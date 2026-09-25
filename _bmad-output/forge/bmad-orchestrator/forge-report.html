@@ -47,7 +47,7 @@
     <circle cx="100" cy="100" r="54" fill="none" stroke="#f3d9b1" stroke-opacity=".45" stroke-width="1.5"/>
     <text font-family="Georgia, serif" font-size="12" letter-spacing="3" fill="#f3d9b1"><textPath href="#ring">BMAD FORGE · ORCH · 2026-09-25 ·</textPath></text>
     <text x="100" y="97" text-anchor="middle" font-family="Georgia, serif" font-weight="bold" font-size="19" fill="#fbe9cc">HARDENED</text>
-    <text x="100" y="118" text-anchor="middle" font-family="Georgia, serif" font-size="11" fill="#f3d9b1">13 locks · 1 kill</text>
+    <text x="100" y="118" text-anchor="middle" font-family="Georgia, serif" font-size="11" fill="#f3d9b1">16 locks · 3 kills</text>
   </svg>
   <div class="t">
     <h1>orch — multi-project orchestration for BMad</h1>
@@ -58,7 +58,7 @@
 
 <h2>Outcome</h2>
 <div class="card">
-The original spec assumed a runtime that does not exist in BMad: a YAML workflow DSL, <code>bmad.module.json</code>, a validator CLI, and the <code>bmad-</code> prefix. What survives is a BMad-native module with four skills (<code>orch-setup</code>, <code>orch-next</code>, <code>orch-gate</code>, <code>orch-status</code>). Its guarantees come from deterministic git gating, not prompts. Work is contract-first. Stories are scoped to one subproject and scheduled by an explicit story DAG. Multi-user safety comes from git-ref claims, hash pinning, and sharded state, with no roles in the module. The niche is teams already living in BMad; that is also its main unverified assumption.
+The original spec assumed a runtime that does not exist in BMad: a YAML workflow DSL, <code>bmad.module.json</code>, a validator CLI, and the <code>bmad-</code> prefix. What survives is a BMad-native module with four skills (<code>orch-setup</code>, <code>orch-next</code>, <code>orch-gate</code>, <code>orch-status</code>). Its guarantees come from deterministic git gating, not prompts. Work is contract-first. Stories are scoped to one subproject and scheduled by an explicit story DAG. Multi-user safety comes from git-ref claims, hash pinning, and sharded state, with no roles in the module. Polyrepo needs no merge train: breaking contract changes go through expand → migrate → contract, and merge status is read from a <code>.orch/stories/&lt;story&gt;.yaml</code> marker in each code repo. The niche is teams already living in BMad; that is also its main unverified assumption.
 </div>
 
 <h2>Locked decisions</h2>
@@ -76,6 +76,9 @@ The original spec assumed a runtime that does not exist in BMad: a YAML workflow
   <li><b><code>sprint-status.yaml</code> is derived from shards,</b> using a custom merge driver plus a gate backstop.</li>
   <li><b>Official BMad Builder shape:</b> code <code>orch</code>, no agents, <code>uv</code> scripts per skill, <code>marketplace.json</code>, built via IM → BW → CM → VM.</li>
   <li><b>Registry:</b> <code>orch/subprojects/&lt;name&gt;.yaml</code> in the coordination repo, with <code>allowed_read</code> kept.</li>
+  <li><b>No breaking contract change in one step:</b> expand → migrate → contract, with the gate detecting breaking changes. Dependent PRs are ordered by readiness; independent PRs merge in any order.</li>
+  <li><b>Merge status is derived and pull-based:</b> the coordination repo needs only read access to code repos, with no cross-repo write tokens.</li>
+  <li><b>Merge marker is a file:</b> <code>.orch/stories/&lt;story&gt;.yaml</code> with contract pins, which survives merge, squash and rebase.</li>
 </ol>
 
 <h2>Rejected, and why</h2>
@@ -88,13 +91,16 @@ The original spec assumed a runtime that does not exist in BMad: a YAML workflow
   <li><b>A role/permission system in the module</b>: prompt-level security; the git host already provides this.</li>
   <li><b>Switching to AI-DLC</b>: it would force BMad teams to abandon their artifacts.</li>
   <li><b><code>bmad-*</code> names, <code>$schema</code> on a bmad domain, <code>workspace.driver</code>, manifests inside services.</b></li>
+  <li><b>Merge train across repos</b> <span class="tag" style="color:var(--seal)">kill</span>: fragile, and a half-merged rollback is manual.</li>
+  <li><b>Push receipts from service CI</b>: needs write tokens on canonical contracts and loses events.</li>
+  <li><b><code>Orch-Story</code> commit trailer</b> <span class="tag" style="color:var(--seal)">kill</span>: squash and rebase merges rewrite it.</li>
 </ul>
 
 <h2>Weak points that survived</h2>
 <ul class="open">
   <li><b>Unverified niche:</b> no pilot project has been named, and "first user already lives in BMad" is still an assumption.</li>
   <li><b>Monorepo + polyrepo both in v1</b> (chosen against the recommendation): every mechanism needs a cross-repo variant.</li>
-  <li><b>Polyrepo merge ordering</b> across N PRs by feature-id is not designed yet.</li>
+  <li><b>Breaking-change detectors</b> per contract type: OpenAPI is covered; AsyncAPI, protobuf and DB schemas each need a tool.</li>
   <li><b>Override creep</b> on <code>bmad-build</code> and <code>bmad-create-epics-and-stories</code>: the fork threshold is about 4.</li>
   <li><b>Merge-driver registration</b> is per clone; the gate is the only backstop.</li>
 </ul>
@@ -114,7 +120,8 @@ The original spec assumed a runtime that does not exist in BMad: a YAML workflow
   <div class="p"><b>Jorge Salinas</b><span>Staff engineer, 40 services · generated</span><i>Contract-first parallelism; warned against stacked branches.</i></div>
   <div class="p"><b>Olga Veres</b><span>Delivery manager · generated</span><i>Stale artifacts are the real pain, not git conflicts.</i></div>
   <div class="p"><b>Thomas Brandt</b><span>Git tooling maintainer · generated</span><i>Proposed the custom merge driver.</i></div>
-  <div class="p"><b>Priya Natarajan</b><span>Platform architect, 120 repos · generated</span><i>"Without cross-repo coordination I don't need it."</i></div>
+  <div class="p"><b>Priya Natarajan</b><span>Platform architect, 120 repos · generated</span><i>"Without cross-repo coordination I don't need it." Found the incompatibility window between repos.</i></div>
+  <div class="p"><b>Damir Khasanov</b><span>Release engineer, merge train on 30 repos · generated</span><i>Killed the merge train and the commit trailer.</i></div>
   <div class="p"><b>Lena Koval</b><span>API SDK maintainer · generated</span><i>Contract-first means the contract lives outside the implementation.</i></div>
   <div class="p"><b>Kira Lyakhova</b><span>Tech lead choosing AI-DLC vs BMad · generated</span><i>Defined the niche: teams already in BMad.</i></div>
   <div class="p"><b>Sebastian Krug</b><span>Scrum master · generated</span><i>"Epic done" is the only metric the business can see.</i></div>

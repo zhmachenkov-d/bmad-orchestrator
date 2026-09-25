@@ -39,6 +39,15 @@ Multi-project (monorepo + polyrepo) feature delivery for teams already working i
                   copy: services/payment-service/docs/openapi.yaml }]
       imports: [user-service]
     ```
+14. **No breaking contract change in one step.** A breaking change becomes expand → migrate → contract (three stories in the epic). `orch-gate` diffs each contract against its previous version and rejects breaking changes, except in a contract-narrowing story where every registry consumer has already migrated. As a result, no atomic cross-repo merge is needed:
+    - dependent PRs are ordered by readiness (a dependency counts only once it is merged);
+    - independent PRs merge in any order.
+15. **Merge status is derived, pull-based.** `orch-next` and `orch-status` read the main branch of each code repo in the registry. They only query stories that are in progress and keep a local cache that can be discarded. The coordination repo needs only read access; there are no cross-repo write tokens and no pushed receipts.
+16. **Merge marker is a file, not a commit trailer.** Each story commits `.orch/stories/<story>.yaml` (`story`, `epic`, `contract_pins`) into its own repo:
+    - the gate requires this file in the PR diff and checks its pins;
+    - "merged" means the file is present in main, which survives merge, squash and rebase alike;
+    - it doubles as the story's completion shard;
+    - it is archived when the epic closes.
 
 ## Rejected
 - YAML workflow DSL (`type: loop`, `run-script`), `bmad.module.json`, `agents/*.md`, a `bmad-builder validate` CLI, `npx skills add`, `src/`: none of these exist in BMad.
@@ -49,9 +58,12 @@ Multi-project (monorepo + polyrepo) feature delivery for teams already working i
 - A role/permission system inside the module: prompt-level security; the git host already does this.
 - Switching to AI-DLC: it would force BMad teams to leave their artifacts behind.
 - `bmad-*` naming, `$schema` on a bmad domain, `workspace.driver`, manifests living inside services.
+- A merge train (atomic merge of N PRs across repos): fragile; one red check stalls everything, and a half-merged rollback has to be done by hand.
+- Push-based receipts from service CI into the coordination repo: every CI would hold a write token on the canonical contracts, and a failed pipeline loses the event.
+- An `Orch-Story` commit trailer: squash and rebase merges rewrite the message on the host side.
 
 ## Open
 - **Unverified:** that the first user already lives in BMad. The whole niche depends on this, and no pilot project has been named yet.
 - Supporting both monorepo and polyrepo in v1 (chosen against the recommendation to start monorepo-only). Risk: every mechanism needs cross-repo gating and claims.
-- Polyrepo merge ordering: coordinating N PRs across repos by feature-id still has no design.
+- Choosing a breaking-change detector per contract type (OpenAPI has off-the-shelf tools; AsyncAPI, protobuf and DB schemas need a choice each).
 - Stock-skill override count: watch against the fork threshold.
