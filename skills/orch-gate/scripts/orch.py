@@ -35,9 +35,17 @@ from orchlib.stories import key_from_any  # noqa: E402
 class Env:
     def __init__(self, args):
         self.repo = gitio.toplevel(args.repo or os.getcwd())
+        # A local gate refreshes origin/* before reading anything, so it sees the main CI will see.
+        # CI checkouts are fresh already, and --offline means no network.
+        self.refs_fetched = []
+        refresh = args.cmd == "gate" and not (args.ci or gate.ci_source()) and not args.offline
+        if refresh and (r := gitio.refresh(self.repo)):
+            self.refs_fetched.append(r)
         coord = args.coord or os.environ.get("ORCH_COORD") or _configured_coord(self.repo)
         self.coord_root = gitio.toplevel(coord) if coord else self.repo
         self.same = self.coord_root.resolve() == self.repo.resolve()
+        if refresh and not self.same and (r := gitio.refresh(self.coord_root)):
+            self.refs_fetched.append(r)
         # Config, registry and epics are read at one trusted ref; in a monorepo that is the gate's --base.
         explicit = args.coord_ref or (getattr(args, "base", None) if self.same else None)
         try:
@@ -49,7 +57,7 @@ class Env:
             self.coord_ref, self.coord_ref_source = "HEAD", "checked-out HEAD (no main ref found)"
             self.cfg = config.load(gitio.Tree(self.coord_root, self.coord_ref))
         self.coord = gitio.Tree(self.coord_root, self.coord_ref)
-        self.cache_root = self.repo / markers.CACHE_DIR
+        self.cache_root = gitio.cache_dir(self.repo)
 
     def registry(self):
         return registry.load(self.coord, self.cfg)
@@ -234,7 +242,8 @@ def _portable(path: Path, repo: Path) -> str:
 
 
 def cmd_gate(args, env: Env):
-    ci = args.ci or gate.is_ci()
+    source = gate.ci_source()
+    ci = args.ci or bool(source)
     if ci and args.offline:
         raise OrchError("--offline is not allowed in CI: the verdict would depend on which repos were skipped")
     repo_id = "." if env.same else gitio.normalize_repo(args.repo_id or gitio.remote_url(env.repo) or str(env.repo))
@@ -249,7 +258,8 @@ def cmd_gate(args, env: Env):
     ctx = gate.Context(
         repo=env.repo, base=base, head=args.head, repo_id=repo_id, coord=coord, cfg=env.cfg, reg=reg,
         stories=stories.load(coord, env.cfg, reg), cache_root=env.cache_root,
-        ci=ci, offline=args.offline, base_source=base_source, coord_ref_source=env.coord_ref_source,
+        ci=ci, ci_source="--ci" if args.ci else source, offline=args.offline, refs_fetched=env.refs_fetched,
+        base_source=base_source, coord_ref_source=env.coord_ref_source,
         fix_prefix=["uv", "run", _portable(Path(__file__), env.repo)], fix_flags=flags, fix_base=args.base,
     )
     result = gate.run(ctx)
@@ -284,7 +294,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("config", parents=[common], help="resolved orch config")
     sub.add_parser("registry", parents=[common], help="load + validate the subproject registry")
     sub.add_parser("stories", parents=[common], help="parse epics into stories (subproject, depends_on, contract change) + plan issues")
-    sub.add_parser("merged", parents=[common], help="merged story markers across all registry repos (pull-based, cached in .orch/cache)")
+    sub.add_parser("merged", parents=[common], help="merged story markers across all registry repos (pull-based, cached under the git dir)")
     d = sub.add_parser("deps", parents=[common], help="contract detector availability and versions for types used in the registry")
     d.add_argument("--probe", action="store_true",
                    help="also run each installed detector on built-in compatible/breaking fixtures and check its verdicts")
@@ -318,7 +328,9 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--head", default="HEAD",
                    help="commit to gate; a CI merge ref (the PR merged into base) is resolved to the PR tip. Needs full history (fetch-depth 0)")
     g.add_argument("--repo-id", help="this repo's identity as written in the registry (default: origin URL)")
-    g.add_argument("--ci", action="store_true", help="CI mode (also implied by $CI)")
+    g.add_argument("--ci", action="store_true",
+                   help="CI mode (also implied by CI, GITHUB_ACTIONS, GITLAB_CI, BUILDKITE, JENKINS_URL, TF_BUILD or "
+                        "TEAMCITY_VERSION); local runs fetch origin first, CI runs do not")
     g.add_argument("--format", choices=["json", "text", "markdown"], default="json",
                    help="markdown suits $GITHUB_STEP_SUMMARY or a PR comment; -o still writes the JSON")
     g.add_argument("-o", "--output", help="also write the JSON result to this file")

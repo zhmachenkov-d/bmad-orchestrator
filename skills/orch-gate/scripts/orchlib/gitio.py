@@ -6,17 +6,20 @@ import hashlib
 import os
 import re
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 from . import OrchError
 
 EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+# Settings that change git's output format are pinned, so the same commit reads the same on every machine.
+PINNED_CONFIG = ("-c", "core.quotePath=false")
 
 
 def git(repo: Path | str, *args: str, check: bool = True, input: bytes | None = None,
         env: dict | None = None) -> subprocess.CompletedProcess:
     proc = subprocess.run(
-        ["git", "-C", str(repo), *args],
+        ["git", *PINNED_CONFIG, "-C", str(repo), *args],
         input=input,
         capture_output=True,
         env={**os.environ, **(env or {})},
@@ -157,10 +160,10 @@ class Tree:
         return self.blob_sha(path) is not None
 
     def list(self, prefix: str = "") -> list[str]:
-        args = ["ls-tree", "-r", "--name-only", self.ref]
+        args = ["ls-tree", "-r", "-z", "--name-only", self.ref]
         if prefix:
             args += ["--", prefix.rstrip("/") + "/"]
-        return [line for line in out(self.repo, *args).splitlines() if line]
+        return [p for p in git(self.repo, *args).stdout.decode().split("\0") if p]
 
 
 def changed_files(repo: Path, base: str, head: str) -> list[dict]:
@@ -188,6 +191,29 @@ def normalize_repo(repo: str) -> str:
 def remote_url(repo: Path, remote: str = "origin") -> str | None:
     proc = git(repo, "remote", "get-url", remote, check=False)
     return proc.stdout.decode().strip() if proc.returncode == 0 else None
+
+
+def cache_dir(repo: Path) -> Path:
+    """orch's fetch cache, inside the git dir so it can never be committed; shared by all worktrees."""
+    common = Path(out(repo, "rev-parse", "--git-common-dir"))
+    return (common if common.is_absolute() else Path(repo) / common) / "orch-cache"
+
+
+def refresh(repo: Path, remote: str = "origin") -> dict | None:
+    """Fetch `remote` so origin/* refs are current; None when there is no such remote.
+
+    Returns {repo, remote, ok} plus, on failure, the error and when the refs were last fetched.
+    """
+    if remote_url(repo, remote) is None:
+        return None
+    proc = git(repo, "fetch", "--quiet", "--no-tags", remote, check=False, env={"GIT_TERMINAL_PROMPT": "0"})
+    if proc.returncode == 0:
+        return {"repo": str(repo), "remote": remote, "ok": True}
+    fetch_head = cache_dir(repo).parent / "FETCH_HEAD"
+    last = (datetime.fromtimestamp(fetch_head.stat().st_mtime, timezone.utc).isoformat(timespec="seconds")
+            if fetch_head.exists() else "never")
+    lines = proc.stderr.decode(errors="replace").strip().splitlines()
+    return {"repo": str(repo), "remote": remote, "ok": False, "last_fetched": last, "error": lines[-1] if lines else ""}
 
 
 def repo_name(repo: Path) -> str:

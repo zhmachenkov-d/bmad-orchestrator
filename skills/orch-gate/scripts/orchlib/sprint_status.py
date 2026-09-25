@@ -106,10 +106,12 @@ def _set(block: list[str], updates: dict[str, str]) -> list[str]:
     return out
 
 
-def check(text: str, merged: set[str], closed: set[int], unknown: set[str] = frozenset()) -> dict:
+def check(text: str, merged: set[str], closed: set[int], unknown: set[str] = frozenset(),
+          pending: set[str] = frozenset()) -> dict:
     """Done invariants. `merged` = story keys ('1-2') with a merged marker, incl. this PR's.
 
     `unknown` = story keys whose repo could not be read; a done story there fails as unverifiable, not as unmerged.
+    `pending` = this PR's own story: it may be done here, but is not yet merged, so it is never told to be done.
     """
     fails, warns = [], []
     if CONFLICT_RE.search(text):
@@ -140,7 +142,7 @@ def check(text: str, merged: set[str], closed: set[int], unknown: set[str] = fro
                 fails.append({"code": "done-without-marker", "key": key,
                               "message": f"{key} is done but no .orch/stories/{sk}.yaml is merged",
                               "hint": "only a merged story may be done; set it back to review or merge the story PR first"})
-            elif sk in merged and status != "done":
+            elif sk in merged and status != "done" and sk not in pending:
                 warns.append({"code": "merged-not-done", "key": key, "message": f"{key} is merged but marked {status}",
                               "hint": "run orch.py sprint-status derive --write"})
             if rank(key, status) < 0:

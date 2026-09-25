@@ -14,9 +14,9 @@ from .gitio import Tree, fetch_tree, normalize_repo, sha
 from .registry import CONTRACTS, Registry, pin_paths
 from .stories import KEY_RE, Story
 
+ORCH_DIR = ".orch"
 MARKER_DIR = ".orch/stories"
 ARCHIVE_DIR = ".orch/archive"
-CACHE_DIR = ".orch/cache"
 ARCHIVE_RE = re.compile(rf"^{re.escape(ARCHIVE_DIR)}/epic-(\d+)/(\d+-\d+[a-z]?)\.yaml$")
 MARKER_RE = re.compile(rf"^{re.escape(MARKER_DIR)}/([^/]+)\.yaml$")
 
@@ -197,6 +197,31 @@ def is_archive_move(changes: list[dict], tree_head: Tree, tree_base: Tree) -> tu
         if path not in ok:
             problems.append(f"{path}: markers may only be removed by moving them to {ARCHIVE_DIR}/epic-N/")
     return ok, problems
+
+
+def record_changes(changes: list[dict], moved: set[str], closed_dir: str) -> list[tuple[str, str, str]]:
+    """(code, path, message) for every change to orch's merge records that no mode may make.
+
+    Live markers and archive additions are judged elsewhere (marker check, is_archive_move); archived markers
+    and epic close records are history, so they may only ever be added.
+    """
+    found = []
+    for c in changes:
+        path, status = c["path"], c["status"]
+        if path in moved:
+            continue
+        if path.startswith(ARCHIVE_DIR + "/"):
+            if status == "D":
+                found.append(("archived-marker-removed", path, f"{path}: archived markers are the merge record and cannot be removed"))
+            elif status != "A":
+                found.append(("archived-marker-modified", path, f"{path}: archived markers are the merge record and cannot change"))
+            elif not ARCHIVE_RE.match(path):
+                found.append(("orch-record-changed", path, f"{path}: the archive holds only {ARCHIVE_DIR}/epic-N/<story>.yaml"))
+        elif path.startswith(ORCH_DIR + "/") and not MARKER_RE.match(path):
+            found.append(("orch-record-changed", path, f"{path}: only story markers and their archive moves may change under {ORCH_DIR}/"))
+        elif path.startswith(closed_dir.rstrip("/") + "/") and status != "A":
+            found.append(("closed-record-changed", path, f"{path}: epic close records cannot be changed or removed"))
+    return found
 
 
 def closed_epics(coord: Tree, cfg: Config) -> set[int]:

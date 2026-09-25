@@ -18,7 +18,8 @@ from .gitio import Tree, default_base, remote_head, repo_name
 
 LAYERS = ("_bmad/config.toml", "_bmad/custom/config.toml")
 USER_LAYERS = ("_bmad/config.toml", "_bmad/config.user.toml", "_bmad/custom/config.toml", "_bmad/custom/config.user.toml")
-USER_KEYS = {"orch_worktrees_dir": "worktrees_dir"}
+# key -> (name in `orch.py config`, whether it is a path). Later USER_LAYERS win, as in stock BMad.
+USER_KEYS = {"orch_worktrees_dir": ("worktrees_dir", True), "communication_language": ("communication_language", False)}
 
 DEFAULTS = {
     "orch_coordination_repo": ".",
@@ -122,7 +123,13 @@ def user_settings(root: Path, cfg: Config) -> dict:
     layers = [(p, (root / p).read_bytes() if (root / p).is_file() else None) for p in USER_LAYERS]
     merged = _layer_values(layers, "the working tree")
     name = str(merged.get("project_name") or cfg.project_name)
-    return {attr: _rel(merged[key], name) if key in merged else getattr(cfg, attr) for key, attr in USER_KEYS.items()}
+    out = {}
+    for key, (attr, is_path) in USER_KEYS.items():
+        if key not in merged:
+            out[attr] = getattr(cfg, attr, None)
+        else:
+            out[attr] = _rel(merged[key], name) if is_path else merged[key]
+    return out
 
 
 def load(tree: Tree) -> Config:

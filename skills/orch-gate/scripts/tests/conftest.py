@@ -129,8 +129,9 @@ def run_cli(*argv, env=None):
     from contextlib import redirect_stdout
 
     old = dict(os.environ)
+    for var in orch.gate.CI_VARS:
+        os.environ.pop(var, None)
     os.environ.update(env or {})
-    os.environ.pop("CI", None)
     buf = io.StringIO()
     try:
         with redirect_stdout(buf):

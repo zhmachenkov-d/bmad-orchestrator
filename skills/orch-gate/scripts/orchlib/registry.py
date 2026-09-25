@@ -7,6 +7,7 @@ from pathlib import PurePosixPath
 
 import yaml
 
+from . import OrchError
 from .config import Config
 from .gitio import Tree, normalize_repo
 from .globs import may_overlap
@@ -18,7 +19,6 @@ CANONICAL_KINDS = {"openapi": ("blob",), "asyncapi": ("blob",), "protobuf": ("bl
 # Things that do not exist *yet* (a new subproject's first story, a contract story adding its canonical).
 # The gate warns on these; every other issue is structural and fails it.
 EXISTENCE_ISSUES = ("path-missing", "canonical-missing")
-REQUIRED = ("repo", "path", "allowed_write")
 
 
 @dataclass
@@ -93,7 +93,49 @@ def contracts_pseudo(cfg: Config) -> Subproject:
     )
 
 
+def _entry(data: dict, path: str, name: str, cfg: Config, issues: list) -> Subproject | None:
+    """One registry entry, or None when a required field is missing, blank or the wrong shape.
+
+    Never fill a boundary with a permissive default: a dropped entry leaves an issue that fails the gate.
+    """
+    before = len(issues)
+    for req in ("repo", "path"):
+        if not isinstance(data.get(req), str) or not data[req].strip():
+            issues.append(_issue("missing-field", f"{path}: '{req}' must be a non-empty string", name))
+    allowed_write = _strings(data.get("allowed_write"), "allowed_write", name, issues)
+    if not allowed_write or not all(p.strip() for p in allowed_write):
+        issues.append(_issue("missing-field", f"{path}: 'allowed_write' must list at least one non-empty pattern", name))
+    if not isinstance(data.get("branch", ""), str):
+        issues.append(_issue("bad-field", f"{path}: 'branch' must be a string", name))
+    contracts = data.get("contracts")
+    contracts = {} if contracts is None else contracts
+    if not isinstance(contracts, dict):
+        issues.append(_issue("bad-field", f"{path}: 'contracts' must be a mapping with exports and imports", name))
+        contracts = {}
+    raw_exports = contracts.get("exports")
+    raw_exports = [] if raw_exports is None else raw_exports
+    if not isinstance(raw_exports, list):
+        issues.append(_issue("bad-field", f"{path}: 'contracts.exports' must be a list", name))
+        raw_exports = []
+    exports = []
+    for i, raw in enumerate(raw_exports):
+        if not (isinstance(raw, dict) and isinstance(raw.get("type"), str) and isinstance(raw.get("canonical"), str)
+                and raw["canonical"].strip("/") and isinstance(raw.get("copy") or "", str)):
+            issues.append(_issue("bad-export", f"{path}: exports[{i}] needs string 'type' and 'canonical' (and 'copy', if given)", name))
+            continue
+        extra = {k: v for k, v in raw.items() if k not in ("type", "canonical", "copy")}
+        exports.append(Export(raw["type"], raw["canonical"].strip("/"), raw.get("copy") or None, extra))
+    imports = _strings(contracts.get("imports"), "contracts.imports", name, issues)
+    allowed_read = _strings(data.get("allowed_read"), "allowed_read", name, issues)
+    if len(issues) > before:
+        return None
+    return Subproject(name=name, repo=data["repo"].strip(), path=data["path"].strip().strip("/"),
+                      allowed_read=allowed_read, allowed_write=allowed_write, exports=exports, imports=imports,
+                      branch=data.get("branch") or cfg.main_branch, source=path)
+
+
 def load(tree: Tree, cfg: Config) -> Registry:
+    """Total over its input: any file content yields issues, never an exception, so a repair PR can always run."""
     reg = Registry()
     reg.issues = []
     for path in sorted(tree.list(cfg.registry_dir)):
@@ -102,7 +144,7 @@ def load(tree: Tree, cfg: Config) -> Registry:
         stem = PurePosixPath(path).stem
         try:
             data = yaml.safe_load(tree.text(path) or "") or {}
-        except yaml.YAMLError as exc:
+        except (yaml.YAMLError, OrchError) as exc:
             reg.issues.append(_issue("yaml", f"{path}: {exc}", stem))
             continue
         if not isinstance(data, dict):
@@ -114,31 +156,8 @@ def load(tree: Tree, cfg: Config) -> Registry:
         if name == CONTRACTS:
             reg.issues.append(_issue("reserved-name", f"{path}: '{CONTRACTS}' is the reserved pseudo-subproject", name))
             continue
-        missing = [req for req in REQUIRED if data.get(req) in (None, "")]
-        if missing:
-            # Never fill a boundary with a permissive default: the entry is dropped and the issue fails the gate.
-            reg.issues += [_issue("missing-field", f"{path}: missing '{req}'", name) for req in missing]
-            continue
-        contracts = data.get("contracts") or {}
-        exports = []
-        for i, raw in enumerate(contracts.get("exports") or []):
-            if not isinstance(raw, dict) or "type" not in raw or "canonical" not in raw:
-                reg.issues.append(_issue("bad-export", f"{path}: exports[{i}] needs 'type' and 'canonical'", name))
-                continue
-            extra = {k: v for k, v in raw.items() if k not in ("type", "canonical", "copy")}
-            exports.append(Export(str(raw["type"]), str(raw["canonical"]).strip("/"),
-                                  str(raw["copy"]) if raw.get("copy") else None, extra))
-        reg[name] = Subproject(
-            name=name,
-            repo=str(data["repo"]),
-            path=str(data["path"]).strip("/"),
-            allowed_read=_strings(data.get("allowed_read"), "allowed_read", name, reg.issues),
-            allowed_write=_strings(data.get("allowed_write"), "allowed_write", name, reg.issues),
-            exports=exports,
-            imports=_strings(contracts.get("imports"), "contracts.imports", name, reg.issues),
-            branch=str(data.get("branch", cfg.main_branch)),
-            source=path,
-        )
+        if (sub := _entry(data, path, name, cfg, reg.issues)) is not None:
+            reg[name] = sub
     reg[CONTRACTS] = contracts_pseudo(cfg)
     return reg
 
@@ -174,7 +193,7 @@ def validate(reg: Registry, coord: Tree, cfg: Config) -> list[dict]:
     for i, a in enumerate(names):
         for b in names[i + 1:]:
             sa, sb = real[a], real[b]
-            if sa.repo != sb.repo:
+            if normalize_repo(sa.repo) != normalize_repo(sb.repo):
                 continue
             for pa in sa.allowed_write:
                 for pb in sb.allowed_write:

@@ -37,7 +37,9 @@ class Context:
     stories: StorySet
     cache_root: Path
     ci: bool = False
+    ci_source: str | None = None
     offline: bool = False
+    refs_fetched: list = field(default_factory=list)   # gitio.refresh results from before config and refs were read
     local_repos: dict = field(default_factory=dict)   # normalized repo id -> Tree (tests, pre-fetched clones)
     detector_runner: object = None
     detector_which: object = None
@@ -152,13 +154,22 @@ def run(ctx: Context) -> dict:
               "repo": ctx.repo_id, "base": ctx.base, "base_source": ctx.base_source, "base_sha": sha(ctx.repo, ctx.base),
               "head": ctx.head, "head_sha": head_sha, "merge_base": mb, "coord_ref": ctx.coord.ref,
               "coord_ref_source": ctx.coord_ref_source, "coord_sha": sha(ctx.coord.repo, ctx.coord.ref),
-              "offline": ctx.offline, "repos_read": [], "changed": [c["path"] for c in changes], "notices": [],
-              "detectors_used": []}
+              "offline": ctx.offline, "ci": ctx.ci, "ci_source": ctx.ci_source, "refs_fetched": ctx.refs_fetched,
+              "repos_read": [], "changed": [c["path"] for c in changes], "notices": [], "detectors_used": []}
     if head_note:
         result["head_resolved"] = head_note
+    # Notices are informational only: they explain the inputs and never change the verdict.
+    for f in ctx.refs_fetched:
+        if not f["ok"]:
+            result["notices"].append({"code": "refs-not-refreshed",
+                                      "message": f"could not fetch {f['remote']} in {f['repo']} (last fetched {f['last_fetched']}): "
+                                                 f"{f['error']}; this verdict may use stale {f['remote']}/* refs",
+                                      "hint": f"git -C {f['repo']} fetch {f['remote']}, then re-run the gate"})
+    if not changes:
+        result["notices"].append({"code": "empty-diff", "message": f"{ctx.head} has no changes against {ctx.base}; nothing was gated",
+                                  "hint": "gate the PR's branch: --head <its ref> --base <its target>"})
     if not ctx.ci:
-        # Informational only: the verdict is about committed history, so this never changes it.
-        dirty = dirty_paths(ctx.repo, ignore_prefix=markers.CACHE_DIR + "/")
+        dirty = dirty_paths(ctx.repo)
         if dirty:
             result["notices"].append({"code": "dirty-worktree",
                                       "message": f"{len(dirty)} uncommitted path(s), invisible to this verdict: "
@@ -183,6 +194,10 @@ def run(ctx: Context) -> dict:
 
     for p in archive_problems:
         checks["scope"].fail("archive-move-invalid", p)
+    records = markers.record_changes(changes, archive_ok, ctx.cfg.closed_dir)
+    for code, path, message in records:
+        checks["scope"].fail(code, message, path=path)
+    judged = archive_ok | {path for _, path, _ in records}
 
     story = sub = marker = None
     if len(live) > 1:
@@ -217,12 +232,23 @@ def run(ctx: Context) -> dict:
     else:
         checks["marker"].skip("no story marker: non-story change (planning, infra, docs)")
 
+    # --- plan issues: the PR's own story must be well-formed; others' defects are surfaced, not blocking ---
+    own = ctx.stories.get(result["story"]) if result["story"] else None
+    for i in ctx.stories.issues:
+        if i["code"] == "no-epics":
+            continue  # a setup failure
+        if own and i["story"] == own.id:
+            if i["code"] not in ("missing-subproject", "unknown-subproject"):  # already no-subproject
+                checks["marker"].fail(i["code"], i["message"], hint="fix the story in the epics on the coordination main")
+        else:
+            checks["setup"].warn(i["code"], i["message"])
+
     # --- scope ---
     bookkeeping = [f"{ctx.cfg.implementation_artifacts}/**"] if is_coord else []
     if story and sub:
         allowed = sub.allowed_write + [markers.marker_path(story.key)] + bookkeeping
         for c in changes:
-            if c["path"] in archive_ok or matches(c["path"], allowed):
+            if c["path"] in judged or matches(c["path"], allowed):
                 continue
             checks["scope"].fail("out-of-scope", f"{c['path']} is outside {sub.name}'s allowed_write", path=c["path"],
                                  hint="move this change to a story of the owning subproject, or amend allowed_write via a registry PR")
@@ -235,7 +261,7 @@ def run(ctx: Context) -> dict:
                 for pattern in s.allowed_write:
                     protected[pattern] = s.name
         for c in changes:
-            if c["path"] in archive_ok:
+            if c["path"] in judged:
                 continue
             owner = next((n for pat, n in protected.items() if matches(c["path"], [pat])), None)
             if owner:
@@ -362,7 +388,7 @@ def run(ctx: Context) -> dict:
         for u in result.get("unread_repos", []):
             checks["sprint-status"].warn(u["code"], u["message"])
         if text is not None:
-            res = sprint_status.check(text, set(mm), closed, unknown)
+            res = sprint_status.check(text, set(mm), closed, unknown, pending={result["story"]} if result["story"] else set())
             for f in res["fail"]:
                 checks["sprint-status"].fail(f.pop("code"), f.pop("message"), **f)
             for f in res["warn"]:
@@ -392,8 +418,17 @@ def run(ctx: Context) -> dict:
     return result
 
 
-def is_ci() -> bool:
-    return os.environ.get("CI", "").strip().lower() in ("1", "true", "yes")
+# Providers that do not set CI themselves (Jenkins, Azure Pipelines, TeamCity) are recognized by their own variable.
+CI_VARS = ("CI", "GITHUB_ACTIONS", "GITLAB_CI", "BUILDKITE", "JENKINS_URL", "TF_BUILD", "TEAMCITY_VERSION")
+
+
+def ci_source() -> str | None:
+    """The environment variable that marks this run as CI, if any."""
+    for var in CI_VARS:
+        value = os.environ.get(var, "").strip().lower()
+        if value and value not in ("0", "false", "no"):
+            return var
+    return None
 
 
 def _fix_line(f: dict) -> str | None:
@@ -404,10 +439,22 @@ def _fix_line(f: dict) -> str | None:
     return f.get("hint")
 
 
+def inputs_line(result: dict) -> str:
+    """Everything a verdict was computed from, on one line, so a CI log alone can be compared with a local run."""
+    parts = [f"base {result['base']}@{result['base_sha'][:10]} ({result['base_source']})",
+             f"head {result['head_sha'][:10]}",
+             f"coord {result['coord_ref']}@{result['coord_sha'][:10]} ({result['coord_ref_source']})"]
+    parts += [f"repo {r['repo']}@{r['sha'][:10]}" for r in result.get("repos_read", [])]
+    parts += [f"{d['type']} {d.get('version') or '?'}" for d in result.get("detectors_used", [])]
+    parts.append(f"ci {result['ci_source'] or ('--ci' if result['ci'] else 'no')}")
+    return "inputs: " + " · ".join(parts)
+
+
 def render_text(result: dict) -> str:
     tags = {"pass": "PASS", "fail": "FAIL", "warn": "WARN", "skip": "SKIP"}
     who = f"story {result['story']} ({result['subproject'] or '?'})" if result.get("story") else "non-story change"
-    lines = [f"orch-gate: {result['verdict'].upper()} - {who} - {result['base']}..{result['head']}"]
+    lines = [f"orch-gate: {result['verdict'].upper()} - {who} - {result['base']}..{result['head']}",
+             f"  {inputs_line(result)}"]
     if result.get("head_resolved"):
         lines.append(f"  note: {result['head_resolved']}")
     for n in result.get("notices", []):
@@ -430,7 +477,7 @@ def render_markdown(result: dict) -> str:
     icon = {"pass": "✅", "fail": "❌", "warn": "⚠️", "skip": "➖"}
     who = f"story `{result['story']}` ({result['subproject'] or '?'})" if result.get("story") else "non-story change"
     lines = [f"### orch-gate: {icon[result['verdict']]} {result['verdict'].upper()} — {who}", "",
-             f"`{result['base']}` @ `{result['base_sha'][:10]}` ← `{result['head_sha'][:10]}`", ""]
+             f"`{inputs_line(result)}`", ""]
     if result.get("head_resolved"):
         lines += [f"> {result['head_resolved']}", ""]
     lines += ["| Check | Status |", "| --- | --- |"]

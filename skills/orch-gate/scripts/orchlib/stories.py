@@ -14,6 +14,7 @@ import re
 from dataclasses import asdict, dataclass, field
 from pathlib import PurePosixPath
 
+from . import OrchError
 from .config import Config
 from .gitio import Tree
 from .registry import CONTRACTS, Registry
@@ -150,7 +151,12 @@ def load(tree: Tree, cfg: Config, reg: Registry | None = None) -> StorySet:
     if not files:
         out.issues.append(_issue("no-epics", f"no epic files (epic*.md) under {cfg.planning_artifacts}"))
     for path in files:
-        stories, issues = parse(tree.text(path) or "", path)
+        try:
+            text = tree.text(path) or ""
+        except OrchError as exc:
+            out.issues.append(_issue("epics-unreadable", str(exc)))
+            continue
+        stories, issues = parse(text, path)
         out.issues += issues
         for s in stories:
             if s.key in out:
