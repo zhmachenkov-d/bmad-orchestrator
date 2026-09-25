@@ -82,8 +82,11 @@ def _set(block: list[str], updates: dict[str, str]) -> list[str]:
     return out
 
 
-def check(text: str, merged: set[str], closed: set[int]) -> dict:
-    """Done invariants. `merged` = story keys ('1-2') with a merged marker, incl. this PR's."""
+def check(text: str, merged: set[str], closed: set[int], unknown: set[str] = frozenset()) -> dict:
+    """Done invariants. `merged` = story keys ('1-2') with a merged marker, incl. this PR's.
+
+    `unknown` = story keys whose repo could not be read; a done story there fails as unverifiable, not as unmerged.
+    """
     fails, warns = [], []
     if CONFLICT_RE.search(text):
         fails.append({"code": "conflict-markers", "message": "sprint-status.yaml contains merge conflict markers",
@@ -96,7 +99,11 @@ def check(text: str, merged: set[str], closed: set[int]) -> dict:
         k = kind(key)
         if k == "story":
             sk = story_key(key)
-            if status == "done" and sk not in merged:
+            if status == "done" and sk not in merged and sk in unknown:
+                fails.append({"code": "done-unverifiable", "key": key,
+                              "message": f"{key} is done but its repo could not be read, so its marker cannot be verified",
+                              "hint": "give this runner read access to that repo (or drop --offline) and re-run"})
+            elif status == "done" and sk not in merged:
                 fails.append({"code": "done-without-marker", "key": key,
                               "message": f"{key} is done but no .orch/stories/{sk}.yaml is merged",
                               "hint": "only a merged story may be done; set it back to review or merge the story PR first"})

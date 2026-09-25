@@ -16,9 +16,11 @@ Never decide the verdict yourself, and never make a check pass by working around
 
 ## Running the gate
 
-Run `uv run scripts/orch.py gate --format text` from the story's repo for the human view, and drop `--format` for JSON. Defaults: the base is `origin/main` or `main`, the coordination repo is the current repo (a monorepo), and the registry is read at the base ref. In a polyrepo code repo, pass `--coord <path to a coordination repo checkout>`, or set `ORCH_COORD`. If the registry `repo` URL differs from `origin`, also pass `--repo-id <url as in the registry>`.
+When the user asks about a CI failure and has the CI result (the `-o` JSON artifact or the job log), explain that run. Re-running locally can reach a different verdict. Otherwise run `uv run scripts/orch.py gate --format text` from the story's repo for the human view, and drop `--format` for JSON. If a local verdict differs from CI, compare `base_sha`, `head_sha`, `coord_sha`, `notices` and `unread_repos` in the two results. Those fields name the inputs that differ.
 
-Explain each failing or warning check in `{communication_language}`. When the fix is mechanical, offer to apply it:
+Defaults: the base is `origin/main` or `main`, and the registry is read at the base ref. The coordination repo is resolved in this order: `--coord`, `ORCH_COORD`, a local path in this repo's `orch_coordination_repo`, and finally the current repo (a monorepo). If the registry `repo` URL differs from `origin`, also pass `--repo-id <url as in the registry>`.
+
+Explain each failing or warning check in `{communication_language}`, and mention any `notices`. When the fix is mechanical, offer to apply it:
 
 - Missing or stale pins, after a rebase onto the latest contract: `orch.py marker write --story <id>`. Commit the story's changes first.
 - A clone without the merge driver: `orch.py sprint-status install-driver`.
@@ -63,12 +65,13 @@ Every other orch skill calls this CLI rather than reimplementing it. Output is J
 | `marker write --story` | Write the completion marker with current pins. Used by the `bmad-build` on_complete override. |
 | `claim list\|create\|take-over\|release` | Atomic claims on `refs/heads/claim/<N-M>`. Take-over and release need `--expect <sha>`. |
 | `sprint-status check\|derive\|merge\|install-driver` | Done invariants, derivation from markers, git merge driver. |
-| `epic close-check --epic N` | All stories merged, markers archived, pins converged. |
+| `epic close-check --epic N` | All stories merged, markers archived, pins converged. A story in an unread repo is an `unverifiable` problem. |
 | `deps` | Detector availability for the contract types in the registry: `oasdiff`, `buf`, `asyncapi`, `atlas`. |
 
 ## Gotchas
 
 - The gate reads through git refs, never the working tree. Uncommitted changes are invisible to it, so commit before running. Orch config is read at the base (or coordination main) too, so a config change takes effect only once merged, and `*.user.toml` never affects the verdict.
-- A CI merge-ref checkout (the PR merged into base) is gated as the PR tip. The result's `head_resolved` says so.
+- A CI merge-ref checkout (the PR merged into base) is gated as the PR tip. The result's `head_resolved` says so. The gate needs full history: in a shallow clone it stops with the fetch-depth fix.
+- If a registry repo cannot be read, its stories' merge status is unknown. They fail as `done-unverifiable` or `consumers-unverifiable`, never as "not merged", and the fix is read access for the runner. `--offline` is refused in CI.
 - `db-schema` contracts are a migrations directory. The detector needs `dev_url` on the registry export, or `ORCH_ATLAS_DEV_URL`.
 - The `asyncapi` and `atlas` detector command lines have not yet been verified against real binaries. If one of them misfires, report the output rather than bypassing it.

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path, PurePosixPath
 
 import yaml
 
+from . import OrchError
 from .config import Config
 from .gitio import Tree, fetch_tree, normalize_repo
 from .registry import CONTRACTS, Registry, pin_paths
@@ -109,36 +111,53 @@ def repo_tree(repo: str, branch: str, coord: Tree, cache_root: Path, local: dict
 
 
 def merged(reg: Registry, coord: Tree, cache_root: Path, local: dict[str, Tree] | None = None,
-           offline: bool = False) -> tuple[dict[str, dict], list[str]]:
-    """Merged story keys across every registry repo -> {repo, path, tree}; plus warnings for unreadable repos."""
-    result, warnings, seen = {}, [], set()
+           offline: bool = False) -> tuple[dict[str, dict], list[dict]]:
+    """Merged story keys across every registry repo -> {repo, path, tree}; plus the repos that could not be read.
+
+    An unread repo means "merge status unknown", never "not merged": callers must report it as such.
+    """
+    result, unread, seen = {}, [], {}
     for sub in sorted(reg.values(), key=lambda s: s.name):
         ident = normalize_repo(sub.repo)
         if ident in seen:
+            seen[ident].append(sub.name)
             continue
-        seen.add(ident)
+        seen[ident] = [sub.name]
         if offline and ident != "." and not (local and ident in local):
-            warnings.append(f"offline: merge status of {sub.repo} not checked")
+            unread.append({"code": "repo-offline", "repo": sub.repo, "subprojects": seen[ident],
+                           "message": f"offline: merge status of {sub.repo} not checked"})
             continue
         try:
             tree = repo_tree(sub.repo, sub.branch, coord, cache_root, local)
-        except Exception as exc:  # network / auth problems degrade to a warning, callers decide severity
-            warnings.append(f"cannot read {sub.repo}: {exc}")
+        except (OrchError, subprocess.CalledProcessError, OSError) as exc:
+            unread.append({"code": "repo-unreadable", "repo": sub.repo, "subprojects": seen[ident],
+                           "message": f"cannot read {sub.repo} (check network and read access for this runner): {exc}"})
             continue
         for key, path in keys_in(tree).items():
             result.setdefault(key, {"repo": sub.repo, "path": path, "tree": tree})
-    return result, warnings
+    return result, unread
+
+
+def unknown_keys(stories, unread: list[dict]) -> set[str]:
+    """Story keys whose merge status is unknown because their subproject's repo was not read."""
+    subs = {s for u in unread for s in u["subprojects"]}
+    return {s.key for s in stories.values() if s.subproject in subs}
 
 
 def public(merged_map: dict[str, dict]) -> dict[str, dict]:
     return {k: {"repo": v["repo"], "path": v["path"]} for k, v in sorted(merged_map.items())}
 
 
-def close_check(epic: int, stories, reg: Registry, merged_map: dict[str, dict], coord: Tree) -> list[dict]:
+def close_check(epic: int, stories, reg: Registry, merged_map: dict[str, dict], coord: Tree,
+                unknown: set[str] = frozenset()) -> list[dict]:
     """An epic may close only when every story is merged, every marker is archived, and every pin matches main."""
     problems = []
     for s in [s for s in stories.values() if s.epic == epic]:
         hit = merged_map.get(s.key)
+        if not hit and s.key in unknown:
+            problems.append({"story": s.key, "code": "unverifiable",
+                             "message": f"cannot verify story {s.id}: the {s.subproject} repo was not read"})
+            continue
         if not hit:
             problems.append({"story": s.key, "message": f"story {s.id} is not merged"})
             continue
