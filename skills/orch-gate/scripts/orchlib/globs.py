@@ -1,4 +1,8 @@
-"""Path globs with `**` support, matched against repo-relative POSIX paths."""
+"""Path globs with `**` support, matched against repo-relative POSIX paths.
+
+Like gitignore, a pattern that matches a directory also covers everything below it, so `services/pay`,
+`services/pay/` and `services/pay/**` all protect `services/pay/x.py`.
+"""
 
 from __future__ import annotations
 
@@ -28,7 +32,7 @@ def compile_glob(pattern: str) -> re.Pattern:
         else:
             rx += re.escape(p[i])
             i += 1
-    return re.compile(rf"^{rx}$")
+    return re.compile(rf"^{rx}(?:/.*)?$")
 
 
 def matches(path: str, patterns: list[str]) -> bool:
@@ -36,11 +40,15 @@ def matches(path: str, patterns: list[str]) -> bool:
 
 
 def literal_prefix(pattern: str) -> str:
-    """The part of a glob before its first wildcard, used to approximate overlap between globs."""
-    m = re.search(r"[*?\[]", pattern)
-    return pattern[: m.start()] if m else pattern
+    """The part of a glob before its first wildcard, used to approximate overlap between globs.
+
+    A wildcard-free pattern names a path and its subtree, so it ends at a segment boundary.
+    """
+    p = pattern.lstrip("/")
+    m = re.search(r"[*?\[]", p)
+    return p[: m.start()] if m else p.rstrip("/") + "/"
 
 
 def may_overlap(a: str, b: str) -> bool:
-    pa, pb = literal_prefix(a.lstrip("/")), literal_prefix(b.lstrip("/"))
+    pa, pb = literal_prefix(a), literal_prefix(b)
     return pa.startswith(pb) or pb.startswith(pa)

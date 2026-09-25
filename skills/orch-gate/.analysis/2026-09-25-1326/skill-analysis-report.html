@@ -1,0 +1,1232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Skill Analysis Report</title>
+<style>
+  :root {
+    --bg: #0f1b2d;
+    --panel: #16263d;
+    --panel-2: #1d3250;
+    --ink: #e9eef6;
+    --ink-dim: #9fb0c7;
+    --line: #294366;
+    --accent: #b66d46;
+    --accent-ink: #f4d9c8;
+    --critical: #e05656;
+    --high: #e0904a;
+    --medium: #d8c24a;
+    --low: #5aa0d0;
+    --ok: #4caf72;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 28px 20px 80px; }
+  header h1 { font-size: 22px; margin: 0 0 4px; }
+  header .meta { color: var(--ink-dim); font-size: 13px; }
+  header .meta b { color: var(--ink); font-weight: 600; }
+
+  .banner {
+    display: none;
+    background: #3a1414;
+    border: 1px solid var(--critical);
+    color: #ffd9d9;
+    padding: 14px 16px;
+    border-radius: 8px;
+    margin: 16px 0;
+    white-space: pre-wrap;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 13px;
+  }
+  .banner.show { display: block; }
+
+  .overview {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 18px;
+    margin: 18px 0;
+  }
+  .grade {
+    font-size: 34px;
+    font-weight: 800;
+    margin: 0 0 8px;
+    text-transform: capitalize;
+  }
+  .grade.g-excellent { color: var(--ok); }
+  .grade.g-good { color: var(--low); }
+  .grade.g-fair { color: var(--medium); }
+  .grade.g-poor { color: var(--critical); }
+  .verdict { font-size: 16px; font-weight: 600; margin: 0 0 14px; }
+  .summary { color: var(--ink-dim); margin: 0 0 14px; }
+  .counts { display: flex; flex-wrap: wrap; gap: 10px; }
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px;
+    border-radius: 999px;
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    font-size: 13px;
+  }
+  .pill .dot { width: 10px; height: 10px; border-radius: 50%; }
+  .pill .n { font-weight: 700; }
+  .dot.critical { background: var(--critical); }
+  .dot.high { background: var(--high); }
+  .dot.medium { background: var(--medium); }
+  .dot.low { background: var(--low); }
+
+  /* Generic synthesis/agent-block panel */
+  .block {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 18px;
+    margin: 18px 0;
+  }
+  .block > h2 {
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--ink-dim);
+    margin: 0 0 12px;
+  }
+  .block .mono, .block code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 13px;
+    background: var(--panel-2);
+    padding: 1px 5px;
+    border-radius: 4px;
+  }
+  .kv { margin: 0; display: grid; grid-template-columns: 150px 1fr; gap: 6px 14px; }
+  .kv dt { color: var(--ink-dim); font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
+  .kv dd { margin: 0; }
+
+  /* Themes */
+  .theme { padding: 12px 0; border-top: 1px solid var(--line); }
+  .theme:first-of-type { border-top: none; padding-top: 0; }
+  .theme .t-head { display: flex; align-items: center; gap: 10px; }
+  .theme .t-title { font-weight: 600; flex: 1 1 auto; min-width: 0; }
+  .theme .t-cause { color: var(--ink-dim); margin-top: 4px; }
+  .theme .t-action { margin-top: 4px; }
+  .theme .t-findings { margin-top: 8px; padding-left: 12px; border-left: 2px solid var(--line); }
+  .theme .t-finding { font-size: 13px; color: var(--ink-dim); padding: 2px 0; }
+
+  /* Strengths */
+  .strength-list { margin: 0; padding-left: 20px; }
+  .strength-list li { padding: 2px 0; }
+
+  /* Recommendations */
+  .rec { padding: 8px 0; border-top: 1px solid var(--line); }
+  .rec:first-of-type { border-top: none; padding-top: 0; }
+  .rec .rank { font-weight: 700; color: var(--accent-ink); margin-right: 8px; }
+  .rec .resolves { color: var(--ink-dim); font-size: 12px; margin-left: 8px; }
+
+  /* Experience journeys */
+  .block .journey { padding: 8px 0; border-top: 1px solid var(--line); }
+  .block .journey:first-of-type { border-top: none; padding-top: 0; }
+  .block .journey .j-name { font-weight: 600; }
+  .block .journey .j-steps { color: var(--ink-dim); margin-top: 2px; }
+
+  .toolbar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin: 18px 0 10px;
+    flex-wrap: wrap;
+  }
+  .toolbar .sel-count { color: var(--ink-dim); font-size: 13px; }
+  button {
+    font: inherit;
+    cursor: pointer;
+    border-radius: 8px;
+    border: 1px solid var(--line);
+    background: var(--panel-2);
+    color: var(--ink);
+    padding: 8px 14px;
+  }
+  button.primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #1a0e07;
+    font-weight: 600;
+  }
+  button:disabled { opacity: 0.5; cursor: default; }
+  button.link {
+    background: none;
+    border: none;
+    color: var(--accent-ink);
+    padding: 4px 6px;
+    font-size: 13px;
+  }
+  button.small { padding: 5px 10px; font-size: 13px; flex: 0 0 auto; }
+
+  .no-findings {
+    background: var(--panel);
+    border: 1px dashed var(--line);
+    border-radius: 10px;
+    padding: 28px;
+    text-align: center;
+    color: var(--ink-dim);
+  }
+  .no-findings .big { font-size: 18px; color: var(--ok); margin-bottom: 6px; }
+
+  .group { margin: 18px 0; }
+  .group > h2 {
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--ink-dim);
+    margin: 0 0 8px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .finding {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-left: 4px solid var(--line);
+    border-radius: 8px;
+    margin: 8px 0;
+    overflow: hidden;
+  }
+  .finding.sev-critical { border-left-color: var(--critical); }
+  .finding.sev-high { border-left-color: var(--high); }
+  .finding.sev-medium { border-left-color: var(--medium); }
+  .finding.sev-low { border-left-color: var(--low); }
+
+  .finding .row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 14px;
+  }
+  .finding .row .chk { width: 16px; height: 16px; flex: 0 0 auto; cursor: pointer; }
+  .finding .row .head { flex: 1 1 auto; cursor: pointer; min-width: 0; }
+  .finding .row .title { font-weight: 600; }
+  .finding .row .sub { color: var(--ink-dim); font-size: 12px; margin-top: 2px; }
+  .finding .tag {
+    flex: 0 0 auto;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 3px 8px;
+    border-radius: 6px;
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    color: var(--ink-dim);
+  }
+  .finding .caret { flex: 0 0 auto; color: var(--ink-dim); transition: transform 0.15s; cursor: pointer; }
+  .finding.open .caret { transform: rotate(90deg); }
+
+  .finding .body {
+    display: none;
+    padding: 0 14px 14px 42px;
+    border-top: 1px solid var(--line);
+  }
+  .finding.open .body { display: block; }
+  .finding .body dl { margin: 12px 0 0; display: grid; grid-template-columns: 130px 1fr; gap: 6px 14px; }
+  .finding .body dt { color: var(--ink-dim); font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
+  .finding .body dd { margin: 0; }
+  .finding .body code, .finding .body .mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 13px;
+    background: var(--panel-2);
+    padding: 1px 5px;
+    border-radius: 4px;
+  }
+
+  .toast {
+    position: fixed;
+    left: 50%;
+    bottom: 28px;
+    transform: translateX(-50%);
+    background: var(--ok);
+    color: #06160c;
+    padding: 10px 18px;
+    border-radius: 8px;
+    font-weight: 600;
+    opacity: 0;
+    transition: opacity 0.2s;
+    pointer-events: none;
+  }
+  .toast.show { opacity: 1; }
+
+  .fallback-area { margin-top: 12px; display: none; }
+  .fallback-area.show { display: block; }
+  .fallback-area textarea {
+    width: 100%;
+    min-height: 160px;
+    background: var(--panel-2);
+    color: var(--ink);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 10px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 13px;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Skill Analysis Report</h1>
+    <div class="meta">
+      <span>Subject: <b id="m-subject">—</b></span> &nbsp;·&nbsp;
+      <span>Generated: <b id="m-generated">—</b></span> &nbsp;·&nbsp;
+      <span>Schema: <b id="m-schema">—</b></span>
+    </div>
+  </header>
+
+  <div id="parse-banner" class="banner"></div>
+
+  <section id="overview" class="overview" hidden>
+    <div id="grade" class="grade" hidden></div>
+    <p id="verdict" class="verdict"></p>
+    <p id="summary-text" class="summary" hidden></p>
+    <div id="counts" class="counts"></div>
+  </section>
+
+  <!-- Synthesis layer (themes, strengths, recommendations). Hidden when absent. -->
+  <section id="themes" class="block" hidden></section>
+  <section id="strengths" class="block" hidden></section>
+  <section id="recommendations" class="block" hidden></section>
+
+  <!-- Experience: journeys plus headless (experience). Hidden when absent. -->
+  <section id="experience" class="block" hidden></section>
+
+  <div id="toolbar" class="toolbar" hidden>
+    <button id="btn-copy" class="primary" disabled>Copy selected as paste-back prompt</button>
+    <span id="sel-count" class="sel-count">0 selected</span>
+    <button id="btn-select-all" class="link">Select all</button>
+    <button id="btn-clear" class="link">Clear</button>
+    <button id="btn-expand-all" class="link">Expand all</button>
+    <button id="btn-collapse-all" class="link">Collapse all</button>
+  </div>
+
+  <div id="fallback" class="fallback-area">
+    <p class="sel-count">Clipboard was unavailable. Copy the text below manually:</p>
+    <textarea id="fallback-text" readonly></textarea>
+  </div>
+
+  <div id="findings-root"></div>
+</div>
+
+<div id="toast" class="toast">Copied</div>
+
+<!-- scripts/render_report.py replaces the contents of this island per run.
+     The placeholder below is intentionally unusable: the shell refuses to
+     render it, so a failed injection can never look like real findings. -->
+<script type="application/json" id="report-data">
+{
+  "schema_version": 2,
+  "subject": "skills/orch-gate",
+  "generated": "2026-09-25",
+  "verdict": "Critical issues from the first run are gone and the explain-and-fix loop is solid, but the gate still fails open on bad setup: an empty or malformed registry passes silently (determinism-2, enhancement-1), and directory contracts are compared as git tree listings (determinism-1).",
+  "grade": "fair",
+  "summary": "The script/prompt boundary is right and SKILL.md stays lean at ~1.7k tokens: the model explains verdicts, never decides them, and all 47 tests pass with ref-based config, merge-ref head resolution and stable finding codes in place. The remaining risk is in script edge cases that quietly weaken the gate: registry and sprint-status inputs that parse wrongly or not at all, plus fix commands that do not carry the context they were computed with.",
+  "standards": {
+    "canon": "/workspaces/bmad-orchestrator/.claude/skills/bmad-workflow-builder/references/prompt-quality-canon.md",
+    "principles": "/workspaces/bmad-orchestrator/.claude/skills/bmad-workflow-builder/references/skill-quality-principles.md",
+    "scripts": "/workspaces/bmad-orchestrator/.claude/skills/bmad-workflow-builder/references/script-standards.md"
+  },
+  "themes": [
+    {
+      "title": "Fail-open on bad or missing setup inputs",
+      "root_cause": "The gate treats an unreadable, empty, malformed or mis-shaped registry (and loose allowed_write patterns) as 'nothing protected' instead of an error, so setup and CI-wiring mistakes, which are the most likely early failures, produce a green gate.",
+      "finding_ids": [
+        "determinism-2",
+        "enhancement-1",
+        "determinism-6"
+      ],
+      "action": "Add a setup/registry-invalid precondition in gate.run: run registry.validate at the trusted ref, fail on any issue, empty registry, no-epics, or unmatched repo_id; never default required fields permissively; define and validate wildcard-free allowed_write semantics. Cover each case with a test."
+    },
+    {
+      "title": "Inputs parsed by the wrong primitive",
+      "root_cause": "Some checks read content with a primitive that does not match its shape: git show on directories, regex over YAML, a dict keyed by subproject, and an archive regex that ignores the epic number. Each gives a wrong or order-dependent answer for ordinary inputs.",
+      "finding_ids": [
+        "determinism-1",
+        "determinism-3",
+        "determinism-4",
+        "determinism-11"
+      ],
+      "action": "Make Tree.read blob-only (compare directories per file), take sprint-status semantics from yaml.safe_load, map consumers to dependency sets, and check the archive epic number; add a regression test for each."
+    },
+    {
+      "title": "fix.command is not self-contained",
+      "root_cause": "Mechanical fixes are emitted as a bare `orch.py …` without the uv run path or the --coord/--coord-ref/--repo/--base the verdict used, and the text view the agent reads cannot tell mechanical fixes from hints.",
+      "finding_ids": [
+        "enhancement-2",
+        "architecture-2",
+        "determinism-8",
+        "architecture-1"
+      ],
+      "action": "Build the full runnable argv (uv run <abs orch.py> + args + gate context flags) in gate.fix, and have SKILL.md run `gate --format text -o <tmp>.json` so the agent reasons from JSON."
+    },
+    {
+      "title": "Unrecorded or environment-dependent verdict inputs",
+      "root_cause": "Some inputs that decide the verdict depend on the environment or are not recorded in the result: the registry-repo SHAs, a default base taken from the coordination repo's branch, the origin/HEAD bootstrap and a project_name taken from the directory. A local run and a CI run can therefore differ without any field showing why.",
+      "finding_ids": [
+        "determinism-5",
+        "determinism-7",
+        "determinism-10",
+        "determinism-9"
+      ],
+      "action": "Record repos_read shas and ref/base sources in the result, resolve the default base from the registry branch, make the bootstrap order environment-independent, and add a --compare mode that diffs two results."
+    },
+    {
+      "title": "Config layers and SKILL.md drift",
+      "root_cause": "The config layers and some SKILL.md wording no longer match what the code does. Personal layers are read at the ref, and a tracked one reaches the verdict. The user setting has nowhere to live. Some prose is addressed to other skills.",
+      "finding_ids": [
+        "customization-1",
+        "customization-2",
+        "customization-3",
+        "architecture-3",
+        "architecture-4",
+        "architecture-5",
+        "leanness-1",
+        "leanness-2"
+      ],
+      "action": "Drop *.user.toml from verdict layers and resolve user settings separately; then tighten SKILL.md: define {planning_artifacts}/{implementation_artifacts}, fix the monorepo-only registry sentence and the language layers, and trim caller-side library/override prose."
+    }
+  ],
+  "strengths": [
+    "The prompt only explains; every verdict comes from the script, with stable finding codes and exit codes that separate verdict (1) from error (2).",
+    "Config, registry and epics are read at a trusted git ref, and merge-ref heads are resolved to the PR tip, so the previous critical issues are closed and covered by tests.",
+    "SKILL.md is lean (~1.7k tokens, no waste patterns) and states the story-metadata contract explicitly.",
+    "Fail-closed handling for unread repos, missing detectors on changed contracts, --offline in CI and shallow clones, with specific messages.",
+    "47 pytest cases including polyrepo via fetch cache, remote claim race and a real git merge through the driver."
+  ],
+  "recommendations": [
+    {
+      "rank": 1,
+      "action": "Add a registry/setup precondition to the gate that fails on validate issues, empty registry, no epics or unmatched repo_id, and define wildcard-free allowed_write semantics.",
+      "resolves": [
+        "determinism-2",
+        "enhancement-1",
+        "determinism-6"
+      ]
+    },
+    {
+      "rank": 2,
+      "action": "Emit full runnable fix.command argv with gate context flags and have SKILL.md read the JSON via -o.",
+      "resolves": [
+        "enhancement-2",
+        "architecture-2",
+        "determinism-8",
+        "architecture-1"
+      ]
+    },
+    {
+      "rank": 3,
+      "action": "Fix the parsing primitives: blob-only Tree.read (per-file directory compare), YAML-based sprint-status check, dependency sets per consumer, and an archive epic check.",
+      "resolves": [
+        "determinism-1",
+        "determinism-3",
+        "determinism-4",
+        "determinism-11"
+      ]
+    },
+    {
+      "rank": 4,
+      "action": "Drop *.user.toml from verdict layers and split out user settings; tidy SKILL.md resolution rules and caller-side prose.",
+      "resolves": [
+        "customization-1",
+        "customization-2",
+        "customization-3",
+        "architecture-3",
+        "architecture-4",
+        "architecture-5",
+        "leanness-1",
+        "leanness-2"
+      ]
+    },
+    {
+      "rank": 5,
+      "action": "Record repos_read shas and base/ref sources, resolve default base from the registry branch, and add a result --compare mode.",
+      "resolves": [
+        "determinism-5",
+        "determinism-7",
+        "determinism-10",
+        "determinism-9"
+      ]
+    },
+    {
+      "rank": 6,
+      "action": "Decide pre-push: add it to orch-setup or record it as post-v1 in the plan.",
+      "resolves": [
+        "enhancement-3"
+      ]
+    }
+  ],
+  "experience": {
+    "journeys": [
+      {
+        "name": "Developer checks a PR locally",
+        "steps": "Commit, run `gate --format text`, read the verdict, apply a mechanical fix.command, commit, re-run until PASS. The fix command is not runnable as printed in polyrepo runs (enhancement-2)."
+      },
+      {
+        "name": "Developer asks why CI failed",
+        "steps": "Provide the CI JSON/log, the agent explains per stable code, and compares input SHAs if a local run differs. Registry-repo SHAs are missing from that comparison (determinism-5)."
+      },
+      {
+        "name": "First-time adopter wires CI",
+        "steps": "Adds the workflow before the registry or coordination checkout is right, and the gate reports PASS instead of flagging the setup (enhancement-1)."
+      }
+    ],
+    "headless": "Fully headless: orch.py gate is script-only with JSON/markdown output and exit codes, and the LLM layer is only needed for explanations."
+  },
+  "findings": [
+    {
+      "id": "determinism-1",
+      "lens": "determinism",
+      "severity": "high",
+      "title": "Directory canonicals and copies are compared as `git show` tree listings",
+      "location": "scripts/orchlib/gitio.py:Tree.read; gate.py conformance; detectors.py:run",
+      "evidence": "Tree.read returns `git show ref:path` stdout for any object, so a directory yields a tree listing whose header contains the ref name. Directory exports always report copy-drift (and miss real content drift); openapi/protobuf/asyncapi detectors get listings, error, and count as breaking, so a protobuf package directory fails every contract PR.",
+      "recommendation": "Make Tree.read return None/raise for non-blobs (cat-file -t); require blob canonicals for file adapters in registry.validate, or compare directories file-by-file and materialize them for detectors. Test identical and drifted directory exports."
+    },
+    {
+      "id": "determinism-2",
+      "lens": "determinism",
+      "severity": "high",
+      "title": "The gate ignores registry problems, and a malformed entry fails open",
+      "location": "scripts/orch.py:cmd_gate; orchlib/registry.py:load; gate.py scope",
+      "evidence": "cmd_gate never inspects reg.issues or runs registry.validate. load() skips YAML-error files, defaults missing repo to '.', and turns non-list allowed_write into [], removing the subproject from `protected`, so a markerless PR into it passes. The writes-contracts overlap is only an issue, never a failure.",
+      "recommendation": "Run registry.validate at the trusted ref inside the gate and fail a `registry-invalid` check with a stable code; never default required fields to permissive values. Test: broken registry file + no-story PR into that subproject fails."
+    },
+    {
+      "id": "enhancement-1",
+      "lens": "enhancement",
+      "severity": "high",
+      "title": "Add: fail closed when the gate has nothing to enforce (empty/unreadable registry, or this repo matches no subproject)",
+      "location": "scripts/orchlib/gate.py:run no-story branch; scripts/orch.py:cmd_gate",
+      "evidence": "Reproduced: a fresh repo with no _bmad config, registry or epics, committing services/pay/a.py, gets `PASS - non-story change`, exit 0. Same silent pass for a missing/wrong coordination checkout in CI, a forgotten --coord, or an origin URL that does not match the registry's `repo`.",
+      "recommendation": "Add a `setup` precondition: fail (stable code) when the registry is empty, reg.issues is non-empty, stories report no-epics, or (polyrepo) repo_id matches no subproject. Name the fix (orch-setup, --coord, --repo-id). Add a Gotchas line and tests."
+    },
+    {
+      "id": "customization-1",
+      "lens": "customization",
+      "severity": "medium",
+      "title": "Personal-layer TOML files are read at the git ref, so committed ones reach the verdict and SKILL.md's claim is false",
+      "location": "scripts/orchlib/config.py:LAYERS; SKILL.md Gotchas",
+      "evidence": "LAYERS includes _bmad/config.user.toml and _bmad/custom/config.user.toml. Only the custom one is gitignored; _bmad/config.user.toml is tracked in this repo (verified with git ls-files), so its keys set scope/paths for everyone, contradicting '`*.user.toml` never affects the verdict'.",
+      "recommendation": "Drop both *.user.toml entries from the verdict layers; read only _bmad/config.toml and _bmad/custom/config.toml at the ref."
+    },
+    {
+      "id": "customization-2",
+      "lens": "customization",
+      "severity": "medium",
+      "title": "The declared user setting orch_worktrees_dir cannot be overridden personally through the shared `orch.py config`",
+      "location": "scripts/orchlib/config.py:load/resolve; orch.py config",
+      "evidence": "The plan marks orch_worktrees_dir as a user setting, but the library reads only committed layers at a ref, so a value in gitignored _bmad/custom/config.user.toml is never seen and silently falls back to the default.",
+      "recommendation": "Split verdict config (ref-read team layers) from local-convenience keys resolved from working-tree layers incl. user layers and never fed to gate.run; or drop the key from the gate library and let orch-next read it."
+    },
+    {
+      "id": "architecture-1",
+      "lens": "architecture",
+      "severity": "medium",
+      "title": "The agent reads the text view, but the fix offer and the CI comparison need JSON-only fields",
+      "location": "SKILL.md: Running the gate (lines 20, 24)",
+      "evidence": "SKILL.md runs `gate --format text`, then says to offer fix.command only when fix.mechanical is set and to compare base_sha/head_sha/coord_sha. The text renderer prints mechanical fixes and free-text hints identically as `fix:` and prints no SHAs.",
+      "recommendation": "Run `gate --format text -o <tmp>.json` and reason from the JSON file; state in one clause that the fix offer and local-vs-CI comparison read the JSON."
+    },
+    {
+      "id": "enhancement-2",
+      "lens": "enhancement",
+      "severity": "medium",
+      "title": "Add: make fix.command runnable as printed and carry the gate's invocation context",
+      "location": "scripts/orchlib/gate.py:fix(), _fix_line, render_text, render_markdown",
+      "evidence": "fix() builds ['orch.py', *args], rendered as `run: orch.py marker write --story 1-2`: not runnable (not on PATH, no uv run), and missing the gate's --coord/--repo/--base, so in polyrepo or contract-story runs the fix resolves a different coordination repo or base and the fix-rerun loop stalls.",
+      "recommendation": "Emit the full argv (uv run <abs orch.py> + args + the gate's explicit --coord/--coord-ref/--repo/--base); keep it a list for sibling skills. Test that a polyrepo run with --coord renders a fix line containing --coord."
+    },
+    {
+      "id": "architecture-2",
+      "lens": "architecture",
+      "severity": "medium",
+      "title": "fix.command leaves out the repository flags the gate ran with, so the fix-and-rerun loop can act on the wrong coordination repo",
+      "location": "scripts/orchlib/gate.py:fix() (lines 45-46); SKILL.md Running the gate (line 24)",
+      "evidence": "In a polyrepo run started with --coord PATH and no ORCH_COORD/local orch_coordination_repo, `marker write` resolves the coordination repo to the current repo, exits 2 or computes pins against the wrong registry; the re-run then shows the same failure.",
+      "recommendation": "Same fix as enhancement-2: gate.run appends the resolved --coord/--coord-ref (and --base for contract stories) to every fix.command."
+    },
+    {
+      "id": "determinism-3",
+      "lens": "determinism",
+      "severity": "medium",
+      "title": "Regex parsing of sprint-status misses `done` entries, so the done-without-marker check can be bypassed",
+      "location": "scripts/orchlib/sprint_status.py:split/ENTRY_RE/check",
+      "evidence": "split() ends the block at the first non-indented line, so a column-0 comment truncates it; ENTRY_RE rejects quoted statuses. Verified: a block with `# Epic 2`, `2-1-b: done` and `1-2-c: \"done\"` yields no failures although both stories are unmerged.",
+      "recommendation": "Take check semantics from yaml.safe_load(...)['development_status']; keep line-level parsing only for comment-preserving writes (derive, merge driver); fail when the two disagree. Test column-0 comment and quoted status."
+    },
+    {
+      "id": "determinism-4",
+      "lens": "determinism",
+      "severity": "medium",
+      "title": "The narrow-story consumer check keeps only one dependency per consumer, and which one depends on list order",
+      "location": "scripts/orchlib/gate.py:252 (dep_subs)",
+      "evidence": "dep_subs = {subproject: key for d in depends_on} overwrites earlier deps on the same consumer. With 2.1 merged and 2.3 unmerged in consumer X, `Depends on: 2.1, 2.3` fails but `2.3, 2.1` passes.",
+      "recommendation": "Map each consumer to a set of dependency keys and state the rule (all merged, or any merged) explicitly; unit-test that reordering Depends on keeps the verdict."
+    },
+    {
+      "id": "determinism-5",
+      "lens": "determinism",
+      "severity": "medium",
+      "title": "The result omits the registry-repo SHAs that decide the cross-repo checks",
+      "location": "scripts/orchlib/markers.py:merged/fetch_tree; gate.py result; SKILL.md Running the gate",
+      "evidence": "merged() fetches each registry repo's branch live; those trees decide done-without-marker, consumers-not-migrated and epic-close-failed, but the result records no sha per repo, so a local/CI difference caused by a moved code-repo main is invisible in the fields SKILL.md tells the model to compare.",
+      "recommendation": "Emit repos_read: [{repo, branch, sha}] (rev-parse of the fetched ref) and add it to SKILL.md's comparison list."
+    },
+    {
+      "id": "determinism-6",
+      "lens": "determinism",
+      "severity": "medium",
+      "title": "An allowed_write pattern without a wildcard matches only the exact path, so no-story protection fails open",
+      "location": "scripts/orchlib/globs.py:compile_glob; gate.py no-story scope; registry.py:validate",
+      "evidence": "`services/pay` compiles to ^services/pay$, so services/pay/x.py is unprotected for markerless PRs and out of scope for story PRs; validate does not warn.",
+      "recommendation": "Either treat a wildcard-free directory pattern as covering its subtree, or have validate reject wildcard-free patterns without a trailing '/'; consider protecting sub.path/** for no-story PRs. Add a test."
+    },
+    {
+      "id": "determinism-7",
+      "lens": "determinism",
+      "severity": "medium",
+      "title": "The default base for a code repo uses the coordination repo's main branch, not the subproject's registry branch",
+      "location": "scripts/orch.py:cmd_gate (default_base with env.cfg.main_branch)",
+      "evidence": "In a polyrepo, omitting --base diffs a code repo against origin/<coord orch_main_branch> while merged() reads it at the registry `branch`; a repo whose branch is `develop` gets a different local verdict than CI with an explicit --base.",
+      "recommendation": "Resolve the default base from the matching subproject's registry branch, fall back to orch_main_branch, and record the source in the result."
+    },
+    {
+      "id": "leanness-1",
+      "lens": "leanness",
+      "severity": "low",
+      "title": "Library section is mostly addressed to other skills' authors, not this skill's reader",
+      "location": "SKILL.md: Library for other orch skills (line 54)",
+      "evidence": "'Every other orch skill calls this CLI…' and the <calling skill's directory>/../orch-gate/scripts/orch.py pattern are caller-side mechanics that sibling models never read here; only the exit-code split, --format markdown and deps --probe change this reader's moves.",
+      "recommendation": "Rename to 'CLI behavior', keep only what the gate runner acts on, and move the invocation pattern into each calling skill or the module plan.",
+      "proposed_smallest": "## CLI behavior\n\nOutput is JSON on stdout. Exit 1 = failing verdict, lost race, validation issues, missing detector, or `epic close-check` problems; exit 2 = usage, environment or internal error — report it, never explain it as a verdict. `orch.py --help` lists commands; `gate --format markdown` renders a CI step summary; `deps --probe` checks installed detectors against built-in fixtures.",
+      "predicted_delta": "No change for orch-gate runs; sibling skills must carry their own invocation line anyway. Route to variant eval to confirm."
+    },
+    {
+      "id": "architecture-3",
+      "lens": "architecture",
+      "severity": "low",
+      "title": "The library contract sits in a file its consumers don't load",
+      "location": "SKILL.md: Library for other orch skills (line 54)",
+      "evidence": "orch-setup/next/status run from their own SKILL.md and never load this one, so the calling convention only reaches them if copied; every gate run pays for the paragraph.",
+      "recommendation": "Keep only the exit-code line here; put the calling convention in orch.py --help and the module plan's shared-library section, and stamp it into consuming skills."
+    },
+    {
+      "id": "leanness-2",
+      "lens": "leanness",
+      "severity": "low",
+      "title": "Story-metadata section contains a directive aimed at another skill's override",
+      "location": "SKILL.md: Story metadata (line 42)",
+      "evidence": "'The orch override for bmad-create-epics-and-stories must emit exactly this' instructs a different artifact and does not change how the gate runner explains a marker/Subproject finding.",
+      "recommendation": "Trim the lead-in to 'The gate reads these bold labels under each `### Story N.M: Title` heading in {planning_artifacts}/epic*.md:' and put the must-emit obligation in the epics override."
+    },
+    {
+      "id": "architecture-4",
+      "lens": "architecture",
+      "severity": "low",
+      "title": "`{planning_artifacts}` and `{implementation_artifacts}` appear in SKILL.md but the resolution rules don't define them",
+      "location": "SKILL.md: The checks, Story metadata, Resolution rules",
+      "evidence": "Resolution rules cover only bare paths, {project-root} and {communication_language}; the model may guess the working-tree _bmad config, which the gate deliberately does not read.",
+      "recommendation": "Add one rule: these resolve to the values in `orch.py config` output (read at coordination main)."
+    },
+    {
+      "id": "architecture-5",
+      "lens": "architecture",
+      "severity": "low",
+      "title": "\"Registry is read at the base ref\" holds only for monorepos",
+      "location": "SKILL.md: Running the gate (line 22)",
+      "evidence": "In a polyrepo the registry is read at the coordination main ref (falling back to HEAD); the Gotchas section says so correctly, so the two sections contradict.",
+      "recommendation": "Say 'at the base ref in a monorepo, at coordination main otherwise', or drop the line and rely on Gotchas."
+    },
+    {
+      "id": "customization-3",
+      "lens": "customization",
+      "severity": "low",
+      "title": "The communication_language rule skips the custom override layers",
+      "location": "SKILL.md: Resolution rules",
+      "evidence": "Only _bmad/config.user.toml and _bmad/config.toml are consulted; the documented durable override files under _bmad/custom/ are ignored for explanations (verdict unaffected).",
+      "recommendation": "Resolve from _bmad/custom/config.user.toml, _bmad/config.user.toml, _bmad/custom/config.toml, _bmad/config.toml, else the user's language."
+    },
+    {
+      "id": "determinism-8",
+      "lens": "determinism",
+      "severity": "low",
+      "title": "fix.command drops the context flags the verdict was computed with",
+      "location": "scripts/orchlib/gate.py:fix; SKILL.md",
+      "evidence": "fix() returns ['orch.py', *command] without --coord/--coord-ref/--base/--repo or the uv run path, so the model must rebuild the invocation.",
+      "recommendation": "Put the full argv in fix.command (script path + context flags); SKILL.md then only says 'run fix.command'."
+    },
+    {
+      "id": "determinism-9",
+      "lens": "determinism",
+      "severity": "low",
+      "title": "The prompt compares two gate results field by field",
+      "location": "SKILL.md: Running the gate",
+      "evidence": "'compare base_sha, head_sha, coord_sha, notices and unread_repos in the two results' is a structured diff with one correct answer.",
+      "recommendation": "Add `orch.py gate --compare <ci.json>` (or diff-results) that emits only differing input fields; the prompt explains that output."
+    },
+    {
+      "id": "determinism-10",
+      "lens": "determinism",
+      "severity": "low",
+      "title": "How the default ref and project_name are found depends on the environment",
+      "location": "scripts/orchlib/config.py:resolve/load",
+      "evidence": "resolve() starts from origin/HEAD, which actions/checkout lacks, so repos whose default branch is not main work locally but exit 2 in CI without --base; project_name falls back to the checkout directory name, which differs between a local clone and a CI `path: coord` checkout.",
+      "recommendation": "Use one bootstrap order everywhere or record coord_ref_source; fail clearly (or use repo identity) when project_name is unset."
+    },
+    {
+      "id": "determinism-11",
+      "lens": "determinism",
+      "severity": "low",
+      "title": "The archive's epic number is never checked against the story's epic",
+      "location": "scripts/orchlib/markers.py:close_check/is_archive_move",
+      "evidence": "Both accept a move into any .orch/archive/epic-N/, so a marker archived under the wrong epic passes the close check despite its message.",
+      "recommendation": "Compare ARCHIVE_RE group(1) with the story's epic in both functions; add a wrong-epic test."
+    },
+    {
+      "id": "enhancement-3",
+      "lens": "enhancement",
+      "severity": "low",
+      "title": "Opportunity: give the pre-push entry point an owner",
+      "location": "skills/reports/orch-module-plan.md (Setup Extensions)",
+      "evidence": "The plan promises 'CI and optionally pre-push' but no setup extension installs a hook and no decision is recorded (raised before as enhancement-9).",
+      "recommendation": "Either add a pre-push hook step to orch-setup (runs `orch.py gate --format text`, exit code blocks push) or record pre-push as post-v1 in the plan."
+    }
+  ]
+}
+</script>
+
+<script>
+(function () {
+  "use strict";
+
+  var SEVERITIES = ["critical", "high", "medium", "low"];
+  var SEV_LABEL = { critical: "Critical", high: "High", medium: "Medium", low: "Low" };
+  var GRADES = ["excellent", "good", "fair", "poor"];
+  var PLACEHOLDER_SUBJECT = "__PLACEHOLDER__";
+
+  var els = {
+    banner: document.getElementById("parse-banner"),
+    overview: document.getElementById("overview"),
+    grade: document.getElementById("grade"),
+    verdict: document.getElementById("verdict"),
+    summaryText: document.getElementById("summary-text"),
+    counts: document.getElementById("counts"),
+    themes: document.getElementById("themes"),
+    strengths: document.getElementById("strengths"),
+    recommendations: document.getElementById("recommendations"),
+    experience: document.getElementById("experience"),
+    toolbar: document.getElementById("toolbar"),
+    root: document.getElementById("findings-root"),
+    subject: document.getElementById("m-subject"),
+    generated: document.getElementById("m-generated"),
+    schema: document.getElementById("m-schema"),
+    selCount: document.getElementById("sel-count"),
+    btnCopy: document.getElementById("btn-copy"),
+    btnSelectAll: document.getElementById("btn-select-all"),
+    btnClear: document.getElementById("btn-clear"),
+    btnExpandAll: document.getElementById("btn-expand-all"),
+    btnCollapseAll: document.getElementById("btn-collapse-all"),
+    fallback: document.getElementById("fallback"),
+    fallbackText: document.getElementById("fallback-text"),
+    toast: document.getElementById("toast")
+  };
+
+  var selected = Object.create(null);
+  var findings = [];
+  var findingsById = Object.create(null);
+  var subjectPath = "";
+  var standards = null;
+
+  function showBanner(message) {
+    els.banner.textContent = message;
+    els.banner.classList.add("show");
+  }
+
+  function esc(value) {
+    var s = value == null ? "" : String(value);
+    return s.replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  // Normalize an arbitrary parsed object against schema_version 2, supplying
+  // defaults so a partial or future island still renders. Unknown fields are
+  // ignored, not fatal. Severity counts are always derived from the findings
+  // array, never read from the island, so they cannot disagree with it. The
+  // synthesis blocks (grade, summary, themes, strengths, recommendations) and
+  // the experience block are OPTIONAL: each normalizes to an empty value that
+  // renders nothing rather than an empty panel or an error.
+  function normalize(raw) {
+    var obj = raw && typeof raw === "object" ? raw : {};
+    var rawFindings = Array.isArray(obj.findings) ? obj.findings : [];
+
+    var norm = {
+      schema_version: typeof obj.schema_version === "number" ? obj.schema_version : 2,
+      subject: obj.subject != null ? String(obj.subject) : "(unspecified)",
+      generated: obj.generated != null ? String(obj.generated) : "(unspecified)",
+      verdict: obj.verdict != null ? String(obj.verdict) : "(no verdict supplied)",
+      grade: GRADES.indexOf(String(obj.grade || "").toLowerCase()) >= 0
+        ? String(obj.grade).toLowerCase() : "",
+      summary: typeof obj.summary === "string" ? obj.summary : "",
+      standards: (obj.standards && typeof obj.standards === "object") ? {
+        canon: obj.standards.canon != null ? String(obj.standards.canon) : "",
+        principles: obj.standards.principles != null ? String(obj.standards.principles) : "",
+        scripts: obj.standards.scripts != null ? String(obj.standards.scripts) : ""
+      } : null,
+      themes: normalizeThemes(obj.themes),
+      strengths: normalizeStrengths(obj.strengths),
+      recommendations: normalizeRecommendations(obj.recommendations),
+      experience: normalizeExperience(obj.experience),
+      counts: { critical: 0, high: 0, medium: 0, low: 0 },
+      findings: []
+    };
+
+    rawFindings.forEach(function (f, i) {
+      if (!f || typeof f !== "object") { return; }
+      var sev = SEVERITIES.indexOf(f.severity) >= 0 ? f.severity : "low";
+      norm.findings.push({
+        id: f.id != null ? String(f.id) : "finding-" + (i + 1),
+        lens: f.lens != null ? String(f.lens) : "(unknown)",
+        severity: sev,
+        title: f.title != null ? String(f.title) : "(untitled finding)",
+        location: f.location != null ? String(f.location) : "",
+        evidence: f.evidence != null ? String(f.evidence) : "",
+        recommendation: f.recommendation != null ? String(f.recommendation) : "",
+        proposed_smallest: f.proposed_smallest != null ? String(f.proposed_smallest) : "",
+        predicted_delta: f.predicted_delta != null ? String(f.predicted_delta) : ""
+      });
+      norm.counts[sev] += 1;
+    });
+
+    return norm;
+  }
+
+  function normalizeThemes(raw) {
+    if (!Array.isArray(raw)) { return []; }
+    var list = [];
+    raw.forEach(function (t) {
+      if (!t || typeof t !== "object") { return; }
+      var ids = [];
+      if (Array.isArray(t.finding_ids)) {
+        t.finding_ids.forEach(function (id) { if (id != null) { ids.push(String(id)); } });
+      }
+      var title = t.title != null ? String(t.title) : "";
+      if (!title && !ids.length) { return; }
+      list.push({
+        title: title || "(untitled theme)",
+        root_cause: t.root_cause != null ? String(t.root_cause) : "",
+        action: t.action != null ? String(t.action) : "",
+        finding_ids: ids
+      });
+    });
+    return list;
+  }
+
+  function normalizeStrengths(raw) {
+    if (!Array.isArray(raw)) { return []; }
+    var list = [];
+    raw.forEach(function (s) {
+      if (typeof s === "string" && s) { list.push(s); }
+      else if (s && typeof s === "object" && s.title) {
+        list.push(String(s.title) + (s.detail ? " — " + String(s.detail) : ""));
+      }
+    });
+    return list;
+  }
+
+  function normalizeRecommendations(raw) {
+    if (!Array.isArray(raw)) { return []; }
+    var list = [];
+    raw.forEach(function (r, i) {
+      if (!r || typeof r !== "object") { return; }
+      var action = r.action != null ? String(r.action) : "";
+      if (!action) { return; }
+      var resolves = "";
+      if (Array.isArray(r.resolves)) { resolves = r.resolves.map(String).join(", "); }
+      else if (typeof r.resolves === "number") { resolves = r.resolves + " findings"; }
+      else if (r.resolves != null) { resolves = String(r.resolves); }
+      list.push({
+        rank: typeof r.rank === "number" ? r.rank : i + 1,
+        action: action,
+        resolves: resolves
+      });
+    });
+    list.sort(function (a, b) { return a.rank - b.rank; });
+    return list;
+  }
+
+  // Optional experience block: journeys plus a headless note. Returns null when
+  // neither is usable.
+  function normalizeExperience(raw) {
+    if (!raw || typeof raw !== "object") { return null; }
+    var journeys = [];
+    if (Array.isArray(raw.journeys)) {
+      raw.journeys.forEach(function (j) {
+        if (!j || typeof j !== "object") { return; }
+        var name = j.name != null ? String(j.name) : "";
+        var steps = j.steps != null ? String(j.steps) : "";
+        if (!name && !steps) { return; }
+        journeys.push({ name: name, steps: steps });
+      });
+    }
+    var headless = raw.headless != null ? String(raw.headless) : "";
+    if (!journeys.length && !headless) { return null; }
+    return { journeys: journeys, headless: headless };
+  }
+
+  function renderOverview(data) {
+    els.subject.textContent = data.subject;
+    els.generated.textContent = data.generated;
+    els.schema.textContent = String(data.schema_version);
+    els.verdict.textContent = data.verdict;
+
+    if (data.grade) {
+      els.grade.textContent = data.grade;
+      els.grade.className = "grade g-" + data.grade;
+      els.grade.hidden = false;
+    }
+    if (data.summary) {
+      els.summaryText.textContent = data.summary;
+      els.summaryText.hidden = false;
+    }
+
+    els.counts.innerHTML = "";
+    SEVERITIES.forEach(function (s) {
+      var pill = document.createElement("span");
+      pill.className = "pill";
+      pill.innerHTML =
+        '<span class="dot ' + s + '"></span>' +
+        '<span class="lbl">' + SEV_LABEL[s] + '</span>' +
+        '<span class="n">' + data.counts[s] + "</span>";
+      els.counts.appendChild(pill);
+    });
+    els.overview.hidden = false;
+  }
+
+  // Every copied fix prompt opens by anchoring the fixing session to the same
+  // standards that produced the findings, so the fix is held to the bar too.
+  function standardsPreamble() {
+    if (!standards || !standards.canon) { return []; }
+    var bar = standards.canon + (standards.principles ? " and " + standards.principles : "");
+    var lines = [
+      "Hold " + bar + " as the bar for every line you change — a fix that adds ceremony is a new finding, not a fix."
+    ];
+    if (standards.scripts) {
+      lines.push("If the fix adds or changes scripts, follow " + standards.scripts + ".");
+    }
+    lines.push("");
+    return lines;
+  }
+
+  function composeThemePrompt(theme, resolved) {
+    var lines = standardsPreamble();
+    lines.push("Fix the following theme in " + subjectPath + ": " + theme.title);
+    lines.push("");
+    if (theme.root_cause) { lines.push("Root cause: " + theme.root_cause); }
+    if (theme.action) { lines.push("Fix: " + theme.action); }
+    if (resolved.length) {
+      lines.push("");
+      lines.push("Findings to address:");
+      resolved.forEach(function (f, i) {
+        lines.push((i + 1) + ". " + f.title);
+        if (f.location) { lines.push("   Location: " + f.location); }
+        if (f.evidence) { lines.push("   Evidence: " + f.evidence); }
+        if (f.recommendation) { lines.push("   Recommendation: " + f.recommendation); }
+      });
+    }
+    return lines.join("\n") + "\n";
+  }
+
+  function renderThemes(themes) {
+    if (!themes.length) { els.themes.hidden = true; return; }
+    els.themes.innerHTML = "<h2>Themes</h2>";
+    themes.forEach(function (t) {
+      var resolved = t.finding_ids
+        .map(function (id) { return findingsById[id]; })
+        .filter(function (f) { return !!f; });
+      var items = resolved.map(function (f) {
+        return '<div class="t-finding"><span class="mono">' + esc(f.id) + "</span> " +
+          esc(f.title) +
+          (f.location ? ' · <span class="mono">' + esc(f.location) + "</span>" : "") +
+          "</div>";
+      }).join("");
+
+      var node = document.createElement("div");
+      node.className = "theme";
+      node.innerHTML =
+        '<div class="t-head"><span class="t-title">' + esc(t.title) + "</span>" +
+        '<button class="small t-fix">Fix This Theme</button></div>' +
+        (t.root_cause ? '<div class="t-cause">Root cause: ' + esc(t.root_cause) + "</div>" : "") +
+        (t.action ? '<div class="t-action"><b>Fix:</b> ' + esc(t.action) + "</div>" : "") +
+        (items ? '<div class="t-findings">' + items + "</div>" : "");
+      node.querySelector(".t-fix").addEventListener("click", function () {
+        copyText(composeThemePrompt(t, resolved));
+      });
+      els.themes.appendChild(node);
+    });
+    els.themes.hidden = false;
+  }
+
+  function renderStrengths(list) {
+    if (!list.length) { els.strengths.hidden = true; return; }
+    els.strengths.innerHTML =
+      "<h2>Strengths</h2><ul class=\"strength-list\">" +
+      list.map(function (s) { return "<li>" + esc(s) + "</li>"; }).join("") +
+      "</ul>";
+    els.strengths.hidden = false;
+  }
+
+  function renderRecommendations(recs) {
+    if (!recs.length) { els.recommendations.hidden = true; return; }
+    var html = "<h2>Recommendations</h2>";
+    recs.forEach(function (r) {
+      html += '<div class="rec"><span class="rank">#' + esc(String(r.rank)) + "</span>" +
+        esc(r.action) +
+        (r.resolves ? '<span class="resolves">resolves: ' + esc(r.resolves) + "</span>" : "") +
+        "</div>";
+    });
+    els.recommendations.innerHTML = html;
+    els.recommendations.hidden = false;
+  }
+
+  function renderExperience(exp) {
+    if (!exp) { els.experience.hidden = true; return; }
+    var html = "<h2>Experience</h2>";
+    if (exp.journeys.length) {
+      html += exp.journeys.map(function (j) {
+        return '<div class="journey">' +
+          '<div class="j-name">' + esc(j.name || "(unnamed journey)") + "</div>" +
+          (j.steps ? '<div class="j-steps">' + esc(j.steps) + "</div>" : "") +
+          "</div>";
+      }).join("");
+    }
+    if (exp.headless) {
+      html += '<dl class="kv" style="margin-top:12px"><dt>Headless</dt><dd>' +
+        esc(exp.headless) + "</dd></dl>";
+    }
+    els.experience.innerHTML = html;
+    els.experience.hidden = false;
+  }
+
+  function renderNoFindings() {
+    els.root.innerHTML =
+      '<div class="no-findings">' +
+      '<div class="big">No findings</div>' +
+      "<div>The scanners returned a clean pass for this subject.</div>" +
+      "</div>";
+  }
+
+  function findingNode(f) {
+    var node = document.createElement("div");
+    node.className = "finding sev-" + f.severity;
+    node.setAttribute("data-id", f.id);
+
+    var sub =
+      esc(f.lens) +
+      (f.location ? ' · <span class="mono">' + esc(f.location) + "</span>" : "");
+
+    var rows =
+      "<dt>Lens</dt><dd>" + esc(f.lens) + "</dd>" +
+      (f.location ? "<dt>Location</dt><dd><code>" + esc(f.location) + "</code></dd>" : "") +
+      (f.evidence ? "<dt>Evidence</dt><dd>" + esc(f.evidence) + "</dd>" : "") +
+      (f.recommendation ? "<dt>Recommendation</dt><dd>" + esc(f.recommendation) + "</dd>" : "") +
+      (f.proposed_smallest ? "<dt>Proposed smallest</dt><dd>" + esc(f.proposed_smallest) + "</dd>" : "") +
+      (f.predicted_delta ? "<dt>Predicted delta</dt><dd>" + esc(f.predicted_delta) + "</dd>" : "");
+
+    node.innerHTML =
+      '<div class="row">' +
+      '<input type="checkbox" class="chk" aria-label="Select finding">' +
+      '<div class="head">' +
+      '<div class="title">' + esc(f.title) + "</div>" +
+      '<div class="sub">' + sub + "</div>" +
+      "</div>" +
+      '<span class="tag">' + SEV_LABEL[f.severity] + "</span>" +
+      '<span class="caret">▸</span>' +
+      "</div>" +
+      '<div class="body"><dl>' + rows + "</dl></div>";
+
+    var chk = node.querySelector(".chk");
+    chk.checked = !!selected[f.id];
+    chk.addEventListener("change", function () {
+      if (chk.checked) { selected[f.id] = true; } else { delete selected[f.id]; }
+      updateSelection();
+    });
+
+    var head = node.querySelector(".head");
+    var caret = node.querySelector(".caret");
+    function toggle() { node.classList.toggle("open"); }
+    head.addEventListener("click", toggle);
+    caret.addEventListener("click", toggle);
+
+    return node;
+  }
+
+  function renderFindings(list) {
+    els.root.innerHTML = "";
+    if (list.length === 0) {
+      renderNoFindings();
+      els.toolbar.hidden = true;
+      return;
+    }
+    els.toolbar.hidden = false;
+
+    SEVERITIES.forEach(function (sev) {
+      var group = list.filter(function (f) { return f.severity === sev; });
+      if (group.length === 0) { return; }
+      var wrap = document.createElement("div");
+      wrap.className = "group";
+      var h = document.createElement("h2");
+      h.innerHTML = '<span class="dot ' + sev + '"></span>' + SEV_LABEL[sev] + " (" + group.length + ")";
+      wrap.appendChild(h);
+      group.forEach(function (f) { wrap.appendChild(findingNode(f)); });
+      els.root.appendChild(wrap);
+    });
+  }
+
+  function updateSelection() {
+    var n = Object.keys(selected).length;
+    els.selCount.textContent = n + " selected";
+    els.btnCopy.disabled = n === 0;
+  }
+
+  function composePrompt() {
+    var picked = findings.filter(function (f) { return selected[f.id]; });
+    if (picked.length === 0) { return ""; }
+    var lines = standardsPreamble();
+    lines.push("Fix the following issues in " + subjectPath + ":");
+    lines.push("");
+    picked.forEach(function (f, i) {
+      lines.push((i + 1) + ". " + f.title);
+      if (f.location) { lines.push("   Location: " + f.location); }
+      if (f.evidence) { lines.push("   Evidence: " + f.evidence); }
+      if (f.recommendation) { lines.push("   Recommendation: " + f.recommendation); }
+      if (f.proposed_smallest) { lines.push("   Proposed smallest: " + f.proposed_smallest); }
+      lines.push("");
+    });
+    return lines.join("\n").replace(/\n+$/, "\n");
+  }
+
+  function showToast(text) {
+    els.toast.textContent = text;
+    els.toast.classList.add("show");
+    setTimeout(function () { els.toast.classList.remove("show"); }, 1600);
+  }
+
+  function fallbackCopy(text) {
+    els.fallbackText.value = text;
+    els.fallback.classList.add("show");
+    els.fallbackText.focus();
+    els.fallbackText.select();
+    try {
+      var ok = document.execCommand && document.execCommand("copy");
+      if (ok) {
+        showToast("Copied");
+        return;
+      }
+    } catch (e) { /* fall through to manual */ }
+    showToast("Copy the text shown below");
+  }
+
+  function copyText(text) {
+    if (!text) { return; }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(
+        function () { showToast("Copied"); },
+        function () { fallbackCopy(text); }
+      );
+    } else {
+      fallbackCopy(text);
+    }
+  }
+
+  function doCopy() {
+    copyText(composePrompt());
+  }
+
+  function wireToolbar() {
+    els.btnCopy.addEventListener("click", doCopy);
+    els.btnSelectAll.addEventListener("click", function () {
+      findings.forEach(function (f) { selected[f.id] = true; });
+      document.querySelectorAll(".finding .chk").forEach(function (c) { c.checked = true; });
+      updateSelection();
+    });
+    els.btnClear.addEventListener("click", function () {
+      selected = Object.create(null);
+      document.querySelectorAll(".finding .chk").forEach(function (c) { c.checked = false; });
+      els.fallback.classList.remove("show");
+      updateSelection();
+    });
+    els.btnExpandAll.addEventListener("click", function () {
+      document.querySelectorAll(".finding").forEach(function (n) { n.classList.add("open"); });
+    });
+    els.btnCollapseAll.addEventListener("click", function () {
+      document.querySelectorAll(".finding").forEach(function (n) { n.classList.remove("open"); });
+    });
+  }
+
+  function init() {
+    var island = document.getElementById("report-data");
+    var parsed;
+    try {
+      if (!island) { throw new Error("report-data island element not found"); }
+      parsed = JSON.parse(island.textContent);
+    } catch (err) {
+      showBanner(
+        "Could not parse the report data island.\n\n" +
+        "Error: " + (err && err.message ? err.message : String(err)) + "\n\n" +
+        "The findings could not be rendered. The JSON inside the " +
+        'report-data island (the application/json script tag) is malformed.'
+      );
+      return;
+    }
+
+    var data = normalize(parsed);
+
+    if (data.subject === PLACEHOLDER_SUBJECT) {
+      els.subject.textContent = data.subject;
+      showBanner(
+        "This is the unfilled report shell.\n\n" +
+        "The report-data island still carries the placeholder subject, so " +
+        "there are no findings here. Generate a real report with " +
+        "scripts/render_report.py."
+      );
+      return;
+    }
+
+    findings = data.findings;
+    subjectPath = data.subject;
+    standards = data.standards;
+    findingsById = Object.create(null);
+    findings.forEach(function (f) { findingsById[f.id] = f; });
+
+    renderOverview(data);
+    renderThemes(data.themes);
+    renderStrengths(data.strengths);
+    renderRecommendations(data.recommendations);
+    renderExperience(data.experience);
+    renderFindings(findings);
+    wireToolbar();
+    updateSelection();
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init);
+  } else {
+    init();
+  }
+})();
+</script>
+</body>
+</html>

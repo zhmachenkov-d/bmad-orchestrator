@@ -5,6 +5,9 @@
 # ///
 """orch — the shared orch library CLI. Every orch skill and CI job calls this; output is JSON on stdout.
 
+Other orch skills install beside orch-gate and call `uv run <their skill dir>/../orch-gate/scripts/orch.py <command>`
+instead of reimplementing any of this.
+
 Exit codes: 0 = ok/pass, 1 = failing verdict / lost race / validation issues, 2 = usage or environment error.
 
 Repositories: --repo is the repo being acted on (default: current directory). --coord is the coordination
@@ -32,20 +35,29 @@ from orchlib.stories import key_from_any  # noqa: E402
 class Env:
     def __init__(self, args):
         self.repo = gitio.toplevel(args.repo or os.getcwd())
+        # A local gate refreshes origin/* before reading anything, so it sees the main CI will see.
+        # CI checkouts are fresh already, and --offline means no network.
+        self.refs_fetched = []
+        refresh = args.cmd == "gate" and not (args.ci or gate.ci_source()) and not args.offline
+        if refresh and (r := gitio.refresh(self.repo)):
+            self.refs_fetched.append(r)
         coord = args.coord or os.environ.get("ORCH_COORD") or _configured_coord(self.repo)
         self.coord_root = gitio.toplevel(coord) if coord else self.repo
         self.same = self.coord_root.resolve() == self.repo.resolve()
+        if refresh and not self.same and (r := gitio.refresh(self.coord_root)):
+            self.refs_fetched.append(r)
         # Config, registry and epics are read at one trusted ref; in a monorepo that is the gate's --base.
         explicit = args.coord_ref or (getattr(args, "base", None) if self.same else None)
         try:
-            self.cfg, self.coord_ref = config.resolve(self.coord_root, explicit)
+            self.cfg, self.coord_ref, self.coord_ref_source = config.resolve(self.coord_root, explicit)
         except OrchError:
             if self.same:
                 raise
-            self.coord_ref = "HEAD"  # CI checkouts of the coordination repo are often a detached main
+            # CI checkouts of the coordination repo are often a detached main
+            self.coord_ref, self.coord_ref_source = "HEAD", "checked-out HEAD (no main ref found)"
             self.cfg = config.load(gitio.Tree(self.coord_root, self.coord_ref))
         self.coord = gitio.Tree(self.coord_root, self.coord_ref)
-        self.cache_root = self.repo / markers.CACHE_DIR
+        self.cache_root = gitio.cache_dir(self.repo)
 
     def registry(self):
         return registry.load(self.coord, self.cfg)
@@ -90,8 +102,10 @@ def need_key(value: str) -> str:
 # ---- commands ----
 
 def cmd_config(args, env: Env):
+    # User settings resolve from this checkout's working tree (personal layers included); the gate never reads them.
+    cfg = {**env.cfg.to_dict(), **config.user_settings(env.coord_root, env.cfg)}
     return emit({"ok": True, "repo": str(env.repo), "coord": str(env.coord_root), "coord_ref": env.coord_ref,
-                 "config": env.cfg.to_dict()})
+                 "coord_ref_source": env.coord_ref_source, "config": cfg})
 
 
 def cmd_registry(args, env: Env):
@@ -206,18 +220,47 @@ def cmd_epic(args, env: Env):
                 1 if problems else 0)
 
 
+def _gate_base(args, env: Env, reg, repo_id: str) -> tuple[str, str]:
+    """The base ref and where it came from. A code repo defaults to its registry `branch`, which merged() reads too."""
+    if args.base:
+        return args.base, "explicit"
+    if not env.same:
+        subs = registry.subprojects_in(reg, repo_id)
+        branches = sorted({s.branch for s in subs})
+        if len(branches) > 1:
+            raise OrchError(f"subprojects in this repo name different branches ({', '.join(branches)}); pass --base")
+        if branches:
+            return gitio.default_base(env.repo, branches[0]), f"registry branch of {', '.join(s.name for s in subs)}"
+    return gitio.default_base(env.repo, env.cfg.main_branch), "orch_main_branch"
+
+
+def _portable(path: Path, repo: Path) -> str:
+    """Path as a fix command should print it: relative to the repo root when inside or beside it, else absolute."""
+    path = path.resolve()
+    rel = os.path.relpath(path, repo.resolve())
+    return rel if not rel.startswith(os.pardir + os.sep + os.pardir) else str(path)
+
+
 def cmd_gate(args, env: Env):
-    ci = args.ci or gate.is_ci()
+    source = gate.ci_source()
+    ci = args.ci or bool(source)
     if ci and args.offline:
         raise OrchError("--offline is not allowed in CI: the verdict would depend on which repos were skipped")
     repo_id = "." if env.same else gitio.normalize_repo(args.repo_id or gitio.remote_url(env.repo) or str(env.repo))
-    base = args.base or gitio.default_base(env.repo, env.cfg.main_branch)
     coord = env.coord
     reg = registry.load(coord, env.cfg)
+    base, base_source = _gate_base(args, env, reg, repo_id)
+    flags = []
+    if args.coord:
+        flags += ["--coord", _portable(Path(args.coord), env.repo)]
+    if args.coord_ref:
+        flags += ["--coord-ref", args.coord_ref]
     ctx = gate.Context(
         repo=env.repo, base=base, head=args.head, repo_id=repo_id, coord=coord, cfg=env.cfg, reg=reg,
         stories=stories.load(coord, env.cfg, reg), cache_root=env.cache_root,
-        ci=ci, offline=args.offline,
+        ci=ci, ci_source="--ci" if args.ci else source, offline=args.offline, refs_fetched=env.refs_fetched,
+        base_source=base_source, coord_ref_source=env.coord_ref_source,
+        fix_prefix=["uv", "run", _portable(Path(__file__), env.repo)], fix_flags=flags, fix_base=args.base,
     )
     result = gate.run(ctx)
     code = 0 if result["ok"] else 1
@@ -251,7 +294,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("config", parents=[common], help="resolved orch config")
     sub.add_parser("registry", parents=[common], help="load + validate the subproject registry")
     sub.add_parser("stories", parents=[common], help="parse epics into stories (subproject, depends_on, contract change) + plan issues")
-    sub.add_parser("merged", parents=[common], help="merged story markers across all registry repos (pull-based, cached in .orch/cache)")
+    sub.add_parser("merged", parents=[common], help="merged story markers across all registry repos (pull-based, cached under the git dir)")
     d = sub.add_parser("deps", parents=[common], help="contract detector availability and versions for types used in the registry")
     d.add_argument("--probe", action="store_true",
                    help="also run each installed detector on built-in compatible/breaking fixtures and check its verdicts")
@@ -285,7 +328,9 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--head", default="HEAD",
                    help="commit to gate; a CI merge ref (the PR merged into base) is resolved to the PR tip. Needs full history (fetch-depth 0)")
     g.add_argument("--repo-id", help="this repo's identity as written in the registry (default: origin URL)")
-    g.add_argument("--ci", action="store_true", help="CI mode (also implied by $CI)")
+    g.add_argument("--ci", action="store_true",
+                   help="CI mode (also implied by CI, GITHUB_ACTIONS, GITLAB_CI, BUILDKITE, JENKINS_URL, TF_BUILD or "
+                        "TEAMCITY_VERSION); local runs fetch origin first, CI runs do not")
     g.add_argument("--format", choices=["json", "text", "markdown"], default="json",
                    help="markdown suits $GITHUB_STEP_SUMMARY or a PR comment; -o still writes the JSON")
     g.add_argument("-o", "--output", help="also write the JSON result to this file")
@@ -299,6 +344,8 @@ COMMANDS = {"config": cmd_config, "registry": cmd_registry, "stories": cmd_stori
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="backslashreplace")  # a non-UTF-8 path in a message must not crash the report
     try:
         if args.cmd == "sprint-status" and args.action == "merge":
             if len(args.files) != 3:

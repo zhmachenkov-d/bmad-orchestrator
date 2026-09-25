@@ -1,7 +1,7 @@
 import os
 
 import yaml
-from conftest import C, R, SPRINT, Repo, check, fake_bin, registry_yaml, run_cli
+from conftest import C, EPICS, R, SPRINT, Repo, check, fake_bin, registry_yaml, run_cli
 
 IMPL = "services/payment/app.py"
 OAS = f"{C}/payment-service/openapi.yaml"
@@ -230,6 +230,9 @@ def test_result_records_inputs_and_dirty_tree_never_changes_the_verdict(mono):
     assert [n["code"] for n in res["notices"]] == ["dirty-worktree"] and "wip.py" in res["notices"][0]["message"]
     code, res = gate(mono, "--ci")
     assert code == 0 and res["notices"] == []
+    mono.write("README.md", "edited, not committed\n")  # a tracked edit sorts first and starts with " M"
+    code, res = gate(mono)
+    assert ": README.md, services/payment/wip.py" in res["notices"][0]["message"]
 
 
 def test_shallow_clone_names_the_fix(mono, tmp_path):
@@ -310,11 +313,13 @@ def test_findings_carry_codes_and_mechanical_fixes(mono):
     assert all("code" in f for c in res["checks"] for f in c["findings"])
     stale = check(res, "pins")["findings"][0]
     assert stale["code"] == "pin-stale"
-    assert stale["fix"]["command"] == ["orch.py", "marker", "write", "--story", "1-3"] and "rebase" in stale["fix"]["precondition"]
+    cmd = stale["fix"]["command"]
+    assert cmd[:2] == ["uv", "run"] and cmd[2].endswith("orch-gate/scripts/orch.py")
+    assert cmd[3:] == ["marker", "write", "--story", "1-3", "--base", "main"] and "rebase" in stale["fix"]["precondition"]
     driver = check(res, "merge-driver")["findings"][0]
-    assert driver["code"] == "driver-missing" and driver["fix"]["command"][1:] == ["sprint-status", "install-driver"]
+    assert driver["code"] == "driver-missing" and driver["fix"]["command"][3:] == ["sprint-status", "install-driver"]
     code, out = gate(mono, "--format", "text")
-    assert "[pin-stale]" in out and "then run: orch.py marker write --story 1-3" in out
+    assert "[pin-stale]" in out and f"then run: uv run {cmd[2]} marker write --story 1-3 --base main" in out
 
 
 def test_conformance_failure_shows_the_diff(mono):
@@ -468,6 +473,8 @@ def test_polyrepo_code_repo(tmp_path):
     code_repo.checkout("main").git("merge", "-q", "orch/1-2")
     code, res = run_cli("merged", "--repo", str(coord.path))
     assert "1-2" in res["merged"], res
+    # The fetch cache lives in the git dir, where no commit can pick it up.
+    assert (coord.path / ".git/orch-cache/repos").is_dir() and not (coord.path / ".orch").exists()
 
 
 def test_wrong_repo_for_story(tmp_path, mono):
@@ -490,3 +497,532 @@ def test_merge_driver_resolves_real_git_conflict(mono):
     text = (mono.path / STATUS).read_text()
     assert "1-2-implement-payment-api: review" in text and "1-3-user-service-calls-payments: in-progress" in text
     assert "<<<<<<<" not in text
+
+
+# ---- setup fails closed ----
+
+def test_repo_without_orch_setup_fails_instead_of_passing(tmp_path):
+    r = Repo(tmp_path / "fresh")
+    r.write("README.md", "x\n").commit()
+    r.branch("x").write("services/pay/a.py", "x\n").commit()
+    code, res = gate(r)
+    codes = {f["code"] for f in check(res, "setup")["findings"]}
+    assert code == 1 and {"registry-empty", "no-epics"} <= codes, res
+
+
+def test_broken_registry_fails_every_pr_until_a_repair_pr(mono):
+    good = (mono.path / f"{R}/user-service.yaml").read_text()
+    mono.write(f"{R}/user-service.yaml", "name: user-service\npath: services/user\nallowed_write: [services/user/**\n").commit("broken")
+    # The broken entry drops out of the registry, so without the setup check this markerless PR would pass.
+    mono.branch("sneaky").write("services/user/app.py", "no story\n").commit()
+    code, res = gate(mono)
+    assert code == 1 and "registry-invalid" in {f["code"] for f in check(res, "setup")["findings"]}
+    mono.checkout("main").branch("repair").write(f"{R}/user-service.yaml", good).commit()
+    code, res = gate(mono)
+    assert code == 0, res
+    assert check(res, "setup")["findings"][0]["code"] == "setup-repair"
+    # A "repair" that also changes anything outside registry and planning files is judged normally.
+    mono.write("services/user/app.py", "sneak along\n").commit()
+    assert gate(mono)[0] == 1
+
+
+def test_registry_entry_without_repo_is_not_defaulted_to_this_repo(mono):
+    mono.write(f"{R}/user-service.yaml", "name: user-service\npath: services/user\nallowed_write: ['services/user/**']\n").commit()
+    code, res = run_cli("registry", "--repo", str(mono.path))
+    assert code == 1 and "user-service" not in res["subprojects"]
+    assert any(i["code"] == "missing-field" and "'repo'" in i["message"] for i in res["issues"])
+
+
+def test_wildcard_free_allowed_write_protects_the_directory(mono):
+    text = (mono.path / f"{R}/user-service.yaml").read_text().replace('allowed_write: ["services/user/**"]',
+                                                                      'allowed_write: ["services/user"]')
+    mono.write(f"{R}/user-service.yaml", text).commit()
+    mono.branch("x").write("services/user/app.py", "no story\n").commit()
+    code, res = gate(mono)
+    assert code == 1 and check(res, "scope")["findings"][0]["code"] == "needs-story"
+
+
+# ---- directory contracts ----
+
+EVENTS = f"{C}/events/proto"
+BUF = """import os, sys
+h, b = sys.argv[2], sys.argv[4]
+assert sorted(os.listdir(h)) == sorted(os.listdir(b)) == ['a.proto', 'b.proto'], (os.listdir(h), os.listdir(b))
+sys.exit(1 if any('BREAK' in open(os.path.join(h, f)).read() for f in os.listdir(h)) else 0)
+"""
+
+
+def events_repo(mono):
+    mono.write(f"{R}/events.yaml", registry_yaml("events", "services/events",
+                                                 exports=[("protobuf", EVENTS, "services/events/proto")]))
+    for root in (EVENTS, "services/events/proto"):
+        mono.write(f"{root}/a.proto", 'syntax = "proto3";\nmessage A {}\n').write(f"{root}/b.proto", 'syntax = "proto3";\nmessage B {}\n')
+    mono.write("services/events/app.py", "x\n")
+    epics = mono.path / "_bmad-output/planning-artifacts/epics.md"
+    mono.write("_bmad-output/planning-artifacts/epics.md", epics.read_text() + (
+        "\n### Story 1.5: Events impl\n**Subproject:** events\n**Depends on:** 1.1\n"
+        "\n### Story 1.6: Events contract\n**Subproject:** contracts\n**Depends on:** none\n**Contract change:** expand\n"))
+    mono.commit("events")
+
+
+def test_directory_contract_copies_compare_file_by_file(mono):
+    events_repo(mono)
+    mono.branch("orch/1-5").write("services/events/app.py", "y\n")
+    marker(mono, "1-5")
+    mono.commit()
+    code, res = gate(mono)
+    assert code == 0 and check(res, "conformance")["status"] == "pass", res
+    mono.write("services/events/proto/b.proto", 'syntax = "proto3";\nmessage B { string x = 1; }\n').commit()
+    code, res = gate(mono)
+    drift = check(res, "conformance")["findings"][0]
+    assert code == 1 and drift["code"] == "copy-drift" and "1 changed" in drift["message"]
+    assert "+message B { string x = 1; }" in drift["detail"]
+
+
+def test_protobuf_directory_contract_runs_the_detector_on_both_trees(mono, tmp_path):
+    path = fake_bin(tmp_path, "buf", BUF)
+    events_repo(mono)
+    mono.branch("orch/1-6").write(f"{EVENTS}/b.proto", 'syntax = "proto3";\nmessage B { string x = 1; }\n').commit()
+    marker(mono, "1-6")
+    mono.commit()
+    code, res = gate(mono, env={"PATH": path})
+    assert code == 0, res
+    mono.write(f"{EVENTS}/a.proto", 'syntax = "proto3";\n// BREAK\n').commit()
+    marker(mono, "1-6")
+    mono.commit()
+    code, res = gate(mono, env={"PATH": path})
+    assert code == 1 and check(res, "breaking")["findings"][0]["code"] == "breaking-change"
+
+
+def test_openapi_canonical_must_be_a_file(mono):
+    mono.write(f"{C}/payment-service/api/openapi.yaml", "openapi: 3.0.0\n")
+    mono.write(f"{R}/payment-service.yaml", registry_yaml(
+        "payment-service", "services/payment", exports=[("openapi", f"{C}/payment-service/api", None)])).commit()
+    code, res = run_cli("registry", "--repo", str(mono.path))
+    assert code == 1 and any(i["code"] == "canonical-kind" for i in res["issues"])
+
+
+# ---- narrow stories, archives ----
+
+def test_narrow_verdict_does_not_depend_on_depends_on_order(mono, tmp_path):
+    path = fake_bin(tmp_path, "oasdiff", ODIFF)
+    mono.branch("orch/1-3").write("services/user/app.py", "migrated\n")
+    marker(mono, "1-3")
+    mono.commit()
+    mono.checkout("main").git("merge", "-q", "--no-ff", "orch/1-3", "-m", "merge 1-3")
+    for order in ("1.3, 1.5", "1.5, 1.3"):
+        # user-service has two stories in Depends on; only 1.3 is merged, so it has not fully migrated either way.
+        mono.checkout("main").write("_bmad-output/planning-artifacts/epics.md", EPICS + (
+            "\n### Story 1.5: More user work\n**Subproject:** user-service\n**Depends on:** 1.1\n"
+            f"\n### Story 1.6: Narrow again\n**Subproject:** contracts\n**Depends on:** {order}\n**Contract change:** narrow\n"))
+        mono.commit(f"plan {order}")
+        mono.git("checkout", "-q", "-B", "orch/1-6")
+        mono.write(OAS, "openapi: 3.0.0\n# BREAK\n").commit()
+        marker(mono, "1-6")
+        mono.commit()
+        code, res = gate(mono, env={"PATH": path})
+        msgs = [f["message"] for f in check(res, "breaking")["findings"]]
+        assert code == 1 and any("not yet migrated: user-service" in m for m in msgs), (order, res)
+
+
+def test_archive_under_the_wrong_epic_is_rejected(mono):
+    mono.branch("orch/1-2").write(IMPL, "x\n")
+    marker(mono, "1-2")
+    mono.commit()
+    mono.checkout("main").git("merge", "-q", "--no-ff", "orch/1-2", "-m", "m")
+    mono.branch("archive")
+    (mono.path / ".orch/archive/epic-2").mkdir(parents=True)
+    mono.git("mv", ".orch/stories/1-2.yaml", ".orch/archive/epic-2/1-2.yaml")
+    mono.commit()
+    code, res = gate(mono)
+    assert code == 1 and "belongs to epic 1" in check(res, "scope")["findings"][0]["message"]
+    mono.checkout("main").git("merge", "-q", "archive")
+    code, res = run_cli("epic", "close-check", "--epic", "1", "--repo", str(mono.path))
+    assert any(p["story"] == "1-2" and "not archived under .orch/archive/epic-1/" in p["message"] for p in res["problems"])
+
+
+# ---- verdict inputs, runnable fixes, config ----
+
+def test_polyrepo_verdict_inputs_and_runnable_fixes(tmp_path):
+    coord = Repo(tmp_path / "coord")
+    code_repo = Repo(tmp_path / "payment")
+    url = str(code_repo.path)
+    coord.write(f"{R}/payment-service.yaml", registry_yaml("payment-service", "src", repo=url) + "branch: develop\n")
+    coord.write("_bmad-output/planning-artifacts/epics.md", "## Epic 1: P\n### Story 1.2: Impl\n**Subproject:** payment-service\n")
+    coord.write(STATUS, "development_status:\n  epic-1: in-progress\n  1-2-impl: backlog\n")
+    coord.commit()
+    code_repo.write("src/app.py", "x\n").commit()
+    code_repo.git("branch", "develop")
+    code_repo.branch("orch/1-2").write("src/app.py", "y\n")
+    code_repo.write(".orch/stories/1-2.yaml", yaml.safe_dump({"story": "1-2", "epic": 9, "contract_pins": {}})).commit()
+    # No --base: a code repo is gated against its registry branch, the one merged() reads.
+    code, res = run_cli("gate", "--repo", url, "--coord", str(coord.path), "--repo-id", url)
+    assert res["base"] == "develop" and res["base_source"] == "registry branch of payment-service", res
+    assert res["coord_ref_source"] == "default branch name"
+    mismatch = next(f for f in check(res, "marker")["findings"] if f["code"] == "marker-epic-mismatch")
+    cmd = mismatch["fix"]["command"]
+    assert cmd[cmd.index("--coord") + 1] == "../coord" and "--base" not in cmd
+    code, res = run_cli("gate", "--repo", url, "--coord", str(coord.path), "--repo-id", "github.com/x/other")
+    assert code == 1 and any(f["code"] == "repo-unregistered" for f in check(res, "setup")["findings"])
+    # A coordination PR that reads the code repo records which commit it read.
+    code_repo.checkout("develop").git("merge", "-q", "orch/1-2")
+    coord.branch("status").write(STATUS, "development_status:\n  epic-1: in-progress\n  1-2-impl: done\n").commit()
+    code, res = run_cli("gate", "--repo", str(coord.path), "--base", "main")
+    assert code == 0, res
+    assert res["repos_read"] == [{"repo": url, "branch": "develop", "sha": code_repo.git("rev-parse", "develop")}]
+
+
+def test_personal_layers_never_reach_the_verdict_but_user_settings_resolve_locally(mono):
+    mono.write("_bmad/config.user.toml", '[modules.orch]\norch_registry_dir = "nowhere"\n').commit("tracked personal layer")
+    mono.write("_bmad/custom/config.user.toml", '[modules.orch]\norch_worktrees_dir = "../my-trees"\n')
+    code, res = run_cli("config", "--repo", str(mono.path))
+    assert res["config"]["registry_dir"] == R and res["config"]["worktrees_dir"] == "../my-trees", res
+    (mono.path / "_bmad/custom/config.user.toml").unlink()
+    mono.git("remote", "add", "origin", "git@example.com:org/shop.git")
+    code, res = run_cli("config", "--repo", str(mono.path))
+    assert res["config"]["project_name"] == "shop" and res["config"]["worktrees_dir"] == "../shop-worktrees"
+
+
+def test_missing_coordination_main_names_coord_ref(tmp_path):
+    r = Repo(tmp_path / "trunk")
+    r.write("a.txt", "1").commit()
+    r.git("branch", "-m", "trunk")
+    code, res = run_cli("config", "--repo", str(r.path))
+    assert code == 2 and "--coord-ref" in res["error"]
+
+
+# ---- same verdict on every machine ----
+
+def test_non_ascii_paths_read_the_same_under_any_quotepath(mono):
+    mono.write(f"{R}/zahlung-ü.yaml", registry_yaml("zahlung-ü", "services/zahlung"))
+    mono.write("services/zahlung/app.py", "x\n")
+    mono.git("mv", "_bmad-output/planning-artifacts/epics.md", "_bmad-output/planning-artifacts/epics-Überblick.md")
+    mono.commit("non-ascii names")
+    mono.branch("x").write("services/zahlung/app.py", "no story\n").commit()
+    for quote in ("true", "false"):
+        mono.git("config", "core.quotePath", quote)
+        code, res = gate(mono)
+        assert code == 1, (quote, res)
+        assert check(res, "scope")["findings"][0]["code"] == "needs-story", (quote, res)
+        assert "no-epics" not in {f["code"] for f in check(res, "setup")["findings"]}, (quote, res)
+
+
+def test_local_gate_fetches_origin_before_reading(mono, tmp_path):
+    remote = tmp_path / "remote.git"
+    mono.git("clone", "-q", "--bare", str(mono.path), str(remote))
+    mono.git("remote", "add", "origin", str(remote))
+    dev = Repo.__new__(Repo)
+    dev.path = tmp_path / "dev"
+    mono.git("clone", "-q", str(remote), str(dev.path))
+    dev.branch("orch/1-3").write("services/user/app.py", "uses payments\n")
+    marker(dev, "1-3")
+    dev.commit()
+    # Someone else moves the contract on the remote main after this clone last fetched.
+    mono.write(OAS, "openapi: 3.0.0\npaths: {/pay: {}}\n").write("services/payment/openapi.yaml", "openapi: 3.0.0\npaths: {/pay: {}}\n")
+    mono.commit("contract moved")
+    mono.git("push", "-q", "origin", "main")
+    code, res = run_cli("gate", "--repo", str(dev.path))
+    assert code == 1 and check(res, "pins")["findings"][0]["code"] == "pin-stale", res
+    assert res["refs_fetched"] == [{"repo": str(dev.path), "remote": "origin", "ok": True}]
+    # A fetch that fails is a notice; the verdict still comes from the refs the clone has.
+    dev.git("remote", "set-url", "origin", str(tmp_path / "gone.git"))
+    code, res = run_cli("gate", "--repo", str(dev.path))
+    notice = next(n for n in res["notices"] if n["code"] == "refs-not-refreshed")
+    assert code == 1 and "stale origin/*" in notice["message"] and res["refs_fetched"][0]["ok"] is False
+    code, res = run_cli("gate", "--repo", str(dev.path), "--ci")
+    assert res["refs_fetched"] == [] and res["ci_source"] == "--ci"
+
+
+def test_ci_is_detected_from_provider_variables(mono):
+    mono.write(".gitattributes", f"{STATUS} merge=orch-sprint-status\n").commit()
+    mono.branch("x").write("README.md", "y\n").commit()
+    code, res = gate(mono, env={"JENKINS_URL": "https://jenkins.example"})
+    assert code == 0 and res["ci"] is True and res["ci_source"] == "JENKINS_URL", res
+    assert check(res, "merge-driver")["status"] == "skip"
+    assert gate(mono, "--offline", env={"TF_BUILD": "True"})[0] == 2
+    code, res = gate(mono, env={"GITHUB_ACTIONS": "false"})
+    assert res["ci"] is False and check(res, "merge-driver")["status"] == "fail"
+
+
+def test_text_and_markdown_carry_the_verdict_inputs(mono):
+    mono.branch("orch/1-2").write(IMPL, "x\n")
+    marker(mono, "1-2")
+    mono.commit()
+    main = mono.git("rev-parse", "main")[:10]
+    for fmt in ("text", "markdown"):
+        code, out = gate(mono, "--format", fmt)
+        assert code == 0 and f"inputs: base main@{main} (explicit)" in out and f"coord main@{main}" in out, out
+        assert f"head {mono.git('rev-parse', 'HEAD')[:10]}" in out and "ci no" in out
+
+
+def test_empty_diff_is_a_notice_not_a_silent_pass(mono):
+    code, res = gate(mono)
+    assert code == 0 and "empty-diff" in {n["code"] for n in res["notices"]}
+
+
+# ---- merge records are append-only ----
+
+def merged_and_archived(mono):
+    mono.branch("orch/1-2").write(IMPL, "x\n")
+    marker(mono, "1-2")
+    mono.commit()
+    mono.checkout("main").git("merge", "-q", "--no-ff", "orch/1-2", "-m", "m")
+    (mono.path / ".orch/archive/epic-1").mkdir(parents=True)
+    mono.git("mv", ".orch/stories/1-2.yaml", ".orch/archive/epic-1/1-2.yaml")
+    mono.write("_bmad-output/orch/closed/epic-1.yaml", "epic: 1\n")
+    mono.commit("archive and close")
+
+
+def test_archived_markers_and_close_records_cannot_change(mono):
+    merged_and_archived(mono)
+    cases = [
+        ("edit", lambda: mono.write(".orch/archive/epic-1/1-2.yaml", "story: '1-2'\nepic: 1\ncontract_pins: {}\n"), "archived-marker-modified"),
+        ("delete", lambda: mono.rm(".orch/archive/epic-1/1-2.yaml"), "archived-marker-removed"),
+        ("reopen", lambda: mono.write("_bmad-output/orch/closed/epic-1.yaml", "epic: 1\nreopened: true\n"), "closed-record-changed"),
+        ("junk", lambda: mono.write(".orch/notes.txt", "x\n"), "orch-record-changed"),
+    ]
+    for name, change, code_ in cases:
+        mono.checkout("main").branch(name)
+        change()
+        mono.commit()
+        code, res = gate(mono)
+        assert code == 1 and code_ in {f["code"] for f in check(res, "scope")["findings"]}, (name, res)
+
+
+# ---- registry shapes ----
+
+def test_empty_allowed_write_fails_setup_instead_of_unprotecting(mono):
+    text = (mono.path / f"{R}/user-service.yaml").read_text().replace('allowed_write: ["services/user/**"]', "allowed_write: []")
+    mono.write(f"{R}/user-service.yaml", text).commit()
+    mono.branch("x").write("services/user/app.py", "no story\n").commit()
+    code, res = gate(mono)
+    msgs = [f["message"] for f in check(res, "setup")["findings"] if f["code"] == "registry-invalid"]
+    assert code == 1 and any("allowed_write" in m for m in msgs), res
+
+
+def test_misshapen_registry_is_an_issue_and_its_repair_passes(mono):
+    good = (mono.path / f"{R}/user-service.yaml").read_text()
+    mono.write(f"{R}/user-service.yaml", good.replace("contracts:\n  exports: []\n  imports: [payment-service]\n",
+                                                      "contracts: [payment-service]\n")).commit("broken shape")
+    code, res = run_cli("registry", "--repo", str(mono.path))
+    assert code == 1 and any(i["code"] == "bad-field" for i in res["issues"]), res
+    mono.branch("repair").write(f"{R}/user-service.yaml", good).commit()
+    code, res = gate(mono)
+    assert code == 0 and check(res, "setup")["findings"][0]["code"] == "setup-repair", res
+
+
+def test_write_overlap_compares_normalized_repos(mono):
+    for name, url in (("a", "git@github.com:o/code.git"), ("b", "https://github.com/o/code")):
+        mono.write(f"{R}/{name}.yaml", registry_yaml(name, "services/shared", repo=url))
+    mono.commit()
+    code, res = run_cli("registry", "--repo", str(mono.path))
+    assert any(i["code"] == "write-overlap" for i in res["issues"]), res
+
+
+# ---- plan issues ----
+
+def test_plan_issues_fail_the_own_story_and_warn_for_others(mono):
+    mono.write("_bmad-output/planning-artifacts/epics.md", EPICS + (
+        "\n### Story 1.5: Refunds\n**Subproject:** payment-service\n**Depends on:** 1.9\n")).commit("plan")
+    mono.branch("orch/1-2").write(IMPL, "x\n")
+    marker(mono, "1-2")
+    mono.commit()
+    code, res = gate(mono)
+    assert code == 0 and "unknown-dependency" in {f["code"] for f in check(res, "setup")["findings"]}, res
+    mono.checkout("main").branch("orch/1-5").write(IMPL, "refunds\n")
+    marker(mono, "1-5")
+    mono.commit()
+    code, res = gate(mono)
+    assert code == 1 and "unknown-dependency" in {f["code"] for f in check(res, "marker")["findings"]}, res
+
+
+# ---- sprint status: the gate and derive agree ----
+
+def test_own_story_in_review_is_fine_and_the_derive_fix_clears_its_finding(mono):
+    mono.branch("orch/1-2").write(IMPL, "x\n")
+    mono.write(STATUS, SPRINT.replace("1-2-implement-payment-api: backlog", "1-2-implement-payment-api: review"))
+    marker(mono, "1-2")
+    mono.commit()
+    code, res = gate(mono)
+    assert code == 0 and check(res, "sprint-status")["findings"] == [], res
+    mono.checkout("main").git("merge", "-q", "--no-ff", "orch/1-2", "-m", "m")
+    status = (mono.path / STATUS).read_text()
+    mono.branch("status").write(STATUS, status.replace("1-3-user-service-calls-payments: backlog",
+                                                       "1-3-user-service-calls-payments: in-progress")).commit()
+    code, res = gate(mono)
+    lag = next(f for f in check(res, "sprint-status")["findings"] if f["code"] == "merged-not-done")
+    cmd = lag["fix"]["command"]
+    assert cmd[3:] == ["sprint-status", "derive", "--write"], cmd
+    assert run_cli(*cmd[3:], "--repo", str(mono.path))[0] == 0
+    mono.commit("derive")
+    code, res = gate(mono)
+    assert code == 0 and "merged-not-done" not in {f["code"] for f in check(res, "sprint-status")["findings"]}, res
+
+
+def test_communication_language_resolves_in_stock_layer_order(mono):
+    for layer, lang in (("config.toml", "English"), ("config.user.toml", "German"), ("custom/config.toml", "Russian")):
+        mono.write(f"_bmad/{layer}", f'[core]\ncommunication_language = "{lang}"\n')
+    code, res = run_cli("config", "--repo", str(mono.path))
+    assert res["config"]["communication_language"] == "Russian", res
+    mono.write("_bmad/custom/config.user.toml", '[core]\ncommunication_language = "French"\n')
+    assert run_cli("config", "--repo", str(mono.path))[1]["config"]["communication_language"] == "French"
+
+
+# ---- review round: records, setup PRs, environment ----
+
+def test_a_merged_story_cannot_be_reopened(mono):
+    mono.branch("orch/1-2").write(IMPL, "x\n")
+    marker(mono, "1-2")
+    mono.commit()
+    mono.checkout("main").git("merge", "-q", "--no-ff", "orch/1-2", "-m", "m")
+    mono.branch("touch").write(IMPL, "more\n").write(".orch/stories/1-2.yaml", (mono.path / ".orch/stories/1-2.yaml").read_text() + "# again\n")
+    mono.commit()
+    code, res = gate(mono)
+    assert code == 1 and check(res, "marker")["findings"][0]["code"] == "marker-already-merged", res
+    mono.checkout("main")
+    (mono.path / ".orch/archive/epic-1").mkdir(parents=True)
+    mono.git("mv", ".orch/stories/1-2.yaml", ".orch/archive/epic-1/1-2.yaml")
+    mono.commit("archive")
+    mono.branch("readd").write(IMPL, "unplanned\n")
+    marker(mono, "1-2")
+    mono.commit()
+    code, res = gate(mono)
+    assert code == 1 and ".orch/archive/epic-1/1-2.yaml" in check(res, "marker")["findings"][0]["message"], res
+
+
+def test_an_invalid_archive_entry_is_reported_once(mono):
+    mono.branch("orch/1-2").write(IMPL, "x\n")
+    marker(mono, "1-2")
+    mono.write(".orch/archive/epic-1/1-1.yaml", "story: '1-1'\nepic: 1\n").commit()
+    code, res = gate(mono)
+    assert code == 1 and [f["code"] for f in check(res, "scope")["findings"]] == ["archive-move-invalid"], res
+
+
+def test_a_coordination_pr_cannot_break_a_healthy_setup(mono):
+    text = (mono.path / f"{R}/user-service.yaml").read_text().replace('allowed_write: ["services/user/**"]', "allowed_write: []")
+    mono.branch("reg").write(f"{R}/user-service.yaml", text).commit()
+    code, res = gate(mono)
+    fails = [f for f in check(res, "setup")["findings"] if f["level"] == "fail"]
+    assert code == 1 and fails and all(f["message"].startswith("introduced by this PR") for f in fails), res
+    mono.checkout("main").branch("plan").write("_bmad-output/planning-artifacts/epics.md", EPICS + (
+        "\n### Story 1.5: Refunds\n**Subproject:** payment-service\n**Depends on:** 1.2\n")).commit()
+    assert gate(mono)[0] == 0
+
+
+def test_dot_slash_repo_is_the_coordination_repo(mono):
+    text = registry_yaml("user-service", "services/user", imports=["payment-service"], repo="./").replace(
+        'allowed_write: ["services/user/**"]', f'allowed_write: ["services/user/**", "{C}/**"]')
+    mono.write(f"{R}/user-service.yaml", text).commit()
+    code, res = run_cli("registry", "--repo", str(mono.path))
+    assert res["subprojects"]["user-service"]["repo"] == "." and "writes-contracts" in {i["code"] for i in res["issues"]}, res
+
+
+def test_registry_values_that_would_crash_are_issues(mono):
+    good = (mono.path / f"{R}/payment-service.yaml").read_text()
+    cases = {
+        "deep": (good + "x: " + "[" * 5000 + "]" * 5000 + "\n", "yaml"),
+        "date-key": (good.replace("copy: services/payment/openapi.yaml}", "copy: services/payment/openapi.yaml, 2020-01-01: x}"), "bad-export"),
+        "dev-url": (good.replace("copy: services/payment/openapi.yaml}", "copy: services/payment/openapi.yaml, dev_url: 5}"), "bad-export"),
+        "copy-false": (good.replace("copy: services/payment/openapi.yaml}", "copy: false}"), "bad-export"),
+        "branch-blank": (good + "branch: ''\n", "bad-field"),
+        "path-root": (good.replace("path: services/payment", "path: /"), "missing-field"),
+    }
+    for name, (text, issue) in cases.items():
+        mono.checkout("main").branch(name).write(f"{R}/payment-service.yaml", text).commit()
+        code, res = run_cli("registry", "--repo", str(mono.path), "--coord-ref", name)
+        assert code == 1 and issue in {i["code"] for i in res["issues"]}, (name, res)
+        mono.git("checkout", "-q", "-b", f"{name}-repair")
+        mono.write(f"{R}/payment-service.yaml", good).commit()
+        code, res = gate(mono, "--base", name)
+        assert code == 0 and check(res, "setup")["findings"][0]["code"] == "setup-repair", (name, res)
+
+
+def test_unreadable_epics_fail_setup(mono):
+    (mono.path / "_bmad-output/planning-artifacts/epics.md").write_bytes(EPICS.encode() + b"\xff\n")
+    mono.commit()
+    mono.branch("x").write("README.md", "y\n").commit()
+    code, res = gate(mono)
+    assert code == 1 and check(res, "setup")["findings"][0]["code"] == "epics-unreadable", res
+
+
+def test_submodules_are_findings_not_crashes(mono, tmp_path):
+    mono.branch("orch/1-2")
+    mono.git("rm", "-q", "services/payment/openapi.yaml")
+    mono.git("update-index", "--add", "--cacheinfo", f"160000,{mono.git('rev-parse', 'HEAD')},services/payment/openapi.yaml")
+    mono.git("commit", "-q", "-m", "gitlink copy")
+    marker(mono, "1-2")
+    mono.git("add", ".orch")  # not add -A: the gitlink has no working-tree directory
+    mono.git("commit", "-q", "-m", "marker")
+    code, res = gate(mono)
+    assert code == 1 and "a submodule" in check(res, "conformance")["findings"][0]["message"], res
+    path = fake_bin(tmp_path, "buf", BUF)
+    mono.checkout("main")
+    events_repo(mono)
+    mono.branch("orch/1-6")
+    mono.git("update-index", "--add", "--cacheinfo", f"160000,{mono.git('rev-parse', 'HEAD')},{EVENTS}/vendored")
+    mono.git("commit", "-q", "-m", "gitlink in proto dir")
+    marker(mono, "1-6")
+    mono.git("add", ".orch")
+    mono.git("commit", "-q", "-m", "marker")
+    code, res = gate(mono, env={"PATH": path})
+    assert code in (0, 1) and "error" not in res, res
+
+
+def test_non_utf8_paths_do_not_crash_the_gate(mono):
+    mono.branch("docs")
+    (mono.path / os.fsdecode(b"docs/caf\xe9.md")).parent.mkdir()
+    (mono.path / os.fsdecode(b"docs/caf\xe9.md")).write_text("x\n")
+    mono.commit()
+    (mono.path / os.fsdecode(b"notes-\xff.txt")).write_text("uncommitted\n")
+    local, ci = gate(mono), gate(mono, "--ci")
+    assert local[0] == ci[0] == 0 and local[1]["changed"] == ci[1]["changed"], (local, ci)
+    assert gate(mono, "--format", "text")[0] == 0
+
+
+def test_hook_environment_does_not_redirect_git(mono, tmp_path):
+    other = Repo(tmp_path / "other")
+    other.write("x", "y\n").commit()
+    mono.branch("orch/1-2").write(IMPL, "x\n")
+    marker(mono, "1-2")
+    mono.commit()
+    expected = gate(mono)
+    got = gate(mono, env={"GIT_DIR": str(other.path / ".git"), "GIT_WORK_TREE": str(other.path)})
+    assert got[0] == expected[0] == 0 and got[1]["head_sha"] == expected[1]["head_sha"], got
+
+
+def test_concurrent_fetches_share_the_cache(tmp_path):
+    import threading
+
+    from orchlib import gitio
+    up = Repo(tmp_path / "up")
+    errors = []
+
+    def fetch():
+        try:
+            gitio.fetch_tree(str(up.path), "main", tmp_path / "cache")
+        except Exception as exc:  # noqa: BLE001 - any failure is the bug
+            errors.append(str(exc))
+
+    for i in range(5):
+        up.write("a", f"{i}\n").commit()
+        threads = [threading.Thread(target=fetch) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    assert not errors, errors[:3]
+    # A lock left by an interrupted fetch does not block the next one.
+    next(iter((tmp_path / "cache").glob("*.git")), None).joinpath("shallow.lock").write_text("")
+    up.write("a", "last\n").commit()
+    fetch()
+    assert not errors, errors
+
+
+def test_marker_fix_says_to_check_out_the_gated_head(mono):
+    mono.branch("orch/1-2").write(IMPL, "x\n").write(".orch/stories/1-2.yaml", "story: '1-2'\n").commit()
+    pre = next(f for f in check(gate(mono)[1], "marker")["findings"] if f.get("fix"))["fix"]["precondition"]
+    assert not pre.startswith("check out"), pre
+    mono.checkout("main")
+    code, res = gate(mono, "--head", "orch/1-2")
+    pre = next(f for f in check(res, "marker")["findings"] if f.get("fix"))["fix"]["precondition"]
+    assert code == 1 and pre.startswith("check out orch/1-2, then "), pre

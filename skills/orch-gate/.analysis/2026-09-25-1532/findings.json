@@ -1,0 +1,211 @@
+{
+  "schema_version": 2,
+  "subject": "skills/orch-gate",
+  "generated": "2026-09-25",
+  "verdict": "The 24 findings from the last run are all fixed. What is left is mostly script-level: a local verdict can still differ from CI because of machine state (git quotePath, stale origin refs), and several registry and archive shapes still fail open.",
+  "grade": "fair",
+  "summary": "The prompt side is close to done. Leanness, customization and architecture confirmed every earlier finding fixed and raised only small coherence gaps, and SKILL.md is 1917 tokens with a clean script/prompt split. The biggest remaining opportunity is the gate's core promise of the same verdict locally and in CI. Git listings follow the user's core.quotePath, and a local run reads whatever origin/main was last fetched. Next come the registry, archive and sprint-status paths where malformed or unusual input still passes, crashes, or gets a fix that cannot clear its own finding.",
+  "standards": {
+    "canon": "/workspaces/bmad-orchestrator/.claude/skills/bmad-workflow-builder/references/prompt-quality-canon.md",
+    "principles": "/workspaces/bmad-orchestrator/.claude/skills/bmad-workflow-builder/references/skill-quality-principles.md",
+    "scripts": "/workspaces/bmad-orchestrator/.claude/skills/bmad-workflow-builder/references/script-standards.md"
+  },
+  "themes": [
+    {
+      "title": "The local verdict depends on the machine, not only on the refs",
+      "root_cause": "The gate promises the same verdict locally and in CI, but some inputs still come from the environment. These are the user's git config (quotePath changes ls-tree output), how fresh the local origin refs are (never fetched, while registry repos are), and a narrow CI detection that switches on local-only checks. The text log also cannot show which inputs a run used.",
+      "finding_ids": ["determinism-1", "enhancement-1", "determinism-7", "enhancement-3"],
+      "action": "Pin git's output-affecting config in gitio.git (-c core.quotePath=false) and use -z listings. In local non-offline runs, fetch the base and coordination refs before reading them, and add a notice when the fetch fails. Detect CI from the common provider variables and record ci_source. Print a compact inputs line (shas, sources, repos_read, detector versions) in the text and markdown output."
+    },
+    {
+      "title": "Registry and archive inputs that still fail open or crash",
+      "root_cause": "The setup-repair work made missing and invalid registries fail closed, but validation is still shape-incomplete. Empty allowed_write lists pass as present, and a non-mapping contracts field crashes load, which blocks setup-repair. Overlap is compared on raw repo URLs, archived markers are not protected from edits or deletes, and the setup row promises epic validity that only covers file existence.",
+      "finding_ids": ["determinism-2", "determinism-3", "determinism-4", "determinism-5", "architecture-2"],
+      "action": "Make registry.load total and type-checked: bad shapes and empty required values become registry-invalid issues, never exceptions or permissive defaults. Normalize repos in the overlap check. Protect .orch/archive against modify and delete in every mode. Surface story-plan issues: fail those that concern the PR's own story, and warn about the rest under setup. Add a test for each."
+    },
+    {
+      "title": "sprint-status derive cannot clear the gate's merged-not-done warning",
+      "root_cause": "In a coordination PR the gate counts markers at the PR head as merged, while derive and epic close-check count them on coordination main. So the PR's own story is warned as merged-not-done with a fix that changes nothing, and the SKILL.md fix loop never converges.",
+      "finding_ids": ["architecture-1", "determinism-6"],
+      "action": "Use one merged-set rule. Exempt the PR's own story from the reverse-lag warning, or give derive and close-check a --head ref that the fix.command passes. Test that applying the gate's own fix.command clears the finding on re-run."
+    },
+    {
+      "title": "Prompt residue the script already knows",
+      "root_cause": "A few SKILL.md sentences do lookups or restate defaults that the script resolves and reports itself, and one resolves the language in a different order than stock BMad. The prompt also never tells the agent which PR to gate, so an empty diff reports PASS, and it never mentions the untracked cache.",
+      "finding_ids": ["leanness-1", "customization-1", "determinism-8", "enhancement-2", "architecture-3"],
+      "action": "Expose communication_language through orch.py config in stock layer order and point SKILL.md at it. Shrink the Defaults paragraph to the trusted-read-point sentence. Tell the agent to gate a named PR with --head and --base, and emit an empty-diff notice. Move the fetch cache under the git dir."
+    }
+  ],
+  "strengths": [
+    "Every one of the 24 findings from 2026-09-25-1326 was verified fixed in code, and the 62 tests pass.",
+    "The setup check now fails closed on an empty or invalid registry, missing epics and an unregistered repo, and the setup-repair escape prevents a bootstrap deadlock.",
+    "The script owns the verdict and the prompt only explains it. Stable finding codes with a runnable fix.command make the fix loop mechanical.",
+    "The SKILL.md body is 1917 tokens. It uses a single-file layout, with the calling convention in --help and the module plan, and the leanness lens found only one low cut.",
+    "It is fully headless at the script level: JSON or markdown output, with exit codes 0, 1 and 2 separating a pass, a failing verdict and an environment error."
+  ],
+  "recommendations": [
+    { "rank": 1, "action": "Pin git output config (-c core.quotePath=false, -z listings) in gitio so the same commit gives the same verdict on every machine.", "resolves": ["determinism-1"] },
+    { "rank": 2, "action": "Make registry.load total and shape-checked, treat empty required values as missing, normalize repos in the overlap check, and protect .orch/archive against edits and deletes.", "resolves": ["determinism-2", "determinism-3", "determinism-4", "determinism-5"] },
+    { "rank": 3, "action": "Unify the merged-set rule between the gate's sprint-status check and derive or close-check, so the attached fix clears its own finding.", "resolves": ["architecture-1", "determinism-6"] },
+    { "rank": 4, "action": "Fetch the base and coordination refs in local runs, and print an inputs line in the text and markdown output.", "resolves": ["enhancement-1", "enhancement-3"] },
+    { "rank": 5, "action": "Move communication_language into orch.py config, trim the Defaults paragraph, add gate-a-named-PR guidance and an empty-diff notice, and move the cache under the git dir.", "resolves": ["customization-1", "determinism-8", "leanness-1", "enhancement-2", "architecture-3"] },
+    { "rank": 6, "action": "Surface story-plan issues from the gate, and broaden CI detection with a recorded ci_source.", "resolves": ["architecture-2", "determinism-7"] }
+  ],
+  "experience": {
+    "journeys": [
+      { "name": "Developer checks a story branch locally", "steps": "Commit, run gate --format text -o tmp.json, apply fix.command when mechanical, commit, re-run. The loop works. The gap is that without a fetch, pins and scope run against a stale origin/main and can pass a branch that CI fails." },
+      { "name": "Developer asks why CI failed", "steps": "With the JSON artifact, findings are explained by code and the inputs are compared. With only the job log, there are no shas to compare. A local re-run gates the current checkout, which may not be the PR being asked about, and an empty diff reports PASS." },
+      { "name": "First-time adopter wires CI before setup", "steps": "Now fails closed. registry-empty, no-epics and repo-unregistered each name the fix, and a repair PR passes as setup-repair. Some malformed registry shapes still crash before the repair can run." },
+      { "name": "Contract author ships a breaking change", "steps": "The gate fails with the expand, migrate, contract hint. A narrow change passes only when every consumer's dependencies are merged, and an unreadable consumer repo fails as unverifiable." }
+    ],
+    "headless": "Fully headless at the script level (JSON or markdown output, exit codes 0, 1 and 2). The SKILL.md layer's only confirmation is the offer to run fix.command, and no v1 caller needs a headless variant."
+  },
+  "findings": [
+    {
+      "id": "determinism-1",
+      "lens": "determinism",
+      "severity": "high",
+      "title": "Directory listings depend on core.quotePath, so non-ASCII registry files and epics are silently dropped",
+      "location": "scripts/orchlib/gitio.py:159-163 (Tree.list); registry.py:99, stories.py:126, gitio.py:138, markers.py:92/204",
+      "evidence": "ls-tree runs without -z and inherits the user's git config. With the default quotePath=true, a registry file named zahlung-ü.yaml or an epics file under Überblick/ is C-quoted and filtered out, so the same commit gets needs-story or no-epics under one setting and passes under the other. Tree.files crashes with exit 2 on such directories.",
+      "recommendation": "Use ls-tree -r -z --name-only split on NUL, and pass -c core.quotePath=false in gitio.git. Add a regression test with a non-ASCII registry file and epics subdirectory under both settings."
+    },
+    {
+      "id": "enhancement-1",
+      "lens": "enhancement",
+      "severity": "high",
+      "title": "A local run gates against stale origin refs and can PASS what CI fails",
+      "location": "scripts/orchlib/gitio.py:41-45 default_base; scripts/orch.py:215-226 _gate_base; SKILL.md:21",
+      "evidence": "Nothing fetches the base or coordination ref before a local run, while registry repos are fetched fresh. Reproduced: after a contract change lands on remote main, a story branch gets PASS pins locally, and gets FAIL pin-stale after a plain git fetch.",
+      "recommendation": "In local non-CI, non-offline runs, fetch the base branch and coordination ref first, recorded as refs_fetched. On failure, add a refs-not-refreshed notice without changing the verdict. Add a test reproducing the stale-ref case."
+    },
+    {
+      "id": "determinism-2",
+      "lens": "determinism",
+      "severity": "medium",
+      "title": "Markerless PRs can modify or delete archived markers",
+      "location": "scripts/orchlib/gate.py:229-243; scripts/orchlib/markers.py:183-199 (is_archive_move)",
+      "evidence": "Only deleted story markers and added archive files are examined, so an M or D under .orch/archive/epic-N/ passes. Reproduced: editing or deleting .orch/archive/epic-1/1-2.yaml in a markerless PR returns pass. That archive is the merge record that close_check and sprint-status read.",
+      "recommendation": "Protect .orch/ (except cache) in every mode. Allow only pure archive moves, marker adds and closed records, and fail archived-marker-modified or archived-marker-removed. Add tests for both cases."
+    },
+    {
+      "id": "determinism-3",
+      "lens": "determinism",
+      "severity": "medium",
+      "title": "allowed_write: [] passes the required-field check and leaves the subproject unprotected",
+      "location": "scripts/orchlib/registry.py:117",
+      "evidence": "An empty list is not in (None, \"\"), so the entry loads, validate is silent and setup passes. Reproduced: a markerless PR editing services/user/app.py passes. This contradicts the decision that required fields never default permissively.",
+      "recommendation": "Treat an empty or whitespace-only allowed_write, repo or path as missing-field. Add a test that a markerless PR into sub.path then fails setup."
+    },
+    {
+      "id": "determinism-4",
+      "lens": "determinism",
+      "severity": "medium",
+      "title": "Some registry shapes crash the loader, which also blocks the setup-repair PR",
+      "location": "scripts/orchlib/registry.py:122-124; scripts/orch.py:242",
+      "evidence": "contracts.get(\"exports\") assumes a mapping. With contracts: [payment-service] on main, both orch.py registry and the gate on the PR that fixes it exit 2 with AttributeError, so setup-repair never runs.",
+      "recommendation": "Make load total. Type-check contracts, exports and scalar fields, record a bad-field issue and drop the entry, so a malformed main becomes a registry-invalid failure that a repair PR can clear. Add a test."
+    },
+    {
+      "id": "determinism-5",
+      "lens": "determinism",
+      "severity": "medium",
+      "title": "The write-overlap check compares raw repo strings",
+      "location": "scripts/orchlib/registry.py:177",
+      "evidence": "Two subprojects with the same allowed_write, one at git@github.com:o/code.git and one at https://github.com/o/code, validate clean. The rest of the library normalizes these to the same repo, so one path gets two owners.",
+      "recommendation": "Compare normalize_repo values, and add a validate test with both URL spellings."
+    },
+    {
+      "id": "determinism-6",
+      "lens": "determinism",
+      "severity": "medium",
+      "title": "The derive fix reads a different merged set than the gate, so it cannot clear its own warning",
+      "location": "scripts/orchlib/gate.py:304, 369-370; scripts/orch.py:191, 209",
+      "evidence": "In coordination PRs the gate counts markers at head, while derive and epic close-check count them on coordination main. Reproduced: story 1-2 set to review gets merged-not-done with fix sprint-status derive --write, and running that fix changes nothing. The standalone close-check also misses archives added in the close PR.",
+      "recommendation": "Use one merged-set rule. Either give derive and close-check a --head ref that fix.command passes, or do not attach the derive fix to the PR's own story. Test that applying fix.command clears the finding."
+    },
+    {
+      "id": "architecture-1",
+      "lens": "architecture",
+      "severity": "medium",
+      "title": "merged-not-done is raised on the PR's own story in the normal bmad-build flow",
+      "location": "scripts/orchlib/gate.py:302-309, 364-371; scripts/orchlib/sprint_status.py:143-145",
+      "evidence": "The PR's own marker counts as merged at head, so a coordination story PR that sets its story to review (as stock bmad-build does) is warned merged-not-done. This contradicts the decision that in-progress and review are free, and the attached fix is a no-op (see determinism-6).",
+      "recommendation": "Exclude result['story'] from the reverse-lag warning, and keep the head-based set for the forward invariant. Add a test that a story PR setting its own story to review produces no merged-not-done finding."
+    },
+    {
+      "id": "enhancement-2",
+      "lens": "enhancement",
+      "severity": "medium",
+      "title": "Nothing says which PR to gate, and an empty diff reports PASS",
+      "location": "SKILL.md:21; scripts/orchlib/gate.py:142-156, 218",
+      "evidence": "The skill always gates HEAD. Reproduced: asking about a PR while on main gives PASS non-story change with empty changes, so a user asking why a gate failed is told it passes.",
+      "recommendation": "Add one SKILL.md sentence: gate a named PR or branch with --head and --base. Emit an empty-diff notice when changes is empty."
+    },
+    {
+      "id": "enhancement-3",
+      "lens": "enhancement",
+      "severity": "medium",
+      "title": "Text and markdown output omit the verdict inputs that SKILL.md compares",
+      "location": "scripts/orchlib/gate.py:407-414 render_text, 428-437 render_markdown",
+      "evidence": "SKILL.md explains a CI run from the job log, but render_text prints only ref names and render_markdown only base and head shas. A log-only user cannot compare coord_sha, sources or repos_read.",
+      "recommendation": "Add a compact inputs line to both renderers: base@sha (source), head sha, coord_ref@sha (source), repos_read, detectors_used. Have the orch-setup CI templates upload the -o JSON."
+    },
+    {
+      "id": "architecture-2",
+      "lens": "architecture",
+      "severity": "medium",
+      "title": "The setup row promises structurally valid epics, but only a missing epics file fails",
+      "location": "SKILL.md:33; scripts/orchlib/gate.py:133-135; scripts/orchlib/stories.py:146-176",
+      "evidence": "setup_problems keeps only no-epics. Duplicate stories, forward or unknown dependencies and unknown subprojects never surface, and a duplicate silently keeps its first definition, so the enforced subproject can come from a heading the author did not edit.",
+      "recommendation": "Fail the story issues that concern the PR's own story (stable codes) and warn about the rest under setup, or narrow the SKILL.md row to 'epic files exist'."
+    },
+    {
+      "id": "determinism-7",
+      "lens": "determinism",
+      "severity": "low",
+      "title": "CI detection reads only $CI",
+      "location": "scripts/orchlib/gate.py:381-385, 395-396; scripts/orch.py:237-239",
+      "evidence": "Jenkins, Azure (TF_BUILD) and TeamCity do not set CI. On them, --offline is accepted, the dirty notice runs, and the working-tree merge-driver check can fail every PR.",
+      "recommendation": "Recognize the common CI variables, or have the CI templates pass --ci, and record ci_source in the result."
+    },
+    {
+      "id": "customization-1",
+      "lens": "customization",
+      "severity": "low",
+      "title": "communication_language precedence differs from stock BMad and from USER_LAYERS",
+      "location": "SKILL.md:16; scripts/orchlib/config.py:20",
+      "evidence": "SKILL.md ranks config.user.toml above custom/config.toml. Stock BMad (last layer wins) and orch-gate's own USER_LAYERS rank the team custom layer above the installer's user layer, so a team-pinned language is ignored in the explanations only.",
+      "recommendation": "Resolve it through orch.py config in stock order (see determinism-8), or rewrite the line as custom user > custom team > user > team."
+    },
+    {
+      "id": "determinism-8",
+      "lens": "determinism",
+      "severity": "low",
+      "title": "The model resolves {communication_language} by reading four TOML layers",
+      "location": "SKILL.md:16 (Resolution rules)",
+      "evidence": "The rule is a 'first found in' layered lookup with one correct answer. config.user_settings already resolves these layers, and SKILL.md already reads orch.py config for the artifact paths.",
+      "recommendation": "Add communication_language to config.USER_KEYS and make the rule 'the value orch.py config prints, else the user's language'."
+    },
+    {
+      "id": "leanness-1",
+      "lens": "leanness",
+      "severity": "low",
+      "title": "The Defaults paragraph repeats input resolution that the script records and reports",
+      "location": "SKILL.md:23",
+      "evidence": "Default bases, locator order and the --repo-id rule are in --help, recorded in base_source and coord_ref_source, and named in every failing error. Only the 'registry read at base or coordination main' clause carries a why the model cannot get elsewhere.",
+      "recommendation": "Cut the paragraph to the trusted-read-point sentence plus a pointer to the source fields and error hints.",
+      "proposed_smallest": "The script resolves base, coordination repo and coordination ref itself and records how in `base_source` and `coord_ref_source`; when it cannot, it exits 2 or fails `setup` naming the flag to pass (`--base`, `--coord`, `--coord-ref`, `--repo-id`). The registry and epics are read at the base in a monorepo and at coordination main otherwise, so a PR cannot move its own boundaries.",
+      "predicted_delta": "None expected. Every failure case names the same flag the paragraph teaches. Confirm with a polyrepo input whose registry URL differs from origin."
+    },
+    {
+      "id": "architecture-3",
+      "lens": "architecture",
+      "severity": "low",
+      "title": "The fetch cache is untracked in the working tree and hidden from the dirty notice",
+      "location": "SKILL.md:25; scripts/orchlib/markers.py:19; scripts/orch.py:52; scripts/orchlib/gate.py:161",
+      "evidence": "Polyrepo runs write .orch/cache, which only orch-setup gitignores. The dirty notice skips it, so 'commit what it changed' with a broad add can commit the cache and cause out-of-scope on the next run.",
+      "recommendation": "Move the cache under git rev-parse --git-common-dir, or say in SKILL.md to commit only the files the fix wrote."
+    }
+  ]
+}

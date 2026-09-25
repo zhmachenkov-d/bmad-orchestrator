@@ -88,21 +88,36 @@ def run(type_: str, canonical: str, base: Tree, head: Tree, repo: Path, base_ref
         return {"status": "missing", "output": f"'{adapter.binary}' not found; install: {adapter.install}; {PIN_NOTE}"}
     if adapter.kind == "dir":
         return _db_schema(canonical, repo, head.ref, base_ref, extra, runner)
-    old, new = base.read(canonical), head.read(canonical)
-    if new is None:
+    old_kind, new_kind = base.kind(canonical), head.kind(canonical)
+    if new_kind is None:
         return {"status": "removed", "output": f"{canonical} deleted"}
-    if old is None:
+    if old_kind is None:
         return {"status": "added", "output": f"{canonical} is new"}
-    return compare_files(type_, PurePosixPath(canonical).name, old, new, runner)
+    if "commit" in (old_kind, new_kind):
+        # Fail closed: a submodule's contents are not in this repo, so nothing could be compared.
+        return {"status": "breaking", "output": f"canonical {canonical} is a submodule; contracts must be files in the coordination repo"}
+    if new_kind == "tree" or old_kind == "tree":
+        if type_ != "protobuf":
+            # Fail closed: the adapter compares one spec file, a directory would be compared as nothing.
+            return {"status": "breaking", "output": f"{type_} canonical {canonical} must be a single file, not a directory"}
+        return compare_dirs(type_, base.files(canonical), head.files(canonical), runner)
+    return compare_files(type_, PurePosixPath(canonical).name, base.read(canonical), head.read(canonical), runner)
 
 
 def compare_files(type_: str, name: str, old: bytes, new: bytes, runner: Runner = default_runner) -> dict:
+    return compare_dirs(type_, {name: old}, {name: new}, runner)
+
+
+def compare_dirs(type_: str, old: dict[str, bytes], new: dict[str, bytes], runner: Runner = default_runner) -> dict:
+    """Run the adapter on two materialized trees ({relative path: bytes}); single-file adapters get one entry each."""
     with tempfile.TemporaryDirectory(prefix="orch-detect-") as tmp:
         b, h = Path(tmp, "base"), Path(tmp, "head")
-        b.mkdir()
-        h.mkdir()
-        (b / name).write_bytes(old)
-        (h / name).write_bytes(new)
+        for root, files in ((b, old), (h, new)):
+            root.mkdir()
+            for rel, data in files.items():
+                (root / rel).parent.mkdir(parents=True, exist_ok=True)
+                (root / rel).write_bytes(data)
+        name = next(iter(new), "")
         cmd = {
             "openapi": ["oasdiff", "breaking", str(b / name), str(h / name), "--fail-on", "ERR"],
             "protobuf": ["buf", "breaking", str(h), "--against", str(b)],

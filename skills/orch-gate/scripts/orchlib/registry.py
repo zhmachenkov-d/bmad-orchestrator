@@ -7,12 +7,18 @@ from pathlib import PurePosixPath
 
 import yaml
 
+from . import OrchError
 from .config import Config
-from .gitio import Tree
+from .gitio import Tree, normalize_repo
 from .globs import may_overlap
 
 CONTRACTS = "contracts"
 CONTRACT_TYPES = ("openapi", "protobuf", "asyncapi", "db-schema")
+# What a canonical may be per type: a single spec file, a proto package directory, a migrations directory.
+CANONICAL_KINDS = {"openapi": ("blob",), "asyncapi": ("blob",), "protobuf": ("blob", "tree"), "db-schema": ("tree",)}
+# Things that do not exist *yet* (a new subproject's first story, a contract story adding its canonical).
+# The gate warns on these; every other issue is structural and fails it.
+EXISTENCE_ISSUES = ("path-missing", "canonical-missing")
 
 
 @dataclass
@@ -87,7 +93,57 @@ def contracts_pseudo(cfg: Config) -> Subproject:
     )
 
 
+def _entry(data: dict, path: str, name: str, cfg: Config, issues: list) -> Subproject | None:
+    """One registry entry, or None when a required field is missing, blank or the wrong shape.
+
+    Never fill a boundary with a permissive default: a dropped entry leaves an issue that fails the gate.
+    """
+    before = len(issues)
+    for req in ("repo", "path"):
+        if not isinstance(data.get(req), str) or not data[req].strip().strip("/"):
+            issues.append(_issue("missing-field", f"{path}: '{req}' must be a non-empty string", name))
+    allowed_write = _strings(data.get("allowed_write"), "allowed_write", name, issues)
+    if not allowed_write or not all(p.strip() for p in allowed_write):
+        issues.append(_issue("missing-field", f"{path}: 'allowed_write' must list at least one non-empty pattern", name))
+    if data.get("branch") is not None and not (isinstance(data["branch"], str) and data["branch"].strip()):
+        issues.append(_issue("bad-field", f"{path}: 'branch' must be a non-empty branch name (omit it for the main branch)", name))
+    contracts = data.get("contracts")
+    contracts = {} if contracts is None else contracts
+    if not isinstance(contracts, dict):
+        issues.append(_issue("bad-field", f"{path}: 'contracts' must be a mapping with exports and imports", name))
+        contracts = {}
+    raw_exports = contracts.get("exports")
+    raw_exports = [] if raw_exports is None else raw_exports
+    if not isinstance(raw_exports, list):
+        issues.append(_issue("bad-field", f"{path}: 'contracts.exports' must be a list", name))
+        raw_exports = []
+    exports = []
+    for i, raw in enumerate(raw_exports):
+        if not (isinstance(raw, dict) and isinstance(raw.get("type"), str) and isinstance(raw.get("canonical"), str)
+                and raw["canonical"].strip("/") and _optional_path(raw.get("copy"))
+                and all(isinstance(k, str) for k in raw) and isinstance(raw.get("dev_url", ""), str)):
+            issues.append(_issue("bad-export", f"{path}: exports[{i}] needs string 'type' and 'canonical' "
+                                 "(and a non-empty string 'copy' and 'dev_url', if given)", name))
+            continue
+        extra = {k: v for k, v in raw.items() if k not in ("type", "canonical", "copy")}
+        exports.append(Export(raw["type"], raw["canonical"].strip("/"), raw["copy"].strip("/") if raw.get("copy") else None, extra))
+    imports = _strings(contracts.get("imports"), "contracts.imports", name, issues)
+    allowed_read = _strings(data.get("allowed_read"), "allowed_read", name, issues)
+    if len(issues) > before:
+        return None
+    # One spelling of "the coordination repo", so every `repo == "."` check sees it.
+    repo = "." if normalize_repo(data["repo"]) == "." else data["repo"].strip()
+    return Subproject(name=name, repo=repo, path=data["path"].strip().strip("/"),
+                      allowed_read=allowed_read, allowed_write=allowed_write, exports=exports, imports=imports,
+                      branch=data["branch"].strip() if data.get("branch") is not None else cfg.main_branch, source=path)
+
+
+def _optional_path(value) -> bool:
+    return value is None or (isinstance(value, str) and bool(value.strip().strip("/")))
+
+
 def load(tree: Tree, cfg: Config) -> Registry:
+    """Total over its input: any file content yields issues, never an exception, so a repair PR can always run."""
     reg = Registry()
     reg.issues = []
     for path in sorted(tree.list(cfg.registry_dir)):
@@ -96,7 +152,7 @@ def load(tree: Tree, cfg: Config) -> Registry:
         stem = PurePosixPath(path).stem
         try:
             data = yaml.safe_load(tree.text(path) or "") or {}
-        except yaml.YAMLError as exc:
+        except (yaml.YAMLError, OrchError, RecursionError) as exc:
             reg.issues.append(_issue("yaml", f"{path}: {exc}", stem))
             continue
         if not isinstance(data, dict):
@@ -108,29 +164,8 @@ def load(tree: Tree, cfg: Config) -> Registry:
         if name == CONTRACTS:
             reg.issues.append(_issue("reserved-name", f"{path}: '{CONTRACTS}' is the reserved pseudo-subproject", name))
             continue
-        for req in ("repo", "path", "allowed_write"):
-            if req not in data:
-                reg.issues.append(_issue("missing-field", f"{path}: missing '{req}'", name))
-        contracts = data.get("contracts") or {}
-        exports = []
-        for i, raw in enumerate(contracts.get("exports") or []):
-            if not isinstance(raw, dict) or "type" not in raw or "canonical" not in raw:
-                reg.issues.append(_issue("bad-export", f"{path}: exports[{i}] needs 'type' and 'canonical'", name))
-                continue
-            extra = {k: v for k, v in raw.items() if k not in ("type", "canonical", "copy")}
-            exports.append(Export(str(raw["type"]), str(raw["canonical"]).strip("/"),
-                                  str(raw["copy"]) if raw.get("copy") else None, extra))
-        reg[name] = Subproject(
-            name=name,
-            repo=str(data.get("repo", ".")),
-            path=str(data.get("path", "")).strip("/"),
-            allowed_read=_strings(data.get("allowed_read"), "allowed_read", name, reg.issues),
-            allowed_write=_strings(data.get("allowed_write"), "allowed_write", name, reg.issues),
-            exports=exports,
-            imports=_strings(contracts.get("imports"), "contracts.imports", name, reg.issues),
-            branch=str(data.get("branch", cfg.main_branch)),
-            source=path,
-        )
+        if (sub := _entry(data, path, name, cfg, reg.issues)) is not None:
+            reg[name] = sub
     reg[CONTRACTS] = contracts_pseudo(cfg)
     return reg
 
@@ -154,15 +189,19 @@ def validate(reg: Registry, coord: Tree, cfg: Config) -> list[dict]:
             if exp.type not in CONTRACT_TYPES:
                 issues.append(_issue("unknown-contract-type", f"export type '{exp.type}' not one of {', '.join(CONTRACT_TYPES)}", sub.name))
             expected = f"{cfg.contracts_dir}/{sub.name}/"
+            kind = coord.kind(exp.canonical)
             if not exp.canonical.startswith(expected):
                 issues.append(_issue("canonical-location", f"canonical '{exp.canonical}' must live under '{expected}'", sub.name))
-            elif not coord.exists(exp.canonical):
+            elif kind is None:
                 issues.append(_issue("canonical-missing", f"canonical '{exp.canonical}' not found in the coordination repo", sub.name))
+            elif exp.type in CANONICAL_KINDS and kind not in CANONICAL_KINDS[exp.type]:
+                want = " or ".join("a file" if k == "blob" else "a directory" for k in CANONICAL_KINDS[exp.type])
+                issues.append(_issue("canonical-kind", f"{exp.type} canonical '{exp.canonical}' must be {want}", sub.name))
     names = sorted(real)
     for i, a in enumerate(names):
         for b in names[i + 1:]:
             sa, sb = real[a], real[b]
-            if sa.repo != sb.repo:
+            if normalize_repo(sa.repo) != normalize_repo(sb.repo):
                 continue
             for pa in sa.allowed_write:
                 for pb in sb.allowed_write:
@@ -192,6 +231,12 @@ def _cycles(real: dict[str, Subproject]) -> list[list[str]]:
         if n not in state:
             visit(n)
     return found
+
+
+def subprojects_in(reg: Registry, repo_id: str) -> list[Subproject]:
+    """Real subprojects whose `repo` is this repo ('.' = the coordination repo, else a normalized URL)."""
+    return [s for n, s in sorted(reg.items()) if n != CONTRACTS
+            and ("." if s.repo == "." else normalize_repo(s.repo)) == repo_id]
 
 
 def pin_paths(reg: Registry, subproject: str) -> list[str]:

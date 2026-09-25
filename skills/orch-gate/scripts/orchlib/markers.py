@@ -10,13 +10,13 @@ import yaml
 
 from . import OrchError
 from .config import Config
-from .gitio import Tree, fetch_tree, normalize_repo
+from .gitio import Tree, fetch_tree, normalize_repo, sha
 from .registry import CONTRACTS, Registry, pin_paths
 from .stories import KEY_RE, Story
 
+ORCH_DIR = ".orch"
 MARKER_DIR = ".orch/stories"
 ARCHIVE_DIR = ".orch/archive"
-CACHE_DIR = ".orch/cache"
 ARCHIVE_RE = re.compile(rf"^{re.escape(ARCHIVE_DIR)}/epic-(\d+)/(\d+-\d+[a-z]?)\.yaml$")
 MARKER_RE = re.compile(rf"^{re.escape(MARKER_DIR)}/([^/]+)\.yaml$")
 
@@ -111,10 +111,11 @@ def repo_tree(repo: str, branch: str, coord: Tree, cache_root: Path, local: dict
 
 
 def merged(reg: Registry, coord: Tree, cache_root: Path, local: dict[str, Tree] | None = None,
-           offline: bool = False) -> tuple[dict[str, dict], list[dict]]:
+           offline: bool = False, read: list | None = None) -> tuple[dict[str, dict], list[dict]]:
     """Merged story keys across every registry repo -> {repo, path, tree}; plus the repos that could not be read.
 
     An unread repo means "merge status unknown", never "not merged": callers must report it as such.
+    `read`, if given, collects {repo, branch, sha} for every other repo that was read, so a verdict records them.
     """
     result, unread, seen = {}, [], {}
     for sub in sorted(reg.values(), key=lambda s: s.name):
@@ -133,6 +134,8 @@ def merged(reg: Registry, coord: Tree, cache_root: Path, local: dict[str, Tree] 
             unread.append({"code": "repo-unreadable", "repo": sub.repo, "subprojects": seen[ident],
                            "message": f"cannot read {sub.repo} (check network and read access for this runner): {exc}"})
             continue
+        if read is not None and ident != ".":
+            read.append({"repo": sub.repo, "branch": sub.branch, "sha": sha(tree.repo, tree.ref)})
         for key, path in keys_in(tree).items():
             result.setdefault(key, {"repo": sub.repo, "path": path, "tree": tree})
     return result, unread
@@ -161,35 +164,65 @@ def close_check(epic: int, stories, reg: Registry, merged_map: dict[str, dict], 
         if not hit:
             problems.append({"story": s.key, "message": f"story {s.id} is not merged"})
             continue
-        if not ARCHIVE_RE.match(hit["path"]):
+        archived = ARCHIVE_RE.match(hit["path"])
+        if not archived or int(archived.group(1)) != epic:
             problems.append({"story": s.key, "message": f"marker {hit['path']} in {hit['repo']} is not archived under {ARCHIVE_DIR}/epic-{epic}/"})
         marker, errs = parse(hit["tree"].read(hit["path"]) or b"", s.key)
         if errs or marker is None:
             problems.append({"story": s.key, "message": f"marker {hit['path']}: {'; '.join(errs)}"})
             continue
-        for path, sha in marker.get("contract_pins", {}).items():
+        for path, pinned in marker.get("contract_pins", {}).items():
             current = coord.blob_sha(path)
-            if current != sha:
-                problems.append({"story": s.key, "message": f"pin {path} = {sha[:10]} but main has {(current or 'nothing')[:10]} (pins not converged)"})
+            if current != pinned:
+                problems.append({"story": s.key, "message": f"pin {path} = {pinned[:10]} but main has {(current or 'nothing')[:10]} (pins not converged)"})
     return problems
 
 
-def is_archive_move(changes: list[dict], tree_head: Tree, tree_base: Tree) -> tuple[set[str], list[str]]:
-    """Paths that are part of a pure archive move (marker deleted, identical file added under the archive)."""
+def is_archive_move(changes: list[dict], tree_head: Tree, tree_base: Tree) -> tuple[set[str], list[tuple[str, str]]]:
+    """Paths that are part of a pure archive move (marker deleted, identical file added under the archive),
+    plus (path, message) for every archive addition or marker removal that is not one."""
     deleted = {c["path"]: c for c in changes if c["status"] == "D" and MARKER_RE.match(c["path"])}
     added = {c["path"] for c in changes if c["status"] == "A" and ARCHIVE_RE.match(c["path"])}
     ok, problems = set(), []
     for path in added:
-        key = ARCHIVE_RE.match(path).group(2)
+        epic, key = ARCHIVE_RE.match(path).groups()
         src = marker_path(key)
-        if src in deleted and tree_base.read(src) == tree_head.read(path):
+        story_epic = int(key.split("-")[0])
+        if int(epic) != story_epic:
+            problems.append((path, f"{path}: story {key} belongs to epic {story_epic}; archive it under {ARCHIVE_DIR}/epic-{story_epic}/"))
+        elif src in deleted and tree_base.read(src) == tree_head.read(path):
             ok |= {src, path}
         else:
-            problems.append(f"{path}: archive entry must be an unchanged move of {src}")
+            problems.append((path, f"{path}: archive entry must be an unchanged move of {src}"))
     for path in deleted:
         if path not in ok:
-            problems.append(f"{path}: markers may only be removed by moving them to {ARCHIVE_DIR}/epic-N/")
+            problems.append((path, f"{path}: markers may only be removed by moving them to {ARCHIVE_DIR}/epic-N/"))
     return ok, problems
+
+
+def record_changes(changes: list[dict], moved: set[str], closed_dir: str) -> list[tuple[str, str, str]]:
+    """(code, path, message) for every change to orch's merge records that no mode may make.
+
+    Live markers and archive additions are judged elsewhere (marker check, is_archive_move); archived markers
+    and epic close records are history, so they may only ever be added.
+    """
+    found = []
+    for c in changes:
+        path, status = c["path"], c["status"]
+        if path in moved:
+            continue
+        if path.startswith(ARCHIVE_DIR + "/"):
+            if status == "D":
+                found.append(("archived-marker-removed", path, f"{path}: archived markers are the merge record and cannot be removed"))
+            elif status != "A":
+                found.append(("archived-marker-modified", path, f"{path}: archived markers are the merge record and cannot change"))
+            elif not ARCHIVE_RE.match(path):
+                found.append(("orch-record-changed", path, f"{path}: the archive holds only {ARCHIVE_DIR}/epic-N/<story>.yaml"))
+        elif path.startswith(ORCH_DIR + "/") and not MARKER_RE.match(path):
+            found.append(("orch-record-changed", path, f"{path}: only story markers and their archive moves may change under {ORCH_DIR}/"))
+        elif path.startswith(closed_dir.rstrip("/") + "/") and status != "A":
+            found.append(("closed-record-changed", path, f"{path}: epic close records cannot be changed or removed"))
+    return found
 
 
 def closed_epics(coord: Tree, cfg: Config) -> set[int]:
