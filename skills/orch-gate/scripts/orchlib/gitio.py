@@ -120,7 +120,12 @@ class Tree:
 
     def text(self, path: str) -> str | None:
         data = self.read(path)
-        return None if data is None else data.decode("utf-8")
+        if data is None:
+            return None
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise OrchError(f"{path} at {self.ref} is not UTF-8: {exc}") from exc
 
     def blob_sha(self, path: str) -> str | None:
         """Blob sha for a file, tree sha for a directory, None if absent."""

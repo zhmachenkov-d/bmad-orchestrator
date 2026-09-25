@@ -296,6 +296,92 @@ def test_coordination_repo_found_from_committed_config(tmp_path):
     assert code == 2 and "--coord" in res["error"]
 
 
+def test_findings_carry_codes_and_mechanical_fixes(mono):
+    mono.write(".gitattributes", f"{STATUS} merge=orch-sprint-status\n").commit()
+    mono.branch("orch/1-3")
+    mono.write("services/user/app.py", "uses payments\n")
+    marker(mono, "1-3")
+    mono.commit()
+    mono.checkout("main").write(OAS, "openapi: 3.0.0\npaths: {/pay: {}}\n").write(
+        "services/payment/openapi.yaml", "openapi: 3.0.0\npaths: {/pay: {}}\n").commit("contract moved")
+    mono.checkout("orch/1-3")
+    code, res = gate(mono)
+    assert code == 1
+    assert all("code" in f for c in res["checks"] for f in c["findings"])
+    stale = check(res, "pins")["findings"][0]
+    assert stale["code"] == "pin-stale"
+    assert stale["fix"]["command"] == ["orch.py", "marker", "write", "--story", "1-3"] and "rebase" in stale["fix"]["precondition"]
+    driver = check(res, "merge-driver")["findings"][0]
+    assert driver["code"] == "driver-missing" and driver["fix"]["command"][1:] == ["sprint-status", "install-driver"]
+    code, out = gate(mono, "--format", "text")
+    assert "[pin-stale]" in out and "then run: orch.py marker write --story 1-3" in out
+
+
+def test_conformance_failure_shows_the_diff(mono):
+    mono.branch("orch/1-2")
+    mono.write("services/payment/openapi.yaml", "openapi: 3.0.0\npaths: {/edited: {}}\n")
+    marker(mono, "1-2")
+    mono.commit()
+    code, res = gate(mono)
+    detail = check(res, "conformance")["findings"][0]["detail"]
+    assert code == 1 and "-paths: {}" in detail and "+paths: {/edited: {}}" in detail
+
+
+def test_markdown_format_for_ci_summaries(mono):
+    mono.branch("x").write(IMPL, "no story\n").commit()
+    code, out = gate(mono, "--format", "markdown", "--ci")
+    assert code == 1 and out.startswith("### orch-gate: ❌ FAIL") and "| scope | ❌ fail |" in out and "`needs-story`" in out
+
+
+def test_internal_error_is_exit_2_not_a_failing_verdict(mono, monkeypatch):
+    from orchlib import gate as gate_mod
+
+    def boom(ctx):
+        raise KeyError("registry field")
+    monkeypatch.setattr(gate_mod, "run", boom)
+    code, res = gate(mono)
+    assert code == 2 and res["error"].startswith("internal error: KeyError")
+
+
+ATLAS = """import os, sys
+d = sys.argv[sys.argv.index('--dir') + 1][len('file://'):]
+files = sorted(os.listdir(d))
+print(files)
+sys.exit(1 if 'wip.sql' in files else 0)
+"""
+
+
+def test_db_schema_detector_lints_the_committed_head_not_the_working_tree(mono, tmp_path):
+    path = fake_bin(tmp_path, "atlas", ATLAS)
+    mig = f"{C}/orders-db/migrations"
+    mono.write(f"{R}/orders-db.yaml", "name: orders-db\nrepo: .\npath: db/orders\nallowed_read: ['db/orders/**']\n"
+               f"allowed_write: ['db/orders/**']\ncontracts:\n  exports:\n    - {{type: db-schema, canonical: {mig}, dev_url: 'docker://postgres'}}\n"
+               "  imports: []\n")
+    mono.write(f"{mig}/001.sql", "create table a (id int);\n").commit()
+    mono.branch("orch/1-1").write(f"{mig}/002.sql", "alter table a add b int;\n").commit()
+    marker(mono, "1-1")
+    mono.commit()
+    mono.write(f"{mig}/wip.sql", "drop table a;\n")  # uncommitted, must not reach the detector
+    code, res = gate(mono, env={"PATH": path})
+    assert code == 0, res
+    used = res["detectors_used"][0]
+    assert used["type"] == "db-schema" and used["inputs"] == {"dev_url_source": "registry"}
+    assert not (mono.path / ".git" / "worktrees").exists() or not any((mono.path / ".git" / "worktrees").iterdir())
+
+
+def test_deps_probe_checks_detector_verdicts(mono, tmp_path):
+    good = fake_bin(tmp_path, "oasdiff", "import sys\nif '--version' in sys.argv: print('oasdiff v1.2.3'); sys.exit(0)\n"
+                    "sys.exit(0 if '/b:' in open(sys.argv[3]).read() else 1)\n")
+    code, res = run_cli("deps", "--probe", "--repo", str(mono.path), env={"PATH": good})
+    oas = res["detectors"][0]
+    assert code == 0 and oas["version"] == "oasdiff v1.2.3" and oas["probe"]["status"] == "pass", res
+    (tmp_path / "lax").mkdir()
+    lax = fake_bin(tmp_path / "lax", "oasdiff", "import sys\nsys.exit(0)\n")
+    code, res = run_cli("deps", "--probe", "--repo", str(mono.path), env={"PATH": lax})
+    probe = res["detectors"][0]["probe"]
+    assert code == 1 and probe["status"] == "fail" and probe["breaking_change"] == "ok"
+
+
 def test_sprint_status_done_requires_marker(mono):
     mono.branch("status")
     mono.write(STATUS, SPRINT.replace("1-2-implement-payment-api: backlog", "1-2-implement-payment-api: done"))

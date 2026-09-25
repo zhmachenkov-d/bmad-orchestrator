@@ -19,6 +19,7 @@ import argparse
 import json
 import os
 import sys
+import traceback
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -113,9 +114,9 @@ def cmd_merged(args, env: Env):
 def cmd_deps(args, env: Env):
     reg = env.registry()
     types = {e.type for s in reg.values() for e in s.exports}
-    report = detectors.deps(types)
-    missing = [d for d in report if not d["available"]]
-    return emit({"ok": not missing, "detectors": report}, 1 if missing else 0)
+    report = detectors.deps(types, probe=args.probe)
+    bad = [d for d in report if not d["available"] or d.get("probe", {}).get("status") == "fail"]
+    return emit({"ok": not bad, "detectors": report}, 1 if bad else 0)
 
 
 def cmd_marker(args, env: Env):
@@ -220,10 +221,10 @@ def cmd_gate(args, env: Env):
     )
     result = gate.run(ctx)
     code = 0 if result["ok"] else 1
-    if args.format == "text":
+    if args.format in ("text", "markdown"):
         if args.output:
             Path(args.output).write_text(json.dumps({"schema": SCHEMA_VERSION, **result}, indent=2) + "\n", encoding="utf-8")
-        print(gate.render_text(result))
+        print(gate.render_text(result) if args.format == "text" else gate.render_markdown(result))
         return code
     return emit(result, code, args.output)
 
@@ -251,7 +252,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("registry", parents=[common], help="load + validate the subproject registry")
     sub.add_parser("stories", parents=[common], help="parse epics into stories (subproject, depends_on, contract change) + plan issues")
     sub.add_parser("merged", parents=[common], help="merged story markers across all registry repos (pull-based, cached in .orch/cache)")
-    sub.add_parser("deps", parents=[common], help="contract detector availability for types used in the registry")
+    d = sub.add_parser("deps", parents=[common], help="contract detector availability and versions for types used in the registry")
+    d.add_argument("--probe", action="store_true",
+                   help="also run each installed detector on built-in compatible/breaking fixtures and check its verdicts")
 
     m = sub.add_parser("marker", parents=[common], help="write .orch/stories/<key>.yaml with current pins (commit story changes first)")
     m.add_argument("action", choices=["write"])
@@ -283,7 +286,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="commit to gate; a CI merge ref (the PR merged into base) is resolved to the PR tip. Needs full history (fetch-depth 0)")
     g.add_argument("--repo-id", help="this repo's identity as written in the registry (default: origin URL)")
     g.add_argument("--ci", action="store_true", help="CI mode (also implied by $CI)")
-    g.add_argument("--format", choices=["json", "text"], default="json")
+    g.add_argument("--format", choices=["json", "text", "markdown"], default="json",
+                   help="markdown suits $GITHUB_STEP_SUMMARY or a PR comment; -o still writes the JSON")
     g.add_argument("-o", "--output", help="also write the JSON result to this file")
     return p
 
@@ -304,6 +308,11 @@ def main(argv=None) -> int:
         return COMMANDS[args.cmd](args, Env(args))
     except OrchError as exc:
         return emit({"ok": False, "error": str(exc)}, 2)
+    except Exception as exc:  # never let a crash look like a failing verdict (exit 1)
+        if args.verbose:
+            traceback.print_exc()
+        return emit({"ok": False, "error": f"internal error: {type(exc).__name__}: {exc}",
+                     "hint": "re-run with --verbose for the traceback"}, 2)
 
 
 if __name__ == "__main__":

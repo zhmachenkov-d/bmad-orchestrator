@@ -8,7 +8,7 @@ architecture: 'workflows-only (4 skills, no agents)'
 standalone: false
 expands_module: 'bmm'
 skills_planned: ['orch-setup', 'orch-next', 'orch-gate', 'orch-status']
-config_variables: ['orch_coordination_repo', 'orch_registry_dir', 'orch_contracts_dir', 'orch_worktrees_dir', 'orch_stale_claim_hours', 'orch_review_wait_hours']
+config_variables: ['orch_coordination_repo', 'orch_registry_dir', 'orch_contracts_dir', 'orch_worktrees_dir', 'orch_stale_claim_hours', 'orch_review_wait_hours', 'orch_main_branch']
 created: '2026-09-25'
 updated: '2026-09-25'
 ---
@@ -195,6 +195,7 @@ Shared context for every brief: module `orch` expands BMad Method (`bmm`). Harde
 | `orch_worktrees_dir` | Where to create per-story git worktrees | `../{project_name}-worktrees` | `{value}` | yes |
 | `orch_stale_claim_hours` | Hours without branch activity before a claim is considered stale | `48` | `{value}` | no |
 | `orch_review_wait_hours` | Hours a PR may sit in review before it is flagged | `24` | `{value}` | no |
+| `orch_main_branch` | Integration branch of every repo: the gate's default base and the ref orch config, registry and epics are read at (registry `branch` overrides it per subproject) | `main` | `{value}` | no |
 
 Paths are relative to the coordination repo. Registry and contracts are siblings under `_bmad-output/orch/` so CODEOWNERS / branch protection can target `_bmad-output/orch/contracts/**` cleanly. Every skill falls back to these defaults when config is missing.
 
@@ -241,7 +242,7 @@ Beyond config collection, `orch-setup` (after Create Module scaffolds it) must:
 
 Budget: ≤ ~4 overrides per stock skill, else reconsider forking.
 
-**Independent value without BMM:** the registry + `orch-gate` (allowed_write, contract conformance, breaking-change detection) work on any mono/polyrepo PR even with no BMad planning artifacts.
+**Independent value without BMM:** the registry + `orch-gate` (allowed_write, contract conformance, breaking-change detection) work on any mono/polyrepo PR even with no BMad planning artifacts. *Post-v1:* the v1 gate requires a story marker for every subproject change, so registry-only adoption needs an opt-in mode (for example `orch_story_mode: off`) in which a PR without a marker is scope-checked for each subproject it touches and still gets the conformance and breaking checks.
 
 ## Creative Use Cases
 

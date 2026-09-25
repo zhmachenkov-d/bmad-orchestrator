@@ -13,20 +13,17 @@ Never decide the verdict yourself, and never make a check pass by working around
 
 - Bare paths (e.g. `scripts/orch.py`) resolve from this skill's installed directory.
 - `{project-root}` → the project working directory.
+- `{communication_language}` → `communication_language` from `{project-root}/_bmad/config.user.toml` or `{project-root}/_bmad/config.toml`, else the user's language.
 
 ## Running the gate
 
 When the user asks about a CI failure and has the CI result (the `-o` JSON artifact or the job log), explain that run. Re-running locally can reach a different verdict. Otherwise run `uv run scripts/orch.py gate --format text` from the story's repo for the human view, and drop `--format` for JSON. If a local verdict differs from CI, compare `base_sha`, `head_sha`, `coord_sha`, `notices` and `unread_repos` in the two results. Those fields name the inputs that differ.
 
-Defaults: the base is `origin/main` or `main`, and the registry is read at the base ref. The coordination repo is resolved in this order: `--coord`, `ORCH_COORD`, a local path in this repo's `orch_coordination_repo`, and finally the current repo (a monorepo). If the registry `repo` URL differs from `origin`, also pass `--repo-id <url as in the registry>`.
+Defaults: the base is `origin/<orch_main_branch>` or `<orch_main_branch>` (`main` unless configured), and the registry is read at the base ref. The coordination repo is resolved in this order: `--coord`, `ORCH_COORD`, a local path in this repo's `orch_coordination_repo`, and finally the current repo (a monorepo). If the registry `repo` URL differs from `origin`, also pass `--repo-id <url as in the registry>`.
 
-Explain each failing or warning check in `{communication_language}`, and mention any `notices`. When the fix is mechanical, offer to apply it:
+Explain each failing or warning finding in `{communication_language}`, and mention any `notices`. Every finding has a stable `code`. When a finding carries `fix.mechanical`, offer to run `fix.command` once `fix.precondition` (if any) is met. After a fix, commit what it changed, re-run the gate and report the new verdict. The fix is done only when the gate passes or only non-mechanical failures remain.
 
-- Missing or stale pins, after a rebase onto the latest contract: `orch.py marker write --story <id>`. Commit the story's changes first.
-- A clone without the merge driver: `orch.py sprint-status install-driver`.
-- `sprint-status.yaml` drifted from the merged markers: `orch.py sprint-status derive --write`.
-
-Everything else is a judgment for the user. That covers a breaking contract change, which has to be split into expand → migrate → contract, and a scope violation, which means the change belongs in another subproject's story.
+Findings without a `fix` are a judgment for the user. That covers a breaking contract change, which has to be split into expand → migrate → contract, and a scope violation, which means the change belongs in another subproject's story.
 
 ## The checks
 
@@ -54,19 +51,7 @@ The gate reads these bold labels under each stock `### Story N.M: Title` heading
 
 ## Library for other orch skills
 
-Every other orch skill calls this CLI rather than reimplementing it. Output is JSON on stdout. Exit code 1 means a failing verdict, a lost race or validation issues. Exit code 2 means a usage or environment error. Run `uv run scripts/orch.py <command> --help` for the interface.
-
-| Command | Use |
-| --- | --- |
-| `config` | Resolved orch and bmm config. Paths are relative to the coordination repo. |
-| `registry` | Load and validate the registry: overlapping writes, unknown imports, cycles, canonical locations. |
-| `stories` | Parse epics into stories (subproject, depends_on, contract change) and report plan issues. |
-| `merged` | Merged markers across all registry repos. Pull-based, cached in `.orch/cache/`. |
-| `marker write --story` | Write the completion marker with current pins. Used by the `bmad-build` on_complete override. |
-| `claim list\|create\|take-over\|release` | Atomic claims on `refs/heads/claim/<N-M>`. Take-over and release need `--expect <sha>`. |
-| `sprint-status check\|derive\|merge\|install-driver` | Done invariants, derivation from markers, git merge driver. |
-| `epic close-check --epic N` | All stories merged, markers archived, pins converged. A story in an unread repo is an `unverifiable` problem. |
-| `deps` | Detector availability for the contract types in the registry: `oasdiff`, `buf`, `asyncapi`, `atlas`. |
+Every other orch skill calls this CLI rather than reimplementing it: `uv run <calling skill's directory>/../orch-gate/scripts/orch.py <command>`, because the orch skills install side by side. Output is JSON on stdout. Exit code 1 means a failing verdict, a lost race, validation issues, a missing detector, or `epic close-check` problems. Exit code 2 means a usage, environment or internal error, so report it and do not explain it as a verdict. `orch.py --help` lists the commands. `gate --format markdown` renders a CI step summary. `deps --probe` checks installed detectors against built-in compatible and breaking fixtures.
 
 ## Gotchas
 
@@ -74,4 +59,5 @@ Every other orch skill calls this CLI rather than reimplementing it. Output is J
 - A CI merge-ref checkout (the PR merged into base) is gated as the PR tip. The result's `head_resolved` says so. The gate needs full history: in a shallow clone it stops with the fetch-depth fix.
 - If a registry repo cannot be read, its stories' merge status is unknown. They fail as `done-unverifiable` or `consumers-unverifiable`, never as "not merged", and the fix is read access for the runner. `--offline` is refused in CI.
 - `db-schema` contracts are a migrations directory. The detector needs `dev_url` on the registry export, or `ORCH_ATLAS_DEV_URL`.
-- The `asyncapi` and `atlas` detector command lines have not yet been verified against real binaries. If one of them misfires, report the output rather than bypassing it.
+- The `asyncapi` and `atlas` detector command lines are not yet verified against real binaries. `orch.py deps --probe` verifies `asyncapi`, but not `atlas`, which needs a dev database. Detector versions are recorded in `detectors_used`, so keep the same version locally and in CI.
+- Registry-only adoption without BMad planning is post-v1. Every subproject change needs a story marker.
