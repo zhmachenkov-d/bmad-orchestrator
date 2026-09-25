@@ -1,6 +1,8 @@
 """sprint-status.yaml: done-invariant check, derivation from markers, and the git merge driver.
 
-Edits are line-level so the stock file's comments, ordering and other sections survive untouched.
+The check reads statuses with a YAML parser. Edits (derive, merge driver) are line-level so the stock
+file's comments, ordering and other sections survive untouched; a file whose entries the line editor
+cannot see the way YAML does is rejected rather than half-edited.
 Invariants orch owns: a story is `done` only if its marker is merged; an epic is `done` only if its close
 record exists. `in-progress` / `review` stay free because stock bmad-build writes them.
 """
@@ -9,6 +11,10 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+
+import yaml
+
+from . import OrchError
 
 STORY_RANK = {"backlog": 0, "ready-for-dev": 1, "in-progress": 2, "review": 3, "done": 4}
 EPIC_RANK = {"backlog": 0, "in-progress": 1, "done": 2}
@@ -71,6 +77,24 @@ def entries(text: str) -> dict[str, str]:
     return found
 
 
+def parsed(text: str) -> dict[str, str] | None:
+    """development_status as YAML sees it (legacy statuses mapped); None if the file is not valid YAML."""
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError:
+        return None
+    block = data.get("development_status") if isinstance(data, dict) else None
+    if not isinstance(block, dict):
+        return {}
+    return {str(k): LEGACY.get(str(v), str(v)) for k, v in block.items()}
+
+
+def line_mismatch(text: str) -> list[str]:
+    """Keys whose status the line editor reads differently from YAML (comments at column 0, quoted values...)."""
+    by_yaml, by_line = parsed(text) or {}, entries(text)
+    return sorted(k for k in set(by_yaml) | set(by_line) if by_yaml.get(k) != by_line.get(k))
+
+
 def _set(block: list[str], updates: dict[str, str]) -> list[str]:
     out = []
     for line in block:
@@ -92,10 +116,19 @@ def check(text: str, merged: set[str], closed: set[int], unknown: set[str] = fro
         fails.append({"code": "conflict-markers", "message": "sprint-status.yaml contains merge conflict markers",
                       "hint": "register the merge driver in this clone (orch.py sprint-status install-driver), then rebuild with orch.py sprint-status derive --write"})
         return {"fail": fails, "warn": warns}
-    if not split(text)[1]:
+    statuses = parsed(text)
+    if statuses is None:
+        fails.append({"code": "sprint-status-invalid", "message": "sprint-status.yaml is not valid YAML"})
+        return {"fail": fails, "warn": warns}
+    if not statuses:
         fails.append({"code": "no-development-status", "message": "sprint-status.yaml has no development_status entries"})
         return {"fail": fails, "warn": warns}
-    for key, status in entries(text).items():
+    mismatch = line_mismatch(text)
+    if mismatch:
+        fails.append({"code": "sprint-status-layout", "keys": mismatch,
+                      "message": "development_status entries orch cannot edit line by line: " + ", ".join(mismatch),
+                      "hint": "keep the block as unquoted `key: status` lines indented under development_status, with no column-0 comments inside it"})
+    for key, status in statuses.items():
         k = kind(key)
         if k == "story":
             sk = story_key(key)
@@ -126,6 +159,10 @@ def check(text: str, merged: set[str], closed: set[int], unknown: set[str] = fro
 
 def derive(text: str, merged: set[str], closed: set[int]) -> tuple[str, list[dict]]:
     """Apply the invariants: merged stories -> done, unmerged done -> review, epic done iff closed."""
+    mismatch = line_mismatch(text)
+    if mismatch:
+        raise OrchError("sprint-status.yaml has development_status entries orch cannot edit line by line: "
+                        + ", ".join(mismatch) + "; use unquoted `key: status` lines with no column-0 comments inside the block")
     head, block, tail = split(text)
     updates, changes = {}, []
     for key, status in entries(text).items():

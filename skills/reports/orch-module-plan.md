@@ -151,7 +151,7 @@ Shared context for every brief: module `orch` expands BMad Method (`bmm`). Harde
 
 **Design Notes:** Detectors are adapters keyed by `contracts.exports[].type`. Optimistic contract concurrency: a contract story must be rebased onto the latest contract and re-approved (gate checks pins against main). Client hooks are optional hardening, not the guarantee.
 
-**Shared library owner:** `orch-gate/scripts/` owns the shared orch library (registry loading and validation, story/DAG parsing, claim refs, shard reading, sprint-status derivation). `orch-setup`, `orch-next` and `orch-status` invoke `orch-gate` scripts rather than duplicating logic. Consequence: `orch-gate` is always installed and is built first.
+**Shared library owner:** `orch-gate/scripts/` owns the shared orch library (registry loading and validation, story/DAG parsing, claim refs, shard reading, sprint-status derivation). `orch-setup`, `orch-next` and `orch-status` invoke `orch-gate` scripts rather than duplicating logic. Consequence: `orch-gate` is always installed and is built first. Calling convention, which each consuming skill states in its own SKILL.md: `uv run <calling skill's directory>/../orch-gate/scripts/orch.py <command>` (the orch skills install side by side). Output is JSON on stdout. Exit 1 is a verdict or validation result, and exit 2 is an error, never a verdict.
 
 **Relationships:** runs on every PR; library dependency of every other orch skill.
 
@@ -228,6 +228,9 @@ Beyond config collection, `orch-setup` (after Create Module scaffolds it) must:
 4. **Stock-skill overrides:** write `_bmad/custom/bmad-create-epics-and-stories.toml`, `_bmad/custom/bmad-build.toml`, `_bmad/custom/bmad-sprint-planning.toml` (merge with existing files, never clobber).
 5. **CI templates:** generate `orch-gate` jobs for **GitHub Actions and GitLab CI** (user picks which to write); suggest CODEOWNERS entries for `<contracts_dir>/**`, `<registry_dir>/**`, planning artifacts.
 6. **Hygiene:** add `.orch/cache/` to `.gitignore`; check external dependencies per registry contract types.
+7. **Pre-push hook (optional):** offer a `pre-push` hook that runs `orch.py gate --format text` and blocks the push on a failing verdict (exit 1). It must not block on exit 2, which is an environment problem, and it never replaces the CI gate.
+
+Bootstrap order: the gate fails `setup` while the coordination main has no registry or no epics. Land the registry and epics in a coordination PR that changes only registry and planning files. The gate accepts that PR as a setup repair when its own head resolves the problems.
 
 ## Integration
 
@@ -235,7 +238,7 @@ Beyond config collection, `orch-setup` (after Create Module scaffolds it) must:
 
 | Stock skill | Override | What `orch` adds |
 | --- | --- | --- |
-| `bmad-create-epics-and-stories` | `persistent_facts` | registry list; rules: one `subproject:` per story, explicit backwards `depends_on`, contract story first, breaking change = expand → migrate → contract |
+| `bmad-create-epics-and-stories` | `persistent_facts` | registry list; rules: one `subproject:` per story, explicit backwards `depends_on`, contract story first, breaking change = expand → migrate → contract; emit exactly the bold-label story metadata that `orch-gate` reads (`**Subproject:**`, `**Depends on:**`, `**Contract change:**`, see its SKILL.md) |
 | `bmad-sprint-planning` | `persistent_facts` / activation step | plan validation against the registry in the readiness check (PASS/CONCERNS/FAIL), backed by an `orch-status` script |
 | `bmad-build` | `activation_steps_prepend`, `persistent_facts`, `on_complete` | node context (allowed_read, imported contracts, pins); write `.orch/stories/<story>.yaml` |
 | `bmad-build-auto` | (post-v1) | node context for headless runs |

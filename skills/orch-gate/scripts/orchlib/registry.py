@@ -8,11 +8,17 @@ from pathlib import PurePosixPath
 import yaml
 
 from .config import Config
-from .gitio import Tree
+from .gitio import Tree, normalize_repo
 from .globs import may_overlap
 
 CONTRACTS = "contracts"
 CONTRACT_TYPES = ("openapi", "protobuf", "asyncapi", "db-schema")
+# What a canonical may be per type: a single spec file, a proto package directory, a migrations directory.
+CANONICAL_KINDS = {"openapi": ("blob",), "asyncapi": ("blob",), "protobuf": ("blob", "tree"), "db-schema": ("tree",)}
+# Things that do not exist *yet* (a new subproject's first story, a contract story adding its canonical).
+# The gate warns on these; every other issue is structural and fails it.
+EXISTENCE_ISSUES = ("path-missing", "canonical-missing")
+REQUIRED = ("repo", "path", "allowed_write")
 
 
 @dataclass
@@ -108,9 +114,11 @@ def load(tree: Tree, cfg: Config) -> Registry:
         if name == CONTRACTS:
             reg.issues.append(_issue("reserved-name", f"{path}: '{CONTRACTS}' is the reserved pseudo-subproject", name))
             continue
-        for req in ("repo", "path", "allowed_write"):
-            if req not in data:
-                reg.issues.append(_issue("missing-field", f"{path}: missing '{req}'", name))
+        missing = [req for req in REQUIRED if data.get(req) in (None, "")]
+        if missing:
+            # Never fill a boundary with a permissive default: the entry is dropped and the issue fails the gate.
+            reg.issues += [_issue("missing-field", f"{path}: missing '{req}'", name) for req in missing]
+            continue
         contracts = data.get("contracts") or {}
         exports = []
         for i, raw in enumerate(contracts.get("exports") or []):
@@ -122,8 +130,8 @@ def load(tree: Tree, cfg: Config) -> Registry:
                                   str(raw["copy"]) if raw.get("copy") else None, extra))
         reg[name] = Subproject(
             name=name,
-            repo=str(data.get("repo", ".")),
-            path=str(data.get("path", "")).strip("/"),
+            repo=str(data["repo"]),
+            path=str(data["path"]).strip("/"),
             allowed_read=_strings(data.get("allowed_read"), "allowed_read", name, reg.issues),
             allowed_write=_strings(data.get("allowed_write"), "allowed_write", name, reg.issues),
             exports=exports,
@@ -154,10 +162,14 @@ def validate(reg: Registry, coord: Tree, cfg: Config) -> list[dict]:
             if exp.type not in CONTRACT_TYPES:
                 issues.append(_issue("unknown-contract-type", f"export type '{exp.type}' not one of {', '.join(CONTRACT_TYPES)}", sub.name))
             expected = f"{cfg.contracts_dir}/{sub.name}/"
+            kind = coord.kind(exp.canonical)
             if not exp.canonical.startswith(expected):
                 issues.append(_issue("canonical-location", f"canonical '{exp.canonical}' must live under '{expected}'", sub.name))
-            elif not coord.exists(exp.canonical):
+            elif kind is None:
                 issues.append(_issue("canonical-missing", f"canonical '{exp.canonical}' not found in the coordination repo", sub.name))
+            elif exp.type in CANONICAL_KINDS and kind not in CANONICAL_KINDS[exp.type]:
+                want = " or ".join("a file" if k == "blob" else "a directory" for k in CANONICAL_KINDS[exp.type])
+                issues.append(_issue("canonical-kind", f"{exp.type} canonical '{exp.canonical}' must be {want}", sub.name))
     names = sorted(real)
     for i, a in enumerate(names):
         for b in names[i + 1:]:
@@ -192,6 +204,12 @@ def _cycles(real: dict[str, Subproject]) -> list[list[str]]:
         if n not in state:
             visit(n)
     return found
+
+
+def subprojects_in(reg: Registry, repo_id: str) -> list[Subproject]:
+    """Real subprojects whose `repo` is this repo ('.' = the coordination repo, else a normalized URL)."""
+    return [s for n, s in sorted(reg.items()) if n != CONTRACTS
+            and ("." if s.repo == "." else normalize_repo(s.repo)) == repo_id]
 
 
 def pin_paths(reg: Registry, subproject: str) -> list[str]:

@@ -10,7 +10,7 @@ import yaml
 
 from . import OrchError
 from .config import Config
-from .gitio import Tree, fetch_tree, normalize_repo
+from .gitio import Tree, fetch_tree, normalize_repo, sha
 from .registry import CONTRACTS, Registry, pin_paths
 from .stories import KEY_RE, Story
 
@@ -111,10 +111,11 @@ def repo_tree(repo: str, branch: str, coord: Tree, cache_root: Path, local: dict
 
 
 def merged(reg: Registry, coord: Tree, cache_root: Path, local: dict[str, Tree] | None = None,
-           offline: bool = False) -> tuple[dict[str, dict], list[dict]]:
+           offline: bool = False, read: list | None = None) -> tuple[dict[str, dict], list[dict]]:
     """Merged story keys across every registry repo -> {repo, path, tree}; plus the repos that could not be read.
 
     An unread repo means "merge status unknown", never "not merged": callers must report it as such.
+    `read`, if given, collects {repo, branch, sha} for every other repo that was read, so a verdict records them.
     """
     result, unread, seen = {}, [], {}
     for sub in sorted(reg.values(), key=lambda s: s.name):
@@ -133,6 +134,8 @@ def merged(reg: Registry, coord: Tree, cache_root: Path, local: dict[str, Tree] 
             unread.append({"code": "repo-unreadable", "repo": sub.repo, "subprojects": seen[ident],
                            "message": f"cannot read {sub.repo} (check network and read access for this runner): {exc}"})
             continue
+        if read is not None and ident != ".":
+            read.append({"repo": sub.repo, "branch": sub.branch, "sha": sha(tree.repo, tree.ref)})
         for key, path in keys_in(tree).items():
             result.setdefault(key, {"repo": sub.repo, "path": path, "tree": tree})
     return result, unread
@@ -161,16 +164,17 @@ def close_check(epic: int, stories, reg: Registry, merged_map: dict[str, dict], 
         if not hit:
             problems.append({"story": s.key, "message": f"story {s.id} is not merged"})
             continue
-        if not ARCHIVE_RE.match(hit["path"]):
+        archived = ARCHIVE_RE.match(hit["path"])
+        if not archived or int(archived.group(1)) != epic:
             problems.append({"story": s.key, "message": f"marker {hit['path']} in {hit['repo']} is not archived under {ARCHIVE_DIR}/epic-{epic}/"})
         marker, errs = parse(hit["tree"].read(hit["path"]) or b"", s.key)
         if errs or marker is None:
             problems.append({"story": s.key, "message": f"marker {hit['path']}: {'; '.join(errs)}"})
             continue
-        for path, sha in marker.get("contract_pins", {}).items():
+        for path, pinned in marker.get("contract_pins", {}).items():
             current = coord.blob_sha(path)
-            if current != sha:
-                problems.append({"story": s.key, "message": f"pin {path} = {sha[:10]} but main has {(current or 'nothing')[:10]} (pins not converged)"})
+            if current != pinned:
+                problems.append({"story": s.key, "message": f"pin {path} = {pinned[:10]} but main has {(current or 'nothing')[:10]} (pins not converged)"})
     return problems
 
 
@@ -180,9 +184,12 @@ def is_archive_move(changes: list[dict], tree_head: Tree, tree_base: Tree) -> tu
     added = {c["path"] for c in changes if c["status"] == "A" and ARCHIVE_RE.match(c["path"])}
     ok, problems = set(), []
     for path in added:
-        key = ARCHIVE_RE.match(path).group(2)
+        epic, key = ARCHIVE_RE.match(path).groups()
         src = marker_path(key)
-        if src in deleted and tree_base.read(src) == tree_head.read(path):
+        story_epic = int(key.split("-")[0])
+        if int(epic) != story_epic:
+            problems.append(f"{path}: story {key} belongs to epic {story_epic}; archive it under {ARCHIVE_DIR}/epic-{story_epic}/")
+        elif src in deleted and tree_base.read(src) == tree_head.read(path):
             ok |= {src, path}
         else:
             problems.append(f"{path}: archive entry must be an unchanged move of {src}")

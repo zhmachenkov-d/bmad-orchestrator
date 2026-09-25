@@ -68,7 +68,8 @@ def sha(repo: Path, ref: str) -> str:
 
 def dirty_paths(repo: Path, ignore_prefix: str = "") -> list[str]:
     """Uncommitted or untracked (not ignored) paths in the working tree."""
-    raw = out(repo, "status", "--porcelain", "-z", "--untracked-files=all")
+    # Not out(): stripping would eat the leading space of the first " M path" status field.
+    raw = git(repo, "status", "--porcelain", "-z", "--untracked-files=all").stdout.decode()
     paths, parts = [], raw.split("\0")
     i = 0
     while i < len(parts):
@@ -115,8 +116,26 @@ class Tree:
         return f"Tree({self.repo}@{self.ref})"
 
     def read(self, path: str) -> bytes | None:
-        proc = git(self.repo, "show", f"{self.ref}:{path}", check=False)
+        """File contents; None if absent or a directory (never a tree listing)."""
+        proc = git(self.repo, "cat-file", "blob", f"{self.ref}:{path}", check=False)
         return proc.stdout if proc.returncode == 0 else None
+
+    def kind(self, path: str) -> str | None:
+        """'blob', 'tree', or None if absent."""
+        proc = git(self.repo, "cat-file", "-t", f"{self.ref}:{path}", check=False)
+        if proc.returncode != 0:
+            return None
+        return proc.stdout.decode().strip() or None
+
+    def files(self, path: str) -> dict[str, bytes]:
+        """Every file under directory `path`, keyed relative to it; a single file is keyed by its name."""
+        kind = self.kind(path)
+        if kind == "blob":
+            return {path.rstrip("/").rsplit("/", 1)[-1]: self.read(path)}
+        if kind != "tree":
+            return {}
+        root = path.rstrip("/") + "/"
+        return {p[len(root):]: self.read(p) for p in self.list(path)}
 
     def text(self, path: str) -> str | None:
         data = self.read(path)
@@ -169,6 +188,12 @@ def normalize_repo(repo: str) -> str:
 def remote_url(repo: Path, remote: str = "origin") -> str | None:
     proc = git(repo, "remote", "get-url", remote, check=False)
     return proc.stdout.decode().strip() if proc.returncode == 0 else None
+
+
+def repo_name(repo: Path) -> str:
+    """Stable project name: the origin URL's last segment, else the checkout directory's name."""
+    url = remote_url(repo)
+    return normalize_repo(url).rsplit("/", 1)[-1] if url else Path(repo).resolve().name
 
 
 def fetch_tree(url: str, branch: str, cache_dir: Path) -> Tree:

@@ -5,6 +5,9 @@
 # ///
 """orch — the shared orch library CLI. Every orch skill and CI job calls this; output is JSON on stdout.
 
+Other orch skills install beside orch-gate and call `uv run <their skill dir>/../orch-gate/scripts/orch.py <command>`
+instead of reimplementing any of this.
+
 Exit codes: 0 = ok/pass, 1 = failing verdict / lost race / validation issues, 2 = usage or environment error.
 
 Repositories: --repo is the repo being acted on (default: current directory). --coord is the coordination
@@ -38,11 +41,12 @@ class Env:
         # Config, registry and epics are read at one trusted ref; in a monorepo that is the gate's --base.
         explicit = args.coord_ref or (getattr(args, "base", None) if self.same else None)
         try:
-            self.cfg, self.coord_ref = config.resolve(self.coord_root, explicit)
+            self.cfg, self.coord_ref, self.coord_ref_source = config.resolve(self.coord_root, explicit)
         except OrchError:
             if self.same:
                 raise
-            self.coord_ref = "HEAD"  # CI checkouts of the coordination repo are often a detached main
+            # CI checkouts of the coordination repo are often a detached main
+            self.coord_ref, self.coord_ref_source = "HEAD", "checked-out HEAD (no main ref found)"
             self.cfg = config.load(gitio.Tree(self.coord_root, self.coord_ref))
         self.coord = gitio.Tree(self.coord_root, self.coord_ref)
         self.cache_root = self.repo / markers.CACHE_DIR
@@ -90,8 +94,10 @@ def need_key(value: str) -> str:
 # ---- commands ----
 
 def cmd_config(args, env: Env):
+    # User settings resolve from this checkout's working tree (personal layers included); the gate never reads them.
+    cfg = {**env.cfg.to_dict(), **config.user_settings(env.coord_root, env.cfg)}
     return emit({"ok": True, "repo": str(env.repo), "coord": str(env.coord_root), "coord_ref": env.coord_ref,
-                 "config": env.cfg.to_dict()})
+                 "coord_ref_source": env.coord_ref_source, "config": cfg})
 
 
 def cmd_registry(args, env: Env):
@@ -206,18 +212,45 @@ def cmd_epic(args, env: Env):
                 1 if problems else 0)
 
 
+def _gate_base(args, env: Env, reg, repo_id: str) -> tuple[str, str]:
+    """The base ref and where it came from. A code repo defaults to its registry `branch`, which merged() reads too."""
+    if args.base:
+        return args.base, "explicit"
+    if not env.same:
+        subs = registry.subprojects_in(reg, repo_id)
+        branches = sorted({s.branch for s in subs})
+        if len(branches) > 1:
+            raise OrchError(f"subprojects in this repo name different branches ({', '.join(branches)}); pass --base")
+        if branches:
+            return gitio.default_base(env.repo, branches[0]), f"registry branch of {', '.join(s.name for s in subs)}"
+    return gitio.default_base(env.repo, env.cfg.main_branch), "orch_main_branch"
+
+
+def _portable(path: Path, repo: Path) -> str:
+    """Path as a fix command should print it: relative to the repo root when inside or beside it, else absolute."""
+    path = path.resolve()
+    rel = os.path.relpath(path, repo.resolve())
+    return rel if not rel.startswith(os.pardir + os.sep + os.pardir) else str(path)
+
+
 def cmd_gate(args, env: Env):
     ci = args.ci or gate.is_ci()
     if ci and args.offline:
         raise OrchError("--offline is not allowed in CI: the verdict would depend on which repos were skipped")
     repo_id = "." if env.same else gitio.normalize_repo(args.repo_id or gitio.remote_url(env.repo) or str(env.repo))
-    base = args.base or gitio.default_base(env.repo, env.cfg.main_branch)
     coord = env.coord
     reg = registry.load(coord, env.cfg)
+    base, base_source = _gate_base(args, env, reg, repo_id)
+    flags = []
+    if args.coord:
+        flags += ["--coord", _portable(Path(args.coord), env.repo)]
+    if args.coord_ref:
+        flags += ["--coord-ref", args.coord_ref]
     ctx = gate.Context(
         repo=env.repo, base=base, head=args.head, repo_id=repo_id, coord=coord, cfg=env.cfg, reg=reg,
         stories=stories.load(coord, env.cfg, reg), cache_root=env.cache_root,
-        ci=ci, offline=args.offline,
+        ci=ci, offline=args.offline, base_source=base_source, coord_ref_source=env.coord_ref_source,
+        fix_prefix=["uv", "run", _portable(Path(__file__), env.repo)], fix_flags=flags, fix_base=args.base,
     )
     result = gate.run(ctx)
     code = 0 if result["ok"] else 1
