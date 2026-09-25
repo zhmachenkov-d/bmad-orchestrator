@@ -21,3 +21,6 @@ dist/
 .DS_Store
 *.swp
 .idea/
+
+# BMad builder analysis: raw pre-pass outputs (the report and findings.json are kept)
+skills/*/.analysis/**/prepass-*
