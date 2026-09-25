@@ -8,8 +8,9 @@
 Exit codes: 0 = ok/pass, 1 = failing verdict / lost race / validation issues, 2 = usage or environment error.
 
 Repositories: --repo is the repo being acted on (default: current directory). --coord is the coordination
-repo holding the registry, epics, contracts, claims and sprint status (default: $ORCH_COORD, else --repo,
-i.e. a monorepo). Reads always go through git refs, never the working tree.
+repo holding the registry, epics, contracts, claims and sprint status (default: $ORCH_COORD, else the local path
+in this repo's committed orch_coordination_repo, else --repo, i.e. a monorepo). Reads always go through git refs,
+never the working tree.
 """
 
 from __future__ import annotations
@@ -30,7 +31,7 @@ from orchlib.stories import key_from_any  # noqa: E402
 class Env:
     def __init__(self, args):
         self.repo = gitio.toplevel(args.repo or os.getcwd())
-        coord = args.coord or os.environ.get("ORCH_COORD")
+        coord = args.coord or os.environ.get("ORCH_COORD") or _configured_coord(self.repo)
         self.coord_root = gitio.toplevel(coord) if coord else self.repo
         self.same = self.coord_root.resolve() == self.repo.resolve()
         # Config, registry and epics are read at one trusted ref; in a monorepo that is the gate's --base.
@@ -50,6 +51,24 @@ class Env:
 
     def stories(self, reg=None):
         return stories.load(self.coord, self.cfg, reg if reg is not None else self.registry())
+
+
+def _configured_coord(repo: Path) -> str | None:
+    """Coordination repo named by this repo's committed `orch_coordination_repo`; None means this repo."""
+    try:
+        value = config.resolve(repo)[0].coordination_repo.strip()
+    except OrchError:
+        return None  # no trusted ref or no config here: treat as a monorepo
+    if value in ("", "."):
+        return None
+    if gitio.normalize_repo(value) == gitio.normalize_repo(gitio.remote_url(repo) or ""):
+        return None  # the coordination repo names itself
+    path = Path(value).expanduser()
+    path = path if path.is_absolute() else repo / path
+    if path.is_dir():
+        return str(path)
+    raise OrchError(f"this repo's orch_coordination_repo is {value!r}, which is not a local checkout; "
+                    "clone it and pass --coord <path> or set ORCH_COORD")
 
 
 def emit(payload: dict, code: int = 0, out: str | None = None) -> int:
@@ -87,8 +106,8 @@ def cmd_stories(args, env: Env):
 
 def cmd_merged(args, env: Env):
     reg = env.registry()
-    m, warnings = markers.merged(reg, env.coord, env.cache_root, offline=args.offline)
-    return emit({"ok": True, "merged": markers.public(m), "warnings": warnings})
+    m, unread = markers.merged(reg, env.coord, env.cache_root, offline=args.offline)
+    return emit({"ok": True, "merged": markers.public(m), "unread_repos": unread})
 
 
 def cmd_deps(args, env: Env):
@@ -162,27 +181,34 @@ def cmd_sprint_status(args, env: Env | None):
     if text is None:
         raise OrchError(f"{env.cfg.sprint_status} not found")
     reg = env.registry()
-    m, warnings = markers.merged(reg, env.coord, env.cache_root, offline=args.offline)
+    m, unread = markers.merged(reg, env.coord, env.cache_root, offline=args.offline)
     closed = markers.closed_epics(env.coord, env.cfg)
     if args.action == "check":
-        res = sprint_status.check(text, set(m), closed)
-        return emit({"ok": not res["fail"], **res, "warnings": warnings}, 1 if res["fail"] else 0)
+        res = sprint_status.check(text, set(m), closed, markers.unknown_keys(env.stories(reg), unread))
+        return emit({"ok": not res["fail"], **res, "unread_repos": unread}, 1 if res["fail"] else 0)
+    if unread:
+        # derive would demote stories whose markers it could not see
+        raise OrchError("cannot derive sprint status while registry repos are unread: "
+                        + "; ".join(u["message"] for u in unread))
     new_text, changes = sprint_status.derive(text, set(m), closed)
     if args.write and changes:
         path.write_text(new_text, encoding="utf-8")
-    return emit({"ok": True, "changes": changes, "written": bool(args.write and changes), "warnings": warnings})
+    return emit({"ok": True, "changes": changes, "written": bool(args.write and changes)})
 
 
 def cmd_epic(args, env: Env):
     reg = env.registry()
     st = env.stories(reg)
-    m, warnings = markers.merged(reg, env.coord, env.cache_root, offline=args.offline)
-    problems = markers.close_check(args.epic, st, reg, m, env.coord)
-    return emit({"ok": not problems and not warnings, "epic": args.epic, "problems": problems, "warnings": warnings},
-                1 if problems or warnings else 0)
+    m, unread = markers.merged(reg, env.coord, env.cache_root, offline=args.offline)
+    problems = markers.close_check(args.epic, st, reg, m, env.coord, markers.unknown_keys(st, unread))
+    return emit({"ok": not problems, "epic": args.epic, "problems": problems, "unread_repos": unread},
+                1 if problems else 0)
 
 
 def cmd_gate(args, env: Env):
+    ci = args.ci or gate.is_ci()
+    if ci and args.offline:
+        raise OrchError("--offline is not allowed in CI: the verdict would depend on which repos were skipped")
     repo_id = "." if env.same else gitio.normalize_repo(args.repo_id or gitio.remote_url(env.repo) or str(env.repo))
     base = args.base or gitio.default_base(env.repo, env.cfg.main_branch)
     coord = env.coord
@@ -190,7 +216,7 @@ def cmd_gate(args, env: Env):
     ctx = gate.Context(
         repo=env.repo, base=base, head=args.head, repo_id=repo_id, coord=coord, cfg=env.cfg, reg=reg,
         stories=stories.load(coord, env.cfg, reg), cache_root=env.cache_root,
-        ci=args.ci or gate.is_ci(), offline=args.offline,
+        ci=ci, offline=args.offline,
     )
     result = gate.run(ctx)
     code = 0 if result["ok"] else 1
@@ -213,7 +239,7 @@ class JsonParser(argparse.ArgumentParser):
 def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--repo", help="repo to act on (default: cwd)")
-    common.add_argument("--coord", help="coordination repo path (default: $ORCH_COORD, else --repo)")
+    common.add_argument("--coord", help="coordination repo path (default: $ORCH_COORD, else orch_coordination_repo if a local path, else --repo)")
     common.add_argument("--coord-ref", help="ref of the coordination repo to read (default: origin/<main> or <main>)")
     common.add_argument("--offline", action="store_true", help="do not fetch other registry repos; their merge status is skipped with a warning")
     common.add_argument("--verbose", action="store_true")
