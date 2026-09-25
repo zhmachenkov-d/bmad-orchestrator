@@ -6,6 +6,7 @@ import hashlib
 import os
 import re
 import subprocess
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -14,15 +15,31 @@ from . import OrchError
 EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 # Settings that change git's output format are pinned, so the same commit reads the same on every machine.
 PINNED_CONFIG = ("-c", "core.quotePath=false")
+# Set by git hooks (a pre-push hook runs with GIT_DIR) and they override -C, so orch would read or fetch into the
+# hook's repo instead of the one it names. Every call addresses its repo explicitly, so they are dropped.
+REPO_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_PREFIX")
+FETCH_TIMEOUT = 60
+
+
+def git_env(extra: dict | None = None) -> dict:
+    env = {k: v for k, v in os.environ.items() if k not in REPO_ENV}
+    return {**env, **(extra or {})}
+
+
+def decode(raw: bytes) -> str:
+    """git output as str; bytes that are not UTF-8 (a path from another locale) round-trip instead of crashing."""
+    return raw.decode("utf-8", "surrogateescape")
 
 
 def git(repo: Path | str, *args: str, check: bool = True, input: bytes | None = None,
-        env: dict | None = None) -> subprocess.CompletedProcess:
+        env: dict | None = None, timeout: float | None = None) -> subprocess.CompletedProcess:
     proc = subprocess.run(
         ["git", *PINNED_CONFIG, "-C", str(repo), *args],
         input=input,
         capture_output=True,
-        env={**os.environ, **(env or {})},
+        env=git_env(env),
+        timeout=timeout,
     )
     if check and proc.returncode != 0:
         raise OrchError(f"git {' '.join(args)} failed in {repo}: {proc.stderr.decode(errors='replace').strip()}")
@@ -30,7 +47,7 @@ def git(repo: Path | str, *args: str, check: bool = True, input: bytes | None = 
 
 
 def out(repo: Path | str, *args: str, **kw) -> str:
-    return git(repo, *args, **kw).stdout.decode().strip()
+    return decode(git(repo, *args, **kw).stdout).strip()
 
 
 def toplevel(path: Path | str) -> Path:
@@ -72,7 +89,7 @@ def sha(repo: Path, ref: str) -> str:
 def dirty_paths(repo: Path, ignore_prefix: str = "") -> list[str]:
     """Uncommitted or untracked (not ignored) paths in the working tree."""
     # Not out(): stripping would eat the leading space of the first " M path" status field.
-    raw = git(repo, "status", "--porcelain", "-z", "--untracked-files=all").stdout.decode()
+    raw = decode(git(repo, "status", "--porcelain", "-z", "--untracked-files=all").stdout)
     paths, parts = [], raw.split("\0")
     i = 0
     while i < len(parts):
@@ -131,14 +148,18 @@ class Tree:
         return proc.stdout.decode().strip() or None
 
     def files(self, path: str) -> dict[str, bytes]:
-        """Every file under directory `path`, keyed relative to it; a single file is keyed by its name."""
+        """Every file under directory `path`, keyed relative to it; a single file is keyed by its name.
+
+        A submodule (gitlink) reads as git diff prints it, so it compares by the commit it points at.
+        """
         kind = self.kind(path)
         if kind == "blob":
             return {path.rstrip("/").rsplit("/", 1)[-1]: self.read(path)}
         if kind != "tree":
             return {}
         root = path.rstrip("/") + "/"
-        return {p[len(root):]: self.read(p) for p in self.list(path)}
+        return {p[len(root):]: self.read(p) if t == "blob" else f"Subproject commit {obj}\n".encode()
+                for t, obj, p in self.entries(path)}
 
     def text(self, path: str) -> str | None:
         data = self.read(path)
@@ -159,11 +180,21 @@ class Tree:
     def exists(self, path: str) -> bool:
         return self.blob_sha(path) is not None
 
-    def list(self, prefix: str = "") -> list[str]:
-        args = ["ls-tree", "-r", "-z", "--name-only", self.ref]
+    def entries(self, prefix: str = "") -> list[tuple[str, str, str]]:
+        """(type, object sha, path) for every file and submodule under `prefix`."""
+        args = ["ls-tree", "-r", "-z", self.ref]
         if prefix:
             args += ["--", prefix.rstrip("/") + "/"]
-        return [p for p in git(self.repo, *args).stdout.decode().split("\0") if p]
+        found = []
+        for rec in decode(git(self.repo, *args).stdout).split("\0"):
+            if rec:
+                meta, path = rec.split("\t", 1)
+                _, type_, obj = meta.split()
+                found.append((type_, obj, path))
+        return found
+
+    def list(self, prefix: str = "") -> list[str]:
+        return [p for _, _, p in self.entries(prefix)]
 
 
 def changed_files(repo: Path, base: str, head: str) -> list[dict]:
@@ -206,14 +237,20 @@ def refresh(repo: Path, remote: str = "origin") -> dict | None:
     """
     if remote_url(repo, remote) is None:
         return None
-    proc = git(repo, "fetch", "--quiet", "--no-tags", remote, check=False, env={"GIT_TERMINAL_PROMPT": "0"})
-    if proc.returncode == 0:
-        return {"repo": str(repo), "remote": remote, "ok": True}
-    fetch_head = cache_dir(repo).parent / "FETCH_HEAD"
-    last = (datetime.fromtimestamp(fetch_head.stat().st_mtime, timezone.utc).isoformat(timespec="seconds")
-            if fetch_head.exists() else "never")
-    lines = proc.stderr.decode(errors="replace").strip().splitlines()
-    return {"repo": str(repo), "remote": remote, "ok": False, "last_fetched": last, "error": lines[-1] if lines else ""}
+    try:
+        proc = git(repo, "fetch", "--quiet", "--no-tags", remote, check=False, env={"GIT_TERMINAL_PROMPT": "0"},
+                   timeout=FETCH_TIMEOUT)
+        if proc.returncode == 0:
+            return {"repo": str(repo), "remote": remote, "ok": True}
+        lines = proc.stderr.decode(errors="replace").strip().splitlines()
+        error = lines[-1] if lines else ""
+    except subprocess.TimeoutExpired:
+        error = f"no answer from {remote} within {FETCH_TIMEOUT}s"
+    # FETCH_HEAD is per worktree while the refs are shared, so the refs are as fresh as the newest one.
+    common = cache_dir(repo).parent
+    stamps = [f.stat().st_mtime for f in (common / "FETCH_HEAD", *common.glob("worktrees/*/FETCH_HEAD")) if f.exists()]
+    last = datetime.fromtimestamp(max(stamps), timezone.utc).isoformat(timespec="seconds") if stamps else "never"
+    return {"repo": str(repo), "remote": remote, "ok": False, "last_fetched": last, "error": error}
 
 
 def repo_name(repo: Path) -> str:
@@ -226,7 +263,27 @@ def fetch_tree(url: str, branch: str, cache_dir: Path) -> Tree:
     """Shallow-fetch one branch of a remote repo into a bare cache repo and return its Tree."""
     cache_dir.mkdir(parents=True, exist_ok=True)
     bare = cache_dir / (hashlib.sha1(normalize_repo(url).encode()).hexdigest()[:16] + ".git")
-    if not bare.exists():
-        subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True, capture_output=True)
-    git(bare, "fetch", "--depth=1", "--quiet", url, f"+refs/heads/{branch}:refs/heads/{branch}")
+    # The cache is shared by every worktree of the clone, so gates running side by side take turns per repo.
+    with _locked(bare.with_suffix(".lock")):
+        if not bare.exists():
+            subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True, capture_output=True, env=git_env())
+        # Holding the lock, no other orch process is inside: git lock files left by an interrupted run are stale.
+        for stale in (bare / "shallow.lock", bare / "packed-refs.lock", bare / "config.lock", *bare.glob("refs/**/*.lock")):
+            stale.unlink(missing_ok=True)
+        git(bare, "fetch", "--depth=1", "--quiet", url, f"+refs/heads/{branch}:refs/heads/{branch}")
     return Tree(bare, f"refs/heads/{branch}")
+
+
+@contextmanager
+def _locked(path: Path):
+    try:
+        import fcntl
+    except ImportError:  # Windows: no advisory locks; concurrent gates may still collide there
+        yield
+        return
+    with open(path, "a") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)

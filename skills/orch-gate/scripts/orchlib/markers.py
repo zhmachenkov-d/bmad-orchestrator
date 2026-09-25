@@ -178,8 +178,9 @@ def close_check(epic: int, stories, reg: Registry, merged_map: dict[str, dict], 
     return problems
 
 
-def is_archive_move(changes: list[dict], tree_head: Tree, tree_base: Tree) -> tuple[set[str], list[str]]:
-    """Paths that are part of a pure archive move (marker deleted, identical file added under the archive)."""
+def is_archive_move(changes: list[dict], tree_head: Tree, tree_base: Tree) -> tuple[set[str], list[tuple[str, str]]]:
+    """Paths that are part of a pure archive move (marker deleted, identical file added under the archive),
+    plus (path, message) for every archive addition or marker removal that is not one."""
     deleted = {c["path"]: c for c in changes if c["status"] == "D" and MARKER_RE.match(c["path"])}
     added = {c["path"] for c in changes if c["status"] == "A" and ARCHIVE_RE.match(c["path"])}
     ok, problems = set(), []
@@ -188,14 +189,14 @@ def is_archive_move(changes: list[dict], tree_head: Tree, tree_base: Tree) -> tu
         src = marker_path(key)
         story_epic = int(key.split("-")[0])
         if int(epic) != story_epic:
-            problems.append(f"{path}: story {key} belongs to epic {story_epic}; archive it under {ARCHIVE_DIR}/epic-{story_epic}/")
+            problems.append((path, f"{path}: story {key} belongs to epic {story_epic}; archive it under {ARCHIVE_DIR}/epic-{story_epic}/"))
         elif src in deleted and tree_base.read(src) == tree_head.read(path):
             ok |= {src, path}
         else:
-            problems.append(f"{path}: archive entry must be an unchanged move of {src}")
+            problems.append((path, f"{path}: archive entry must be an unchanged move of {src}"))
     for path in deleted:
         if path not in ok:
-            problems.append(f"{path}: markers may only be removed by moving them to {ARCHIVE_DIR}/epic-N/")
+            problems.append((path, f"{path}: markers may only be removed by moving them to {ARCHIVE_DIR}/epic-N/"))
     return ok, problems
 
 

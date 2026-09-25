@@ -93,6 +93,9 @@ def run(type_: str, canonical: str, base: Tree, head: Tree, repo: Path, base_ref
         return {"status": "removed", "output": f"{canonical} deleted"}
     if old_kind is None:
         return {"status": "added", "output": f"{canonical} is new"}
+    if "commit" in (old_kind, new_kind):
+        # Fail closed: a submodule's contents are not in this repo, so nothing could be compared.
+        return {"status": "breaking", "output": f"canonical {canonical} is a submodule; contracts must be files in the coordination repo"}
     if new_kind == "tree" or old_kind == "tree":
         if type_ != "protobuf":
             # Fail closed: the adapter compares one spec file, a directory would be compared as nothing.

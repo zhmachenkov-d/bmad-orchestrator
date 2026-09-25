@@ -344,6 +344,8 @@ COMMANDS = {"config": cmd_config, "registry": cmd_registry, "stories": cmd_stori
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="backslashreplace")  # a non-UTF-8 path in a message must not crash the report
     try:
         if args.cmd == "sprint-status" and args.action == "merge":
             if len(args.files) != 3:

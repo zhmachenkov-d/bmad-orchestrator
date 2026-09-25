@@ -49,11 +49,18 @@ class Context:
     fix_prefix: list = field(default_factory=lambda: ["orch.py"])
     fix_flags: list = field(default_factory=list)
     fix_base: str | None = None
+    fix_checkout: str | None = None    # set by run() when the gated head is not the checked-out commit
 
 
 def fix(ctx: Context, *command: str, precondition: str | None = None) -> dict:
-    """A command that runs as printed: same coordination repo, ref and (for markers) base as this verdict."""
+    """A command that runs as printed: same coordination repo, ref and (for markers) base as this verdict.
+
+    Fixes write to the working tree, so when the gate judged another ref they first need that ref checked out.
+    """
     flags = list(ctx.fix_flags) + (["--base", ctx.fix_base] if command[0] == "marker" and ctx.fix_base else [])
+    writes_checkout = command[0] == "marker" or command[:2] == ("sprint-status", "derive")
+    if ctx.fix_checkout and writes_checkout:
+        precondition = f"check out {ctx.fix_checkout}" + (f", then {precondition}" if precondition else "")
     return {"mechanical": True, "command": [*ctx.fix_prefix, *command, *flags], "precondition": precondition}
 
 
@@ -102,8 +109,11 @@ def copy_drift(canon: Tree, canonical: str, copy_tree: Tree, copy: str) -> tuple
     """(message, diff) when a contract copy differs from its canonical; files compare whole, directories per file."""
     ck, pk = canon.kind(canonical), copy_tree.kind(copy)
     if ck != pk:
-        what = {"blob": "a file", "tree": "a directory"}
-        return f"{copy} is {what[pk]} but canonical {canonical} is {what[ck]}", ""
+        what = {"blob": "a file", "tree": "a directory", "commit": "a submodule"}
+        return f"{copy} is {what.get(pk, pk)} but canonical {canonical} is {what.get(ck, ck)}", ""
+    if ck == "commit":
+        a, b = canon.blob_sha(canonical), copy_tree.blob_sha(copy)
+        return None if a == b else (f"{copy} points at submodule commit {b[:10]}, canonical {canonical} at {a[:10]}", "")
     if ck == "blob":
         a, b = canon.read(canonical), copy_tree.read(copy)
         return None if _norm(a) == _norm(b) else (f"{copy} differs from canonical {canonical}", _diff(a, b, canonical, copy))
@@ -135,6 +145,8 @@ def setup_problems(reg: Registry, story_set: StorySet, coord: Tree, cfg: Config,
     for i in story_set.issues:
         if i["code"] == "no-epics":
             fails.append(("no-epics", i["message"], "commit the epics with orch story metadata to the coordination main"))
+        elif i["code"] == "epics-unreadable":
+            fails.append(("epics-unreadable", i["message"], "save the epics file as UTF-8"))
     if repo_id != "." and len(reg) > 1 and not registry.subprojects_in(reg, repo_id):
         fails.append(("repo-unregistered", f"no registry subproject lives in this repo ({repo_id})",
                       "pass --coord <coordination checkout>, or --repo-id <this repo's URL as written in the registry>"))
@@ -143,6 +155,8 @@ def setup_problems(reg: Registry, story_set: StorySet, coord: Tree, cfg: Config,
 
 def run(ctx: Context) -> dict:
     head_sha, head_note = resolve_head(ctx.repo, ctx.base, ctx.head)
+    if sha(ctx.repo, ctx.head) != sha(ctx.repo, "HEAD"):
+        ctx.fix_checkout = ctx.head
     changes = changed_files(ctx.repo, ctx.base, head_sha)
     mb = merge_base(ctx.repo, ctx.base, head_sha)
     head, base_tip, mb_tree = Tree(ctx.repo, head_sha), Tree(ctx.repo, ctx.base), Tree(ctx.repo, mb)
@@ -179,25 +193,31 @@ def run(ctx: Context) -> dict:
     # --- setup: an empty, broken or mismatched registry must fail, never pass as "nothing protected" ---
     fails, warns = setup_problems(ctx.reg, ctx.stories, ctx.coord, ctx.cfg, ctx.repo_id)
     setup_dirs = [f"{ctx.cfg.registry_dir}/**", f"{ctx.cfg.planning_artifacts}/**"]
-    if fails and is_coord and not live and changes and all(matches(c["path"], setup_dirs) for c in changes):
-        # A PR that repairs the setup is judged by the state it produces, or a broken main could never be fixed.
+    if is_coord and any(matches(c["path"], setup_dirs) for c in changes):
+        # The setup this PR produces is what every later PR is judged by, so it is checked here too.
         head_reg = registry.load(head, ctx.cfg)
         head_fails, _ = setup_problems(head_reg, stories.load(head, ctx.cfg, head_reg), head, ctx.cfg, ctx.repo_id)
-        if not head_fails:
+        if fails and not head_fails and not live and all(matches(c["path"], setup_dirs) for c in changes):
+            # A PR that repairs the setup is judged by the state it produces, or a broken main could never be fixed.
             checks["setup"].warn("setup-repair", "the coordination main has setup problems and this PR resolves them: "
                                  + "; ".join(m for _, m, _ in fails))
             fails = []
+        known = {(code, message.replace(f" at {ctx.coord.ref}", "")) for code, message, _ in fails}
+        for code, message, _ in head_fails:
+            if (code, message.replace(f" at {head.ref}", "")) not in known:
+                checks["setup"].fail(code, f"introduced by this PR: {message}",
+                                     hint="fix it in this PR; once merged it would fail every PR's setup check")
     for code, message, hint in fails:
         checks["setup"].fail(code, message, **({"hint": hint} if hint else {}))
     for code, message, hint in warns:
         checks["setup"].warn(code, message)
 
-    for p in archive_problems:
-        checks["scope"].fail("archive-move-invalid", p)
+    for path, message in archive_problems:
+        checks["scope"].fail("archive-move-invalid", message, path=path)
     records = markers.record_changes(changes, archive_ok, ctx.cfg.closed_dir)
     for code, path, message in records:
         checks["scope"].fail(code, message, path=path)
-    judged = archive_ok | {path for _, path, _ in records}
+    judged = archive_ok | {path for path, _ in archive_problems} | {path for _, path, _ in records}
 
     story = sub = marker = None
     if len(live) > 1:
@@ -207,6 +227,12 @@ def run(ctx: Context) -> dict:
         path = live[0]["path"]
         key = markers.MARKER_RE.match(path).group(1)
         result["story"] = key
+        # "Merged" means the marker is on main, so a PR may only add a marker for a story main does not have.
+        merged_at = markers.keys_in(base_tip).get(key)
+        if live[0]["status"] != "A" or merged_at:
+            checks["marker"].fail("marker-already-merged", f"story {key} is already merged ({merged_at or path} is on {ctx.base}); "
+                                  "a merged story is never reopened", path=path,
+                                  hint="leave the merged marker as it is and put the new work under a new story in the epics")
         story = ctx.stories.get(key) if KEY_RE.match(key) else None
         if story is None:
             checks["marker"].fail("unknown-story", f"{path}: story '{key}' is not in the epics on the coordination main", path=path)
@@ -235,8 +261,8 @@ def run(ctx: Context) -> dict:
     # --- plan issues: the PR's own story must be well-formed; others' defects are surfaced, not blocking ---
     own = ctx.stories.get(result["story"]) if result["story"] else None
     for i in ctx.stories.issues:
-        if i["code"] == "no-epics":
-            continue  # a setup failure
+        if i["code"] in ("no-epics", "epics-unreadable"):
+            continue  # setup failures
         if own and i["story"] == own.id:
             if i["code"] not in ("missing-subproject", "unknown-subproject"):  # already no-subproject
                 checks["marker"].fail(i["code"], i["message"], hint="fix the story in the epics on the coordination main")
@@ -311,8 +337,8 @@ def run(ctx: Context) -> dict:
             checks["conformance"].skip(f"{sub.name} declares no contract copies")
         for exp in copies:
             if ctx.coord.kind(exp.canonical) is None:
-                checks["conformance"].warn("canonical-missing", f"canonical {exp.canonical} missing on coordination main")
-            elif head.kind(exp.copy) is None:
+                continue  # setup warns canonical-missing; there is nothing to compare against yet
+            if head.kind(exp.copy) is None:
                 checks["conformance"].fail("copy-missing", f"contract copy {exp.copy} is missing", path=exp.copy,
                                            hint=f"copy {exp.canonical} from the coordination repo")
             elif drift := copy_drift(ctx.coord, exp.canonical, head, exp.copy):

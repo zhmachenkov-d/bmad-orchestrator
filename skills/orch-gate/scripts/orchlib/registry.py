@@ -100,13 +100,13 @@ def _entry(data: dict, path: str, name: str, cfg: Config, issues: list) -> Subpr
     """
     before = len(issues)
     for req in ("repo", "path"):
-        if not isinstance(data.get(req), str) or not data[req].strip():
+        if not isinstance(data.get(req), str) or not data[req].strip().strip("/"):
             issues.append(_issue("missing-field", f"{path}: '{req}' must be a non-empty string", name))
     allowed_write = _strings(data.get("allowed_write"), "allowed_write", name, issues)
     if not allowed_write or not all(p.strip() for p in allowed_write):
         issues.append(_issue("missing-field", f"{path}: 'allowed_write' must list at least one non-empty pattern", name))
-    if not isinstance(data.get("branch", ""), str):
-        issues.append(_issue("bad-field", f"{path}: 'branch' must be a string", name))
+    if data.get("branch") is not None and not (isinstance(data["branch"], str) and data["branch"].strip()):
+        issues.append(_issue("bad-field", f"{path}: 'branch' must be a non-empty branch name (omit it for the main branch)", name))
     contracts = data.get("contracts")
     contracts = {} if contracts is None else contracts
     if not isinstance(contracts, dict):
@@ -120,18 +120,26 @@ def _entry(data: dict, path: str, name: str, cfg: Config, issues: list) -> Subpr
     exports = []
     for i, raw in enumerate(raw_exports):
         if not (isinstance(raw, dict) and isinstance(raw.get("type"), str) and isinstance(raw.get("canonical"), str)
-                and raw["canonical"].strip("/") and isinstance(raw.get("copy") or "", str)):
-            issues.append(_issue("bad-export", f"{path}: exports[{i}] needs string 'type' and 'canonical' (and 'copy', if given)", name))
+                and raw["canonical"].strip("/") and _optional_path(raw.get("copy"))
+                and all(isinstance(k, str) for k in raw) and isinstance(raw.get("dev_url", ""), str)):
+            issues.append(_issue("bad-export", f"{path}: exports[{i}] needs string 'type' and 'canonical' "
+                                 "(and a non-empty string 'copy' and 'dev_url', if given)", name))
             continue
         extra = {k: v for k, v in raw.items() if k not in ("type", "canonical", "copy")}
-        exports.append(Export(raw["type"], raw["canonical"].strip("/"), raw.get("copy") or None, extra))
+        exports.append(Export(raw["type"], raw["canonical"].strip("/"), raw["copy"].strip("/") if raw.get("copy") else None, extra))
     imports = _strings(contracts.get("imports"), "contracts.imports", name, issues)
     allowed_read = _strings(data.get("allowed_read"), "allowed_read", name, issues)
     if len(issues) > before:
         return None
-    return Subproject(name=name, repo=data["repo"].strip(), path=data["path"].strip().strip("/"),
+    # One spelling of "the coordination repo", so every `repo == "."` check sees it.
+    repo = "." if normalize_repo(data["repo"]) == "." else data["repo"].strip()
+    return Subproject(name=name, repo=repo, path=data["path"].strip().strip("/"),
                       allowed_read=allowed_read, allowed_write=allowed_write, exports=exports, imports=imports,
-                      branch=data.get("branch") or cfg.main_branch, source=path)
+                      branch=data["branch"].strip() if data.get("branch") is not None else cfg.main_branch, source=path)
+
+
+def _optional_path(value) -> bool:
+    return value is None or (isinstance(value, str) and bool(value.strip().strip("/")))
 
 
 def load(tree: Tree, cfg: Config) -> Registry:
@@ -144,7 +152,7 @@ def load(tree: Tree, cfg: Config) -> Registry:
         stem = PurePosixPath(path).stem
         try:
             data = yaml.safe_load(tree.text(path) or "") or {}
-        except (yaml.YAMLError, OrchError) as exc:
+        except (yaml.YAMLError, OrchError, RecursionError) as exc:
             reg.issues.append(_issue("yaml", f"{path}: {exc}", stem))
             continue
         if not isinstance(data, dict):
