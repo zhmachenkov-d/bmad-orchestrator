@@ -1,0 +1,18 @@
+{
+  "id": "uv",
+  "version": "1.0.0",
+  "name": "uv",
+  "description": "Install Astral's uv Python package and project manager",
+  "documentationURL": "https://docs.astral.sh/uv/",
+  "options": {
+    "version": {
+      "type": "string",
+      "proposals": ["latest", "0.8.4", "0.7.0"],
+      "default": "latest",
+      "description": "Version of uv to install (latest or X.Y.Z)"
+    }
+  },
+  "installsAfter": [
+    "ghcr.io/devcontainers/features/common-utils"
+  ]
+}
