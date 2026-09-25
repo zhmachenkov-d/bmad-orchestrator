@@ -218,6 +218,84 @@ def test_config_changes_take_effect_once_merged(mono):
     assert code == 0 and "payment-service" in res["subprojects"], res
 
 
+def test_result_records_inputs_and_dirty_tree_never_changes_the_verdict(mono):
+    mono.branch("orch/1-2").write(IMPL, "x\n")
+    marker(mono, "1-2")
+    mono.commit()
+    mono.write("services/payment/wip.py", "not committed\n")
+    code, res = gate(mono)
+    assert code == 0, res
+    assert res["base_sha"] == mono.git("rev-parse", "main") and res["coord_sha"] == res["base_sha"]
+    assert res["head_sha"] == mono.git("rev-parse", "HEAD") and res["offline"] is False
+    assert [n["code"] for n in res["notices"]] == ["dirty-worktree"] and "wip.py" in res["notices"][0]["message"]
+    code, res = gate(mono, "--ci")
+    assert code == 0 and res["notices"] == []
+
+
+def test_shallow_clone_names_the_fix(mono, tmp_path):
+    mono.branch("orch/1-2").write(IMPL, "x\n").commit()
+    shallow = tmp_path / "shallow"
+    mono.git("clone", "-q", "--depth", "1", "--branch", "orch/1-2", f"file://{mono.path}", str(shallow))
+    mono.git("-C", str(shallow), "fetch", "-q", "--depth", "1", "origin", "main:main")
+    code, res = run_cli("gate", "--repo", str(shallow), "--base", "main")
+    assert code == 2 and "shallow clone" in res["error"] and "fetch-depth: 0" in res["error"]
+
+
+def test_offline_is_rejected_in_ci(mono):
+    mono.branch("x").write("README.md", "y\n").commit()
+    code, res = gate(mono, "--ci", "--offline")
+    assert code == 2 and "--offline" in res["error"]
+
+
+def unreadable_user_service(mono):
+    mono.write(f"{R}/user-service.yaml", registry_yaml("user-service", "services/user", imports=["payment-service"],
+                                                       repo="/nonexistent/user-service"))
+    mono.commit("user-service moves to its own repo")
+
+
+def test_unreadable_repo_is_unverifiable_not_unmerged(mono):
+    unreadable_user_service(mono)
+    mono.branch("status")
+    mono.write(STATUS, SPRINT.replace("1-3-user-service-calls-payments: backlog", "1-3-user-service-calls-payments: done"))
+    mono.commit()
+    code, res = gate(mono)
+    fails = [f for f in check(res, "sprint-status")["findings"] if f["level"] == "fail"]
+    assert code == 1 and [f["code"] for f in fails] == ["done-unverifiable"]
+    assert res["unread_repos"][0]["code"] == "repo-unreadable" and res["unread_repos"][0]["subprojects"] == ["user-service"]
+    code, res = run_cli("epic", "close-check", "--epic", "1", "--repo", str(mono.path))
+    assert code == 1 and any(p.get("code") == "unverifiable" and p["story"] == "1-3" for p in res["problems"])
+
+
+def test_narrow_story_with_unreadable_consumer_says_so(mono, tmp_path):
+    path = fake_bin(tmp_path, "oasdiff", ODIFF)
+    unreadable_user_service(mono)
+    mono.branch("orch/1-4").write(OAS, "openapi: 3.0.0\n# BREAK\n").commit()
+    marker(mono, "1-4")
+    mono.commit()
+    code, res = gate(mono, env={"PATH": path})
+    findings = check(res, "breaking")["findings"]
+    assert code == 1 and findings[0]["code"] == "consumers-unverifiable" and "user-service" in findings[0]["message"]
+    assert not any("not yet migrated" in f["message"] for f in findings)
+
+
+def test_coordination_repo_found_from_committed_config(tmp_path):
+    coord = Repo(tmp_path / "coord")
+    code_repo = Repo(tmp_path / "payment")
+    url = str(code_repo.path)
+    coord.write(f"{R}/payment-service.yaml", registry_yaml("payment-service", "src", repo=url))
+    coord.write("_bmad-output/planning-artifacts/epics.md", "## Epic 1: P\n### Story 1.2: Impl\n**Subproject:** payment-service\n")
+    coord.commit()
+    code_repo.write("src/app.py", "x\n").write("_bmad/custom/config.toml", '[modules.orch]\ncoordination_repo = "../coord"\n').commit()
+    code_repo.branch("orch/1-2").write("src/app.py", "y\n")
+    assert run_cli("marker", "write", "--story", "1.2", "--repo", url)[0] == 0
+    code_repo.commit()
+    code, res = run_cli("gate", "--repo", url, "--base", "main", "--repo-id", url)
+    assert code == 0, res
+    code_repo.checkout("main").write("_bmad/custom/config.toml", '[modules.orch]\ncoordination_repo = "git@example.com:org/coord.git"\n').commit()
+    code, res = run_cli("config", "--repo", url)
+    assert code == 2 and "--coord" in res["error"]
+
+
 def test_sprint_status_done_requires_marker(mono):
     mono.branch("status")
     mono.write(STATUS, SPRINT.replace("1-2-implement-payment-api: backlog", "1-2-implement-payment-api: done"))

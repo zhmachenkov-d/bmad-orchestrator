@@ -9,7 +9,7 @@ from pathlib import Path
 from . import markers, sprint_status
 from .config import Config
 from .detectors import run as run_detector
-from .gitio import Tree, changed_files, merge_base, resolve_head
+from .gitio import Tree, changed_files, dirty_paths, merge_base, resolve_head, sha
 from .globs import matches
 from .registry import CONTRACTS, Registry, pin_paths
 from .stories import KEY_RE, StorySet, id_to_key
@@ -68,10 +68,20 @@ def run(ctx: Context) -> dict:
     archive_ok, archive_problems = markers.is_archive_move(changes, head, mb_tree)
     checks = {k: Check(k) for k in ("marker", "scope", "pins", "conformance", "breaking", "sprint-status", "merge-driver")}
     result = {"verdict": "pass", "mode": "story" if live else "no-story", "story": None, "subproject": None,
-              "repo": ctx.repo_id, "base": ctx.base, "head": ctx.head, "head_sha": head_sha, "merge_base": mb,
-              "changed": [c["path"] for c in changes]}
+              "repo": ctx.repo_id, "base": ctx.base, "base_sha": sha(ctx.repo, ctx.base), "head": ctx.head,
+              "head_sha": head_sha, "merge_base": mb, "coord_ref": ctx.coord.ref,
+              "coord_sha": sha(ctx.coord.repo, ctx.coord.ref), "offline": ctx.offline,
+              "changed": [c["path"] for c in changes], "notices": []}
     if head_note:
         result["head_resolved"] = head_note
+    if not ctx.ci:
+        # Informational only: the verdict is about committed history, so this never changes it.
+        dirty = dirty_paths(ctx.repo, ignore_prefix=markers.CACHE_DIR + "/")
+        if dirty:
+            result["notices"].append({"code": "dirty-worktree",
+                                      "message": f"{len(dirty)} uncommitted path(s), invisible to this verdict: "
+                                                 + ", ".join(dirty[:5]) + (" ..." if len(dirty) > 5 else ""),
+                                      "hint": "commit, then re-run the gate"})
 
     for p in archive_problems:
         checks["scope"].fail(p)
@@ -190,8 +200,11 @@ def run(ctx: Context) -> dict:
 
     def merged_map():
         if "m" not in merged_cache:
-            merged_cache["m"], merged_cache["w"] = markers.merged(ctx.reg, head if is_coord else ctx.coord, ctx.cache_root,
-                                                                  ctx.local_repos, ctx.offline)
+            merged_cache["m"], unread = markers.merged(ctx.reg, head if is_coord else ctx.coord, ctx.cache_root,
+                                                       ctx.local_repos, ctx.offline)
+            merged_cache["unknown"] = markers.unknown_keys(ctx.stories, unread)
+            if unread:
+                result["unread_repos"] = unread
         return merged_cache["m"]
 
     if touched and is_coord:
@@ -211,9 +224,16 @@ def run(ctx: Context) -> dict:
                 if not pending:
                     checks["breaking"].warn(f"{canonical}: breaking change accepted — narrow story, all consumers migrated ({', '.join(consumers) or 'none'})")
                     continue
-                checks["breaking"].fail(f"{canonical}: breaking change, consumers not yet migrated: {', '.join(pending)}",
-                                        hint="the narrow story must depend on a merged migrate story for each consumer",
-                                        detail=res["output"])
+                unverified = [c for c in pending if c in dep_subs and dep_subs[c] in merged_cache["unknown"]]
+                if unverified:
+                    checks["breaking"].fail(f"{canonical}: cannot verify that consumers migrated, their repo was not read: {', '.join(unverified)}",
+                                            code="consumers-unverifiable",
+                                            hint="give this runner read access to those repos (or drop --offline) and re-run")
+                missing = [c for c in pending if c not in unverified]
+                if missing:
+                    checks["breaking"].fail(f"{canonical}: breaking change, consumers not yet migrated: {', '.join(missing)}",
+                                            hint="the narrow story must depend on a merged migrate story for each consumer",
+                                            detail=res["output"])
             else:
                 checks["breaking"].fail(f"{canonical}: breaking change ({res['status']})",
                                         hint="split into expand -> migrate -> contract; only a 'Contract change: narrow' story may break, after every consumer migrated",
@@ -228,17 +248,18 @@ def run(ctx: Context) -> dict:
         text = head.text(status_path)
         closed = markers.closed_epics(head, ctx.cfg)
         mm = merged_map()
-        for w in merged_cache.get("w", []):
-            checks["sprint-status"].warn(w)
+        unknown = merged_cache["unknown"]
+        for u in result.get("unread_repos", []):
+            checks["sprint-status"].warn(u["message"], code=u["code"])
         if text is not None:
-            res = sprint_status.check(text, set(mm), closed)
+            res = sprint_status.check(text, set(mm), closed, unknown)
             for f in res["fail"]:
                 checks["sprint-status"].fail(f.pop("message"), **f)
             for f in res["warn"]:
                 checks["sprint-status"].warn(f.pop("message"), **f)
         newly_closed = closed - markers.closed_epics(mb_tree, ctx.cfg)
         for epic in sorted(newly_closed):
-            for p in markers.close_check(epic, ctx.stories, ctx.reg, mm, ctx.coord):
+            for p in markers.close_check(epic, ctx.stories, ctx.reg, mm, ctx.coord, unknown):
                 checks["sprint-status"].fail(f"epic {epic} close record added but close check fails: {p['message']}",
                                              hint="close epics through orch-status")
     else:
@@ -269,6 +290,8 @@ def render_text(result: dict) -> str:
     lines = [f"orch-gate: {result['verdict'].upper()} - {who} - {result['base']}..{result['head']}"]
     if result.get("head_resolved"):
         lines.append(f"  note: {result['head_resolved']}")
+    for n in result.get("notices", []):
+        lines.append(f"  note: {n['message']}")
     for c in result["checks"]:
         lines.append(f"  [{tags[c['status']]}] {c['id']}")
         for f in c["findings"]:

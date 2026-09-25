@@ -53,7 +53,35 @@ def remote_head(repo: Path, remote: str = "origin") -> str | None:
 
 
 def merge_base(repo: Path, a: str, b: str) -> str:
-    return out(repo, "merge-base", a, b)
+    proc = git(repo, "merge-base", a, b, check=False)
+    if proc.returncode == 0:
+        return proc.stdout.decode().strip()
+    if out(repo, "rev-parse", "--is-shallow-repository") == "true":
+        raise OrchError(f"shallow clone: no common history between {a} and {b} in {repo}. Fetch full history "
+                        "(actions/checkout fetch-depth: 0, GitLab GIT_DEPTH: 0, or git fetch --unshallow)")
+    raise OrchError(f"{a} and {b} have no common history in {repo}")
+
+
+def sha(repo: Path, ref: str) -> str:
+    return out(repo, "rev-parse", "--verify", f"{ref}^{{commit}}")
+
+
+def dirty_paths(repo: Path, ignore_prefix: str = "") -> list[str]:
+    """Uncommitted or untracked (not ignored) paths in the working tree."""
+    raw = out(repo, "status", "--porcelain", "-z", "--untracked-files=all")
+    paths, parts = [], raw.split("\0")
+    i = 0
+    while i < len(parts):
+        entry = parts[i]
+        i += 1
+        if len(entry) < 4:
+            continue
+        if entry[0] in "RC":
+            i += 1  # the next field is the rename source
+        path = entry[3:]
+        if not (ignore_prefix and path.startswith(ignore_prefix)):
+            paths.append(path)
+    return paths
 
 
 def is_ancestor(repo: Path, a: str, b: str) -> bool:
@@ -69,11 +97,11 @@ def resolve_head(repo: Path, base: str, head: str) -> tuple[str, str | None]:
     vacuously. Gate the PR's own tip (the second parent) instead, so a branch-tip checkout and a
     merge-ref checkout get the same verdict.
     """
-    sha = out(repo, "rev-parse", "--verify", f"{head}^{{commit}}")
-    parents = out(repo, "rev-list", "--parents", "-n", "1", sha).split()[1:]
+    commit = sha(repo, head)
+    parents = out(repo, "rev-list", "--parents", "-n", "1", commit).split()[1:]
     if len(parents) == 2 and is_ancestor(repo, parents[0], base) and not is_ancestor(repo, parents[1], base):
         return parents[1], f"{head} is a merge of {parents[1][:10]} into {base}; gating the PR tip {parents[1][:10]}"
-    return sha, None
+    return commit, None
 
 
 class Tree:
