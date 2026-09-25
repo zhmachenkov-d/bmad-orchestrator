@@ -1,7 +1,13 @@
-"""The pre-merge verdict. Pure git + registry + detectors; no network except pull-based reads of registry repos."""
+"""The pre-merge verdict. Pure git + registry + detectors; no network except pull-based reads of registry repos.
+
+Every finding carries a stable `code`. A finding that orch can fix by itself also carries
+`fix = {mechanical: true, command: [...], precondition: str|None}`; callers offer that command and never
+map messages to fixes themselves.
+"""
 
 from __future__ import annotations
 
+import difflib
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -9,10 +15,13 @@ from pathlib import Path
 from . import markers, sprint_status
 from .config import Config
 from .detectors import run as run_detector
+from .detectors import version as detector_version
 from .gitio import Tree, changed_files, dirty_paths, merge_base, resolve_head, sha
 from .globs import matches
 from .registry import CONTRACTS, Registry, pin_paths
 from .stories import KEY_RE, StorySet, id_to_key
+
+DETAIL_LINES = 60
 
 
 @dataclass
@@ -33,22 +42,26 @@ class Context:
     detector_which: object = None
 
 
+def fix(*command: str, precondition: str | None = None) -> dict:
+    return {"mechanical": True, "command": ["orch.py", *command], "precondition": precondition}
+
+
 class Check:
     def __init__(self, id_: str):
         self.id, self.status, self.findings = id_, "pass", []
 
-    def fail(self, message: str, **extra):
+    def fail(self, code: str, message: str, **extra):
         self.status = "fail"
-        self.findings.append({"level": "fail", "message": message, **extra})
+        self.findings.append({"level": "fail", "code": code, "message": message, **extra})
 
-    def warn(self, message: str, **extra):
+    def warn(self, code: str, message: str, **extra):
         if self.status == "pass":
             self.status = "warn"
-        self.findings.append({"level": "warn", "message": message, **extra})
+        self.findings.append({"level": "warn", "code": code, "message": message, **extra})
 
     def skip(self, reason: str):
         self.status = "skip"
-        self.findings.append({"level": "info", "message": reason})
+        self.findings.append({"level": "info", "code": "skipped", "message": reason})
 
     def to_dict(self) -> dict:
         return {"id": self.id, "status": self.status, "findings": self.findings}
@@ -56,6 +69,15 @@ class Check:
 
 def _norm(data: bytes) -> bytes:
     return b"\n".join(line.rstrip() for line in data.replace(b"\r\n", b"\n").split(b"\n")).rstrip() + b"\n"
+
+
+def _diff(canonical: bytes, copy: bytes, canonical_path: str, copy_path: str) -> str:
+    lines = list(difflib.unified_diff(_norm(canonical).decode("utf-8", "replace").splitlines(),
+                                      _norm(copy).decode("utf-8", "replace").splitlines(),
+                                      fromfile=canonical_path, tofile=copy_path, lineterm=""))
+    if len(lines) > DETAIL_LINES:
+        lines = lines[:DETAIL_LINES] + [f"... {len(lines) - DETAIL_LINES} more diff lines"]
+    return "\n".join(lines)
 
 
 def run(ctx: Context) -> dict:
@@ -71,7 +93,7 @@ def run(ctx: Context) -> dict:
               "repo": ctx.repo_id, "base": ctx.base, "base_sha": sha(ctx.repo, ctx.base), "head": ctx.head,
               "head_sha": head_sha, "merge_base": mb, "coord_ref": ctx.coord.ref,
               "coord_sha": sha(ctx.coord.repo, ctx.coord.ref), "offline": ctx.offline,
-              "changed": [c["path"] for c in changes], "notices": []}
+              "changed": [c["path"] for c in changes], "notices": [], "detectors_used": []}
     if head_note:
         result["head_resolved"] = head_note
     if not ctx.ci:
@@ -84,11 +106,11 @@ def run(ctx: Context) -> dict:
                                       "hint": "commit, then re-run the gate"})
 
     for p in archive_problems:
-        checks["scope"].fail(p)
+        checks["scope"].fail("archive-move-invalid", p)
 
     story = sub = marker = None
     if len(live) > 1:
-        checks["marker"].fail("a PR carries exactly one story; found markers: " + ", ".join(c["path"] for c in live),
+        checks["marker"].fail("multiple-markers", "a PR carries exactly one story; found markers: " + ", ".join(c["path"] for c in live),
                               hint="split the PR per story")
     elif live:
         path = live[0]["path"]
@@ -96,15 +118,17 @@ def run(ctx: Context) -> dict:
         result["story"] = key
         story = ctx.stories.get(key) if KEY_RE.match(key) else None
         if story is None:
-            checks["marker"].fail(f"{path}: story '{key}' is not in the epics on the coordination main", path=path)
+            checks["marker"].fail("unknown-story", f"{path}: story '{key}' is not in the epics on the coordination main", path=path)
         else:
             marker, problems = markers.parse(head.read(path) or b"", key)
             for p in problems:
-                checks["marker"].fail(f"{path}: {p}", path=path)
+                checks["marker"].fail("marker-invalid", f"{path}: {p}", path=path,
+                                      fix=fix("marker", "write", "--story", key, precondition="commit the story's changes first"))
             if marker and marker.get("epic") not in (None, story.epic):
-                checks["marker"].fail(f"{path}: epic {marker.get('epic')} but story {story.id} is in epic {story.epic}", path=path)
+                checks["marker"].fail("marker-epic-mismatch", f"{path}: epic {marker.get('epic')} but story {story.id} is in epic {story.epic}",
+                                      path=path, fix=fix("marker", "write", "--story", key))
             if not story.subproject or story.subproject not in ctx.reg:
-                checks["marker"].fail(f"story {story.id} has no valid subproject in the plan ({story.subproject!r})",
+                checks["marker"].fail("no-subproject", f"story {story.id} has no valid subproject in the plan ({story.subproject!r})",
                                       hint="fix the **Subproject:** line in the epics file")
                 story = None
             else:
@@ -112,7 +136,7 @@ def run(ctx: Context) -> dict:
                 result["subproject"] = sub.name
                 expected = "." if sub.repo == "." else markers.normalize_repo(sub.repo)
                 if expected != ctx.repo_id:
-                    checks["marker"].fail(f"story {story.id} belongs to subproject '{sub.name}' in repo '{sub.repo}', not this repo ({ctx.repo_id})")
+                    checks["marker"].fail("wrong-repo", f"story {story.id} belongs to subproject '{sub.name}' in repo '{sub.repo}', not this repo ({ctx.repo_id})")
                     story = None
     else:
         checks["marker"].skip("no story marker: non-story change (planning, infra, docs)")
@@ -124,8 +148,8 @@ def run(ctx: Context) -> dict:
         for c in changes:
             if c["path"] in archive_ok or matches(c["path"], allowed):
                 continue
-            checks["scope"].fail(f"{c['path']} is outside {sub.name}'s allowed_write", path=c["path"],
-                                 hint=f"move this change to a story of the owning subproject, or amend allowed_write via a registry PR")
+            checks["scope"].fail("out-of-scope", f"{c['path']} is outside {sub.name}'s allowed_write", path=c["path"],
+                                 hint="move this change to a story of the owning subproject, or amend allowed_write via a registry PR")
     elif not live:
         protected = {}
         for s in ctx.reg.values():
@@ -139,7 +163,7 @@ def run(ctx: Context) -> dict:
                 continue
             owner = next((n for pat, n in protected.items() if matches(c["path"], [pat])), None)
             if owner:
-                checks["scope"].fail(f"{c['path']} belongs to subproject '{owner}'; changes there need a story marker",
+                checks["scope"].fail("needs-story", f"{c['path']} belongs to subproject '{owner}'; changes there need a story marker",
                                      path=c["path"], hint="run orch-next for the story, or add .orch/stories/<story>.yaml via bmad-build")
 
     # --- pins ---
@@ -150,28 +174,30 @@ def run(ctx: Context) -> dict:
             touched[owned[1].canonical] = owned
     if story and sub and marker is not None:
         pins = marker.get("contract_pins", {})
+        rewrite = fix("marker", "write", "--story", story.key, precondition="commit the story's changes first")
         if sub.name == CONTRACTS:
             for canonical in sorted(touched):
                 if mb_tree.blob_sha(canonical) != base_tip.blob_sha(canonical):
-                    checks["pins"].fail(f"{canonical} changed on main since this branch started",
+                    checks["pins"].fail("contract-moved-on-main", f"{canonical} changed on main since this branch started",
                                         hint="rebase onto the latest contract and get the contract change re-approved")
                 want = head.blob_sha(canonical)
                 if pins.get(canonical) != want:
-                    checks["pins"].fail(f"pin for {canonical} is {pins.get(canonical)!r}, expected the PR's version {want}",
-                                        hint="regenerate the marker: orch.py marker write --story " + story.key)
+                    checks["pins"].fail("contract-pin-mismatch", f"pin for {canonical} is {pins.get(canonical)!r}, expected the PR's version {want}",
+                                        fix=rewrite)
         else:
             for canonical in pin_paths(ctx.reg, sub.name):
                 want = ctx.coord.blob_sha(canonical)
                 if want is None:
                     continue
                 if canonical not in pins:
-                    checks["pins"].fail(f"marker does not pin {canonical}", hint="regenerate the marker: orch.py marker write --story " + story.key)
+                    checks["pins"].fail("pin-missing", f"marker does not pin {canonical}", fix=rewrite)
                 elif pins[canonical] != want:
-                    checks["pins"].fail(f"{canonical} is pinned at {pins[canonical][:10]} but main has {want[:10]}",
-                                        hint="rebase onto the latest contract, re-check the implementation, regenerate the marker")
+                    checks["pins"].fail("pin-stale", f"{canonical} is pinned at {pins[canonical][:10]} but main has {want[:10]}",
+                                        fix=fix("marker", "write", "--story", story.key,
+                                                precondition=f"rebase onto {ctx.base} and re-check the implementation against the new contract"))
         prd_now = ctx.coord.blob_sha(ctx.cfg.prd)
         if marker.get("prd_pin") and prd_now and marker["prd_pin"] != prd_now:
-            checks["pins"].warn(f"PRD changed since the story was pinned ({marker['prd_pin'][:10]} -> {prd_now[:10]})",
+            checks["pins"].warn("prd-changed", f"PRD changed since the story was pinned ({marker['prd_pin'][:10]} -> {prd_now[:10]})",
                                 hint="re-read the PRD changes before merging")
     else:
         checks["pins"].skip("no story")
@@ -185,13 +211,14 @@ def run(ctx: Context) -> dict:
             canonical = ctx.coord.read(exp.canonical)
             copy = head.read(exp.copy)
             if canonical is None:
-                checks["conformance"].warn(f"canonical {exp.canonical} missing on coordination main")
+                checks["conformance"].warn("canonical-missing", f"canonical {exp.canonical} missing on coordination main")
             elif copy is None:
-                checks["conformance"].fail(f"contract copy {exp.copy} is missing", path=exp.copy,
+                checks["conformance"].fail("copy-missing", f"contract copy {exp.copy} is missing", path=exp.copy,
                                            hint=f"copy {exp.canonical} from the coordination repo")
             elif _norm(copy) != _norm(canonical):
-                checks["conformance"].fail(f"{exp.copy} differs from canonical {exp.canonical}", path=exp.copy,
-                                           hint="copy or regenerate from the canonical contract; contract edits go through a contract story")
+                checks["conformance"].fail("copy-drift", f"{exp.copy} differs from canonical {exp.canonical}", path=exp.copy,
+                                           hint="copy or regenerate from the canonical contract; contract edits go through a contract story",
+                                           detail=_diff(canonical, copy, exp.canonical, exp.copy))
     else:
         checks["conformance"].skip("no implementation story")
 
@@ -211,10 +238,13 @@ def run(ctx: Context) -> dict:
         det_kw = {k: v for k, v in (("runner", ctx.detector_runner), ("which", ctx.detector_which)) if v}
         for canonical, (owner, exp) in sorted(touched.items()):
             res = run_detector(exp.type, canonical, mb_tree, head, ctx.repo, mb, exp.extra, **det_kw)
+            if res["status"] != "missing" and not any(d["type"] == exp.type for d in result["detectors_used"]):
+                result["detectors_used"].append({"type": exp.type, **detector_version(exp.type, **det_kw),
+                                                 **({"inputs": res["inputs"]} if res.get("inputs") else {})})
             if res["status"] in ("ok", "added"):
                 continue
             if res["status"] == "missing":
-                checks["breaking"].fail(f"{canonical} ({exp.type}): {res['output']}")
+                checks["breaking"].fail("detector-missing", f"{canonical} ({exp.type}): {res['output']}")
                 continue
             consumers = ctx.reg.consumers(owner.name)
             if story and story.contract_change == "narrow":
@@ -222,20 +252,19 @@ def run(ctx: Context) -> dict:
                 dep_subs = {ctx.stories[id_to_key(d)].subproject: id_to_key(d) for d in story.depends_on if id_to_key(d) in ctx.stories}
                 pending = [c for c in consumers if c not in dep_subs or dep_subs[c] not in merged_now]
                 if not pending:
-                    checks["breaking"].warn(f"{canonical}: breaking change accepted — narrow story, all consumers migrated ({', '.join(consumers) or 'none'})")
+                    checks["breaking"].warn("narrow-accepted", f"{canonical}: breaking change accepted — narrow story, all consumers migrated ({', '.join(consumers) or 'none'})")
                     continue
                 unverified = [c for c in pending if c in dep_subs and dep_subs[c] in merged_cache["unknown"]]
                 if unverified:
-                    checks["breaking"].fail(f"{canonical}: cannot verify that consumers migrated, their repo was not read: {', '.join(unverified)}",
-                                            code="consumers-unverifiable",
+                    checks["breaking"].fail("consumers-unverifiable", f"{canonical}: cannot verify that consumers migrated, their repo was not read: {', '.join(unverified)}",
                                             hint="give this runner read access to those repos (or drop --offline) and re-run")
                 missing = [c for c in pending if c not in unverified]
                 if missing:
-                    checks["breaking"].fail(f"{canonical}: breaking change, consumers not yet migrated: {', '.join(missing)}",
+                    checks["breaking"].fail("consumers-not-migrated", f"{canonical}: breaking change, consumers not yet migrated: {', '.join(missing)}",
                                             hint="the narrow story must depend on a merged migrate story for each consumer",
                                             detail=res["output"])
             else:
-                checks["breaking"].fail(f"{canonical}: breaking change ({res['status']})",
+                checks["breaking"].fail("breaking-change", f"{canonical}: breaking change ({res['status']})",
                                         hint="split into expand -> migrate -> contract; only a 'Contract change: narrow' story may break, after every consumer migrated",
                                         detail=res["output"])
     else:
@@ -250,17 +279,19 @@ def run(ctx: Context) -> dict:
         mm = merged_map()
         unknown = merged_cache["unknown"]
         for u in result.get("unread_repos", []):
-            checks["sprint-status"].warn(u["message"], code=u["code"])
+            checks["sprint-status"].warn(u["code"], u["message"])
         if text is not None:
             res = sprint_status.check(text, set(mm), closed, unknown)
             for f in res["fail"]:
-                checks["sprint-status"].fail(f.pop("message"), **f)
+                checks["sprint-status"].fail(f.pop("code"), f.pop("message"), **f)
             for f in res["warn"]:
-                checks["sprint-status"].warn(f.pop("message"), **f)
+                if f["code"] in ("merged-not-done", "closed-not-done"):
+                    f["fix"] = fix("sprint-status", "derive", "--write")
+                checks["sprint-status"].warn(f.pop("code"), f.pop("message"), **f)
         newly_closed = closed - markers.closed_epics(mb_tree, ctx.cfg)
         for epic in sorted(newly_closed):
             for p in markers.close_check(epic, ctx.stories, ctx.reg, mm, ctx.coord, unknown):
-                checks["sprint-status"].fail(f"epic {epic} close record added but close check fails: {p['message']}",
+                checks["sprint-status"].fail("epic-close-failed", f"epic {epic} close record added but close check fails: {p['message']}",
                                              hint="close epics through orch-status")
     else:
         checks["sprint-status"].skip("sprint status not touched" if is_coord else "not the coordination repo")
@@ -269,8 +300,8 @@ def run(ctx: Context) -> dict:
     if ctx.ci:
         checks["merge-driver"].skip("CI run")
     elif sprint_status.attribute_present(ctx.repo) and not sprint_status.driver_registered(ctx.repo):
-        checks["merge-driver"].fail("this clone has no sprint-status merge driver registered",
-                                    hint="run: orch.py sprint-status install-driver")
+        checks["merge-driver"].fail("driver-missing", "this clone has no sprint-status merge driver registered",
+                                    fix=fix("sprint-status", "install-driver"))
     else:
         checks["merge-driver"].skip("driver registered or not used in this repo")
 
@@ -281,7 +312,15 @@ def run(ctx: Context) -> dict:
 
 
 def is_ci() -> bool:
-    return bool(os.environ.get("CI"))
+    return os.environ.get("CI", "").strip().lower() in ("1", "true", "yes")
+
+
+def _fix_line(f: dict) -> str | None:
+    if f.get("fix"):
+        cmd = " ".join(f["fix"]["command"])
+        pre = f["fix"].get("precondition")
+        return f"{pre}, then run: {cmd}" if pre else f"run: {cmd}"
+    return f.get("hint")
 
 
 def render_text(result: dict) -> str:
@@ -297,9 +336,31 @@ def render_text(result: dict) -> str:
         for f in c["findings"]:
             if f["level"] == "info":
                 continue
-            lines.append(f"      - {f['message']}")
-            if f.get("hint"):
-                lines.append(f"        fix: {f['hint']}")
+            lines.append(f"      - {f['message']} [{f['code']}]")
+            if fx := _fix_line(f):
+                lines.append(f"        fix: {fx}")
             if f.get("detail"):
                 lines += ["        | " + d for d in f["detail"].splitlines()[:20]]
     return "\n".join(lines)
+
+
+def render_markdown(result: dict) -> str:
+    """CI step summary / PR comment: a status table plus one entry per failing or warning finding."""
+    icon = {"pass": "✅", "fail": "❌", "warn": "⚠️", "skip": "➖"}
+    who = f"story `{result['story']}` ({result['subproject'] or '?'})" if result.get("story") else "non-story change"
+    lines = [f"### orch-gate: {icon[result['verdict']]} {result['verdict'].upper()} — {who}", "",
+             f"`{result['base']}` @ `{result['base_sha'][:10]}` ← `{result['head_sha'][:10]}`", ""]
+    if result.get("head_resolved"):
+        lines += [f"> {result['head_resolved']}", ""]
+    lines += ["| Check | Status |", "| --- | --- |"]
+    lines += [f"| {c['id']} | {icon[c['status']]} {c['status']} |" for c in result["checks"]]
+    for c in result["checks"]:
+        for f in c["findings"]:
+            if f["level"] == "info":
+                continue
+            lines += ["", f"**{c['id']}** `{f['code']}`: {f['message']}"]
+            if fx := _fix_line(f):
+                lines.append(f"- fix: {fx}")
+            if f.get("detail"):
+                lines += ["", "<details><summary>detail</summary>", "", "```", f["detail"], "```", "", "</details>"]
+    return "\n".join(lines) + "\n"
