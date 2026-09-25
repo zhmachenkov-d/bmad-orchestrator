@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Forge Report — orch</title>
+<style>
+  :root { --bg:#f6f1e7; --ink:#2a2118; --muted:#6b5d4d; --card:#fffaf0; --line:#dccfb8; --seal:#8f1d1d; --ok:#2f6b3a; --warn:#9a5b00; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#1c1814; --ink:#efe6d6; --muted:#b3a58f; --card:#26211b; --line:#3d352b; --seal:#c0392b; --ok:#6fbf7d; --warn:#e0a44a; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:16px/1.55 Georgia, "Iowan Old Style", serif; }
+  main { max-width: 920px; margin: 0 auto; padding: 40px 16px 64px; }
+  header { display:flex; gap:28px; align-items:center; flex-wrap:wrap; border-bottom:2px solid var(--line); padding-bottom:24px; }
+  header .t { flex:1 1 360px; }
+  h1 { font-size: 2rem; margin:0 0 6px; }
+  h2 { font-size: 1.25rem; margin: 36px 0 12px; border-bottom:1px solid var(--line); padding-bottom:6px; }
+  .sub { color:var(--muted); margin:0; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px 18px; }
+  ol, ul { padding-left: 1.3em; }
+  li { margin: 6px 0; }
+  code { font-family: ui-monospace, Menlo, monospace; font-size: .88em; background: rgba(127,127,127,.12); padding: 1px 5px; border-radius: 4px; }
+  .grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(250px,1fr)); gap:12px; }
+  .p { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px 14px; }
+  .p b { display:block; }
+  .p span { color:var(--muted); font-size:.9rem; }
+  .p i { display:block; margin-top:6px; font-size:.92rem; }
+  .tag { font:600 .72rem/1 system-ui, sans-serif; text-transform:uppercase; letter-spacing:.06em; padding:3px 7px; border-radius:99px; border:1px solid currentColor; margin-left:6px; }
+  .open li::marker { color: var(--warn); }
+  .rej li::marker { color: var(--seal); }
+  .lock li::marker { color: var(--ok); font-weight:bold; }
+  svg.seal { width: 190px; height: 190px; flex: 0 0 auto; }
+  footer { margin-top:40px; color:var(--muted); font-size:.85rem; }
+</style>
+</head>
+<body>
+<main>
+<header>
+  <svg class="seal" viewBox="0 0 200 200" role="img" aria-label="Wax seal: HARDENED">
+    <defs>
+      <radialGradient id="wax" cx="40%" cy="35%" r="70%">
+        <stop offset="0%" stop-color="#c0392b"/><stop offset="70%" stop-color="#8f1d1d"/><stop offset="100%" stop-color="#5e1010"/>
+      </radialGradient>
+      <path id="ring" d="M100,100 m-66,0 a66,66 0 1,1 132,0 a66,66 0 1,1 -132,0"/>
+    </defs>
+    <path fill="url(#wax)" d="M100 8 C122 10 130 22 148 26 C168 30 178 48 184 66 C192 86 186 102 190 120 C194 142 178 158 164 170 C148 184 128 186 108 192 C88 196 70 186 52 178 C32 170 22 152 14 134 C6 114 12 96 10 78 C8 56 24 40 40 28 C58 14 78 6 100 8 Z"/>
+    <circle cx="100" cy="100" r="74" fill="none" stroke="#f3d9b1" stroke-opacity=".55" stroke-width="2"/>
+    <circle cx="100" cy="100" r="54" fill="none" stroke="#f3d9b1" stroke-opacity=".45" stroke-width="1.5"/>
+    <text font-family="Georgia, serif" font-size="12" letter-spacing="3" fill="#f3d9b1"><textPath href="#ring">BMAD FORGE · ORCH · 2026-09-25 ·</textPath></text>
+    <text x="100" y="97" text-anchor="middle" font-family="Georgia, serif" font-weight="bold" font-size="19" fill="#fbe9cc">HARDENED</text>
+    <text x="100" y="118" text-anchor="middle" font-family="Georgia, serif" font-size="11" fill="#f3d9b1">16 locks · 3 kills</text>
+  </svg>
+  <div class="t">
+    <h1>orch — multi-project orchestration for BMad</h1>
+    <p class="sub">Forge session for Denys Zhmachenkov · goal: test the idea and make it better · outcome: <b>Hardened</b></p>
+    <p class="sub">Next step: <code>bmad-module-builder</code> → Ideate Module, using <code>forged-idea.md</code></p>
+  </div>
+</header>
+
+<h2>Outcome</h2>
+<div class="card">
+The original spec assumed a runtime that does not exist in BMad: a YAML workflow DSL, <code>bmad.module.json</code>, a validator CLI, and the <code>bmad-</code> prefix. What survives is a BMad-native module with four skills (<code>orch-setup</code>, <code>orch-next</code>, <code>orch-gate</code>, <code>orch-status</code>). Its guarantees come from deterministic git gating, not prompts. Work is contract-first. Stories are scoped to one subproject and scheduled by an explicit story DAG. Multi-user safety comes from git-ref claims, hash pinning, and sharded state, with no roles in the module. Polyrepo needs no merge train: breaking contract changes go through expand → migrate → contract, and merge status is read from a <code>.orch/stories/&lt;story&gt;.yaml</code> marker in each code repo. The niche is teams already living in BMad; that is also its main unverified assumption.
+</div>
+
+<h2>Locked decisions</h2>
+<ol class="lock">
+  <li><b>Git-level gate:</b> each story gets its own branch or worktree, and <code>orch-gate</code> checks the diff against <code>allowed_write</code>, contract conformance, and hash pins before merge. Client hooks are optional.</li>
+  <li><b>Read isolation saves context; it is not security.</b> The node context is imported contracts plus <code>allowed_read</code>.</li>
+  <li><b>Contract-first:</b> the contract change is the first story of an epic, in the pseudo-subproject <code>contracts</code>.</li>
+  <li><b>One abstraction: coordination repo + code repos.</b> A monorepo is the degenerate case.</li>
+  <li><b>Canonical contracts live in the coordination repo.</b> Services hold copies, and the gate checks conformance.</li>
+  <li><b>Epic = cross-cutting value; story = exactly one subproject.</b> Explicit <code>depends_on</code> forms a story DAG, which schedules the work.</li>
+  <li><b>A dependency is done when it is merged to main.</b> No stacked branches.</li>
+  <li><b>No roles.</b> Authorization goes to CODEOWNERS; consistency comes from claims (git refs), hash pinning, and sharded state.</li>
+  <li><b>Concurrent contract edits are optimistic:</b> rebase and re-approve.</li>
+  <li><b>Stock BMad skills are never forked;</b> integration is only via <code>_bmad/custom/*.toml</code>.</li>
+  <li><b><code>sprint-status.yaml</code> is derived from shards,</b> using a custom merge driver plus a gate backstop.</li>
+  <li><b>Official BMad Builder shape:</b> code <code>orch</code>, no agents, <code>uv</code> scripts per skill, <code>marketplace.json</code>, built via IM → BW → CM → VM.</li>
+  <li><b>Registry:</b> <code>orch/subprojects/&lt;name&gt;.yaml</code> in the coordination repo, with <code>allowed_read</code> kept.</li>
+  <li><b>No breaking contract change in one step:</b> expand → migrate → contract, with the gate detecting breaking changes. Dependent PRs are ordered by readiness; independent PRs merge in any order.</li>
+  <li><b>Merge status is derived and pull-based:</b> the coordination repo needs only read access to code repos, with no cross-repo write tokens.</li>
+  <li><b>Merge marker is a file:</b> <code>.orch/stories/&lt;story&gt;.yaml</code> with contract pins, which survives merge, squash and rebase.</li>
+</ol>
+
+<h2>Rejected, and why</h2>
+<ul class="rej">
+  <li><b>YAML workflow DSL, <code>bmad.module.json</code>, <code>agents/*.md</code>, validator CLI, <code>npx skills add</code>, <code>src/</code></b>: none of these exist in BMad or BMad Builder.</li>
+  <li><b>Prompt-only boundaries</b>: a wish, not a guarantee.</li>
+  <li><b>Executing in topological order of subprojects</b>: consumers drive contracts, and it serializes work needlessly.</li>
+  <li><b>Cross-cutting story + per-node slices</b>: the user wants stories scoped to one subproject.</li>
+  <li><b>Stacked branches</b> <span class="tag" style="color:var(--seal)">kill</span>: cascading rebases are merge hell again.</li>
+  <li><b>A role/permission system in the module</b>: prompt-level security; the git host already provides this.</li>
+  <li><b>Switching to AI-DLC</b>: it would force BMad teams to abandon their artifacts.</li>
+  <li><b><code>bmad-*</code> names, <code>$schema</code> on a bmad domain, <code>workspace.driver</code>, manifests inside services.</b></li>
+  <li><b>Merge train across repos</b> <span class="tag" style="color:var(--seal)">kill</span>: fragile, and a half-merged rollback is manual.</li>
+  <li><b>Push receipts from service CI</b>: needs write tokens on canonical contracts and loses events.</li>
+  <li><b><code>Orch-Story</code> commit trailer</b> <span class="tag" style="color:var(--seal)">kill</span>: squash and rebase merges rewrite it.</li>
+</ul>
+
+<h2>Weak points that survived</h2>
+<ul class="open">
+  <li><b>Unverified niche:</b> no pilot project has been named, and "first user already lives in BMad" is still an assumption.</li>
+  <li><b>Monorepo + polyrepo both in v1</b> (chosen against the recommendation): every mechanism needs a cross-repo variant.</li>
+  <li><b>Breaking-change detectors</b> per contract type: OpenAPI is covered; AsyncAPI, protobuf and DB schemas each need a tool.</li>
+  <li><b>Override creep</b> on <code>bmad-build</code> and <code>bmad-create-epics-and-stories</code>: the fork threshold is about 4.</li>
+  <li><b>Merge-driver registration</b> is per clone; the gate is the only backstop.</li>
+</ul>
+
+<h2>Who pressure-tested it</h2>
+<div class="grid">
+  <div class="p"><b>🏗️ Winston</b><span>System Architect · BMad</span><i>"A boundary held only by a prompt is a wish."</i></div>
+  <div class="p"><b>🛡️ Vex</b><span>Security Engineer · member</span><i>Forced the choice between security and context economy.</i></div>
+  <div class="p"><b>🧠 Dr. Quinn</b><span>Problem Solver · BMad CIS</span><i>"Consumers drive contracts"; "stop treating the shared file as truth."</i></div>
+  <div class="p"><b>😈 Grumbal</b><span>The Adversary · member</span><i>Concurrent contract phases, merge-driver per-clone gap, override creep.</i></div>
+  <div class="p"><b>📊 Mary</b><span>Business Analyst · BMad</span><i>Asked who the real first user is.</i></div>
+  <div class="p"><b>🦅 Victor</b><span>Innovation Strategist · BMad CIS</span><i>"You've spent six branches re-inventing AI-DLC."</i></div>
+  <div class="p"><b>📋 John</b><span>Product Manager · BMad</span><i>Who splits the feature into nodes?</i></div>
+  <div class="p"><b>💻 Amelia</b><span>Senior Engineer · BMad</span><i>Named the cost of waiting for merges.</i></div>
+  <div class="p"><b>Irina Gromova</b><span>Platform lead, fintech · generated</span><i>"Violations must not reach main; that's cheaper than preventing them."</i></div>
+  <div class="p"><b>Mark Eugen</b><span>FinOps analyst · generated</span><i>Framed read isolation as a token cost.</i></div>
+  <div class="p"><b>Jorge Salinas</b><span>Staff engineer, 40 services · generated</span><i>Contract-first parallelism; warned against stacked branches.</i></div>
+  <div class="p"><b>Olga Veres</b><span>Delivery manager · generated</span><i>Stale artifacts are the real pain, not git conflicts.</i></div>
+  <div class="p"><b>Thomas Brandt</b><span>Git tooling maintainer · generated</span><i>Proposed the custom merge driver.</i></div>
+  <div class="p"><b>Priya Natarajan</b><span>Platform architect, 120 repos · generated</span><i>"Without cross-repo coordination I don't need it." Found the incompatibility window between repos.</i></div>
+  <div class="p"><b>Damir Khasanov</b><span>Release engineer, merge train on 30 repos · generated</span><i>Killed the merge train and the commit trailer.</i></div>
+  <div class="p"><b>Lena Koval</b><span>API SDK maintainer · generated</span><i>Contract-first means the contract lives outside the implementation.</i></div>
+  <div class="p"><b>Kira Lyakhova</b><span>Tech lead choosing AI-DLC vs BMad · generated</span><i>Defined the niche: teams already in BMad.</i></div>
+  <div class="p"><b>Sebastian Krug</b><span>Scrum master · generated</span><i>"Epic done" is the only metric the business can see.</i></div>
+</div>
+
+<footer>Sources checked during the session: installed BMad skills (<code>bmad-build</code>, <code>bmad-create-epics-and-stories</code>, <code>bmad-module-builder</code>), BMad Builder docs (<code>llms-full.txt</code>), awslabs/aidlc-workflows docs. Memlog: <code>.memlog.md</code> · Handoff: <code>forged-idea.md</code></footer>
+</main>
+</body>
+</html>
