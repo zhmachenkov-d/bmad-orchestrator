@@ -59,6 +59,24 @@ def test_a_ready_story_with_plan_issues_is_held_back(mono):
     assert res["held"][0]["plan_issues"][0]["code"] == "unknown-subproject"
 
 
+def test_nothing_ready_lists_what_the_work_waits_for(mono):
+    _, res = cli(mono, "next", "--no-host", "--user", ANN)
+    assert "waiting" not in res                                  # 1.1 is ready
+    cli(mono, "claim", "create", "--story", "1-1", "--user", BOB)
+    _, res = cli(mono, "next", "--no-host", "--user", ANN)
+    assert not res["ready"]
+    assert [(w["key"], w["state"]) for w in res["waiting"]][:2] == [("1-1", "in-progress"), ("1-2", "blocked")]
+    assert res["waiting"][0]["claimant"] == BOB and res["waiting"][1]["blocked_by"] == ["1-1"]
+    _, res = cli(mono, "next", "--no-host", "--user", BOB)
+    assert [m["key"] for m in res["mine"]] == ["1-1"] and "1-1" not in [w["key"] for w in res["waiting"]]
+
+
+def test_claims_refuse_offline(mono):
+    code, res = cli(mono, "claim", "create", "--story", "1-1", "--user", ANN, "--offline")
+    assert code == 2 and res["code"] == "offline-claim"
+    assert cli(mono, "claim", "list", "--offline")[1]["claims"] == []
+
+
 def test_stale_claims_come_first_among_warnings(mono):
     cli(mono, "claim", "create", "--story", "1-1", "--user", ANN, env={"GIT_COMMITTER_DATE": "2020-01-01T00:00:00Z"})
     _, res = cli(mono, "next", "--no-host", "--user", BOB)
@@ -107,7 +125,7 @@ def test_context_in_a_worktree_reads_the_story_from_the_branch(mono, tmp_path):
     assert ctx["pins"]["contract_pins"] == {OAS: mono.blob(OAS)}
     assert [(c["role"], c["copy"]) for c in ctx["contracts"]] == [("export", "services/payment/openapi.yaml")]
     code, res = run_cli("context", "--repo", str(mono.path))
-    assert code == 2 and "--story" in res["error"]
+    assert code == 2 and res["code"] == "not-story-branch" and "--story" in res["error"]
 
 
 def test_take_over_continues_from_the_pushed_story_branch(mono, tmp_path):
@@ -146,7 +164,7 @@ def test_polyrepo_worktree_goes_to_the_code_repo_with_contract_snapshots(tmp_pat
     run_cli("claim", "create", "--story", "1-2", "--user", ANN, "--repo", str(coord.path))
 
     code, res = run_cli("worktree", "--story", "1-2", "--user", ANN, "--repo", str(coord.path))
-    assert code == 2 and url in res["error"] and "--repo" in res["error"]
+    assert code == 2 and res["code"] == "not-a-clone" and res["repo"] == url and "--repo" in res["error"]
 
     code, res = run_cli("worktree", "--story", "1-2", "--user", ANN, "--repo", url, "--coord", str(coord.path),
                         "--path", str(tmp_path / "wt"))

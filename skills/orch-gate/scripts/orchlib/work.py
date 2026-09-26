@@ -82,8 +82,16 @@ def pick(snapshot: dict, stories: StorySet, reg: Registry, user: str) -> dict:
     severity = {"warn": 0, "info": 1}
     warnings = sorted(snapshot["anomalies"], key=lambda a: severity.get(a.get("severity"), 2))
     counts = {st: sum(r["state"] == st for r in rows) for st in ("done", "review", "in-progress", "ready", "blocked", "unknown")}
-    return {"user": user, "warnings": warnings, "mine": mine, "ready": ready, "held": held, "counts": counts,
-            "unread_repos": snapshot["unread_repos"], "notices": snapshot["notices"]}
+    res = {"user": user, "warnings": warnings, "mine": mine, "ready": ready, "held": held, "counts": counts,
+           "unread_repos": snapshot["unread_repos"], "notices": snapshot["notices"]}
+    if not ready:
+        # nothing to offer: say what the work waits for, the open stories first since they unblock the rest
+        res["waiting"] = [{"key": r["key"], "id": r["id"], "title": r["title"], "state": r["state"],
+                           "blocked_by": r["blocked_by"], "claimant": r["claimant"], "idle_hours": r["idle_hours"],
+                           "review": (r["review"] or {}).get("url")}
+                          for state in ("review", "in-progress", "blocked") for r in rows
+                          if r["state"] == state and not same_user(r["claimant"], user)]
+    return res
 
 
 def _repo_of(reg: Registry, s: Story) -> str | None:
@@ -96,9 +104,9 @@ def _repo_of(reg: Registry, s: Story) -> str | None:
 def story_subproject(reg: Registry, stories: StorySet, key: str) -> tuple[Story, Subproject]:
     s = stories.get(key)
     if s is None:
-        raise OrchError(f"story {key} not found in the epics")
+        raise OrchError(f"story {key} not found in the epics", "story-not-found")
     if not s.subproject or s.subproject not in reg:
-        raise OrchError(f"story {s.id} has no registered subproject ({s.subproject or 'none'}); fix the plan first")
+        raise OrchError(f"story {s.id} has no registered subproject ({s.subproject or 'none'}); fix the plan first", "story-unregistered")
     return s, reg[s.subproject]
 
 
@@ -141,7 +149,7 @@ def prepare(repo: Path, key: str, main_branch: str, path: Path) -> dict:
     if existing is not None:
         return {"status": "exists", "path": str(existing), "branch": branch}
     if path.exists() and any(path.iterdir()):
-        raise OrchError(f"{path} exists and is not empty; pass --path <empty dir> for the worktree")
+        raise OrchError(f"{path} exists and is not empty; pass --path <empty dir> for the worktree", "path-not-empty", path=str(path))
     path.parent.mkdir(parents=True, exist_ok=True)
     remote_branch = f"origin/{branch}"
     if ref_exists(repo, f"refs/heads/{branch}"):

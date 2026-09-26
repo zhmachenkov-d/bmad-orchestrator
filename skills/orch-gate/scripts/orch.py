@@ -83,7 +83,7 @@ def _configured_coord(repo: Path) -> str | None:
     if path.is_dir():
         return str(path)
     raise OrchError(f"this repo's orch_coordination_repo is {value!r}, which is not a local checkout; "
-                    "clone it and pass --coord <path> or set ORCH_COORD")
+                    "clone it and pass --coord <path> or set ORCH_COORD", "coord-not-local", repo=value)
 
 
 def emit(payload: dict, code: int = 0, out: str | None = None) -> int:
@@ -97,7 +97,7 @@ def emit(payload: dict, code: int = 0, out: str | None = None) -> int:
 def need_key(value: str) -> str:
     key = key_from_any(value)
     if not key:
-        raise OrchError(f"'{value}' is not a story id (N.M, N-M or a sprint key)")
+        raise OrchError(f"'{value}' is not a story id (N.M, N-M or a sprint key)", "bad-story-id")
     return key
 
 
@@ -141,7 +141,7 @@ def cmd_marker(args, env: Env):
     key = need_key(args.story)
     story = st.get(key)
     if story is None:
-        raise OrchError(f"story {key} not found in the epics on {env.coord_ref}")
+        raise OrchError(f"story {key} not found in the epics on {env.coord_ref}", "story-not-found")
     changed = []
     if story.subproject == registry.CONTRACTS:
         base = args.base or gitio.default_base(env.repo, env.cfg.main_branch)
@@ -155,7 +155,12 @@ def cmd_claim(args, env: Env):
     remote = None if args.local else (args.remote or ("origin" if gitio.remote_url(env.coord_root, "origin") else None))
     repo = env.coord_root
     if args.action == "list":
-        return emit({"ok": True, "remote": remote, "claims": claims.list_claims(repo, remote)})
+        return emit({"ok": True, "remote": remote,
+                     "claims": claims.list_claims(repo, remote, fetch=not args.offline)})
+    if args.offline:
+        # a claim only counts once pushed; --local is the explicit no-remote mode
+        raise OrchError(f"claim {args.action} needs the remote; drop --offline (or use --local for a repo without one)",
+                        "offline-claim")
     key = need_key(args.story or "")
     user = args.user or _git_user(repo)
     if args.action == "create":
@@ -175,7 +180,7 @@ def _git_user(repo: Path) -> str:
     name = gitio.git(repo, "config", "user.name", check=False).stdout.decode().strip()
     email = gitio.git(repo, "config", "user.email", check=False).stdout.decode().strip()
     if not name:
-        raise OrchError("no git user.name configured; pass --user 'Name <email>'")
+        raise OrchError("no git user.name configured; pass --user 'Name <email>'", "no-git-user")
     return f"{name} <{email}>" if email else name
 
 
@@ -277,7 +282,7 @@ def cmd_worktree(args, env: Env):
     clone = work.local_clone(sub, env.repo, env.coord_root)
     if clone is None:
         raise OrchError(f"story {s.id} ({sub.name}) lives in {sub.repo}; run from a local clone of it "
-                        "or pass --repo <local clone> with --coord <coordination repo>")
+                        "or pass --repo <local clone> with --coord <coordination repo>", "not-a-clone", repo=sub.repo)
     user = args.user or _git_user(env.coord_root)
     claim = next((c for c in claims.list_claims(env.coord_root, _claims_remote(env), fetch=not args.offline)
                   if c["story"] == key), None)
@@ -303,7 +308,7 @@ def cmd_context(args, env: Env):
         branch = gitio.out(env.repo, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
         key = key_from_any(branch.removeprefix(status_mod.STORY_BRANCH)) if branch.startswith(status_mod.STORY_BRANCH) else None
         if not key:
-            raise OrchError(f"not on a story/<N-M> branch ({branch or 'detached HEAD'}); pass --story")
+            raise OrchError(f"not on a story/<N-M> branch ({branch or 'detached HEAD'}); pass --story", "not-story-branch")
     ctx = work.context(reg, st, key, env.coord, env.cfg, gitio.sha(env.coord_root, env.coord_ref))
     written = None
     if args.write:
@@ -498,7 +503,8 @@ def main(argv=None) -> int:
             return cmd_sprint_status(args, None)
         return COMMANDS[args.cmd](args, Env(args))
     except OrchError as exc:
-        return emit({"ok": False, "error": str(exc)}, 2)
+        coded = {"code": exc.code, **exc.fields} if exc.code else {}
+        return emit({"ok": False, "error": str(exc), **coded}, 2)
     except Exception as exc:  # never let a crash look like a failing verdict (exit 1)
         if args.verbose:
             traceback.print_exc()
