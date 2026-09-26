@@ -238,9 +238,11 @@ def _facts(name: str) -> list[str]:
     return _template(name)["workflow"]["persistent_facts"]
 
 
-@pytest.mark.parametrize("name", PLANNING)
-def test_planning_template_sets_only_persistent_facts(name):
-    assert set(_template(name)["workflow"]) == {"persistent_facts"}
+@pytest.mark.parametrize("name, keys", [(EPICS_SKILL, {"persistent_facts"}),
+                                         (SPRINT_SKILL, {"activation_steps_append", "persistent_facts"})])
+def test_planning_template_keys(name, keys):
+    # never on_complete: a string replaces a team one, and sprint-planning runs it for every intent
+    assert set(_template(name)["workflow"]) == keys
 
 
 @pytest.mark.parametrize("name", PLANNING)
@@ -293,6 +295,18 @@ def test_sprint_template_covers_the_readiness_rule():
         assert phrase in fact, phrase
 
 
+def test_sprint_template_runs_plan_check_as_an_activation_step():
+    (step,) = _template(SPRINT_SKILL)["workflow"]["activation_steps_append"]
+    for phrase in ("only when the detected intent is **readiness** or **sprint-planning**",
+                   "for the status, validate and fix intents skip this step and run no orch command",
+                   "plan-check --working-tree", "Do not state a gate verdict without this result",
+                   "orch readiness rule"):
+        assert phrase in step, phrase
+    # the fact names the step and keeps a fallback when it did not run
+    (fact,) = _facts(SPRINT_SKILL)
+    assert 'activation step "orch plan check"' in fact and "if it did not run" in fact
+
+
 @pytest.mark.parametrize("name", PLANNING)
 def test_planning_template_resolves_with_the_bmad_resolver(name, tmp_path):
     resolver = _find_up("_bmad/scripts/resolve_customization.py")
@@ -319,6 +333,8 @@ def test_planning_template_resolves_with_the_bmad_resolver(name, tmp_path):
         assert "orch story rules" in text and "orch plan check" in text
     else:
         assert "orch readiness rule" in text and f"{{project-root}}/{DEFAULT_REGISTRY_DIR}" in text
+        (step,) = wf["activation_steps_append"]
+        assert f"uv run {DEFAULT_CLI} plan-check --working-tree" in step
 
 
 def test_registry_dir_placeholder_matches_the_normalized_config(mono):
@@ -351,3 +367,6 @@ def test_stock_anchors_named_by_the_planning_facts_still_exist():
     skill = (sprint / "SKILL.md").read_text(encoding="utf-8")
     for intent in ("readiness", "sprint-planning", "status", "validate", "fix"):
         assert f"**{intent}**" in skill, intent
+    # the plan-check step relies on append steps running after intent detection, with confirmation
+    assert skill.index("detect intent") < skill.index("{workflow.activation_steps_append}")
+    assert "confirm every entry was executed" in skill

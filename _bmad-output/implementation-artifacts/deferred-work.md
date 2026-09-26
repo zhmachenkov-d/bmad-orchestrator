@@ -17,3 +17,7 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-orch-planning-overrides.md`
   summary: Test `plan-check --working-tree` with a separate coordination repo (`--coord` / `ORCH_COORD` pointing away from `--repo`) to prove the snapshot is taken of the coordination repo, not the acting repo.
   evidence: Every working-tree test uses a single repo where `coord_root == repo`, so snapshotting `Env.repo` instead would pass; the shipped planning templates never pass `--coord`, so only direct CLI use is exposed.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-orch-planning-overrides.md`
+  summary: Make plan validation deterministic in orch-gate — a coordination PR that changes epics or the registry fails when it introduces new `plan-check` FAIL findings compared with its base, so a broken plan never reaches main and the planning-template prompts become a convenience, not the guarantee.
+  evidence: Walkthrough of PR #14: the sprint-planning override enforces the plan-check verdict only through an activation step and a persistent fact (LLM-executed); today the gate fails plan defects only in a PR's own story and warns on other stories, so a defect in a later story is found only when that story's PR runs.
