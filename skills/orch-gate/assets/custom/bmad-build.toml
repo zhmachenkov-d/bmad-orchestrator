@@ -1,0 +1,56 @@
+# orch override for stock bmad-build — TEMPLATE shipped with orch-gate.
+#
+# What it does: when bmad-build runs on an orch story branch (`story/<N-M>`),
+# it refreshes and loads the story's node context at activation, holds the
+# builder to that context, and closes the story the orch way after the stock
+# commit: write and commit the story marker, then run the orch gate. On any
+# other branch it does nothing and bmad-build behaves stock.
+#
+# Installation (done by orch-setup, not by hand):
+# - Substitute every `@ORCH_CLI@` with a `{project-root}`-relative path to
+#   orch.py, by default `{project-root}/.claude/skills/orch-gate/scripts/orch.py`.
+#   Never an absolute path (this file is committed team config shared by every
+#   clone and worktree) and never `{skill-root}` (the renderer binds that to
+#   the bmad-build render snapshot, not to orch-gate).
+# - Install the result as `_bmad/custom/bmad-build.toml`. If that file already
+#   exists, merge into it: the lists append, but `on_complete` is a single
+#   string, so combine an existing `on_complete` with the orch one instead of
+#   replacing it.
+# - Commit it and get it onto the base branch before cutting story branches:
+#   a worktree only sees the override once its branch contains the file.
+#   Without it, bmad-build runs stock and the orch-next handoff still points
+#   the builder at the node context.
+# - A personal `_bmad/custom/bmad-build.user.toml` that sets `on_complete`
+#   replaces the orch one (strings replace), and the marker and gate steps are
+#   lost. Personal completion steps must include the orch steps below.
+#
+# Uses only stock bmad-build customization keys, with their stock types.
+
+[workflow]
+
+activation_steps_prepend = [
+"""
+orch node context (applies only to an orch run). Run `git symbolic-ref --short HEAD` in `{project-root}`. If it fails or the branch does not start with `story/`, this is not an orch run: skip this step and do not run any orch command or read anything under `.orch/`. Otherwise the branch key is the branch name after `story/`, and:
+1. From `{project-root}`, run `uv run @ORCH_CLI@ context --write`. It refreshes `.orch/context/node-context.md` and `.orch/context/node-context.json` for the story of this branch.
+2. If it exits non-zero, show the user its JSON `code` and `error`. If the output has no JSON `code` (e.g. uv missing or a wrong CLI path), show the raw output, tell the user the orch CLI could not run and to check that `uv` is installed and that `@ORCH_CLI@` exists (set in `_bmad/custom/bmad-build.toml`), and HALT; do not ask for `--coord`. If the code is `not-story-branch` or `story-not-found`, tell the user the branch does not name a story in the epics and HALT. For any other failure, use the existing `{project-root}/.orch/context/node-context.md` only if `story.key` in `{project-root}/.orch/context/node-context.json` matches the branch key, and say it may be stale; otherwise treat the context as missing, HALT and ask the user how to reach the coordination repo (for example a local path to pass as `--coord <path>`), then re-run step 1 with it. Never invent node context.
+3. Read `{project-root}/.orch/context/node-context.md` fully. It is the story, its boundaries, its pinned contracts and how it finishes.
+""",
+]
+
+persistent_facts = [
+"""
+orch run rule — applies only when the current branch starts with `story/` (checked at activation); on any other branch ignore this fact. On an orch run, `.orch/context/node-context.md` governs the build: write only within its `allowed_write` paths (plus the story marker), build against the contract versions it pins and never change a canonical contract unless the context says this is a contract story, and close the story only through the orch completion steps in On Complete, which supersede the context's own `## Finish` section — never push or open a PR before the orch gate passes.
+""",
+]
+
+on_complete = """
+orch completion (applies only to an orch run). Run `git symbolic-ref --short HEAD` in `{project-root}`. If it fails or the branch does not start with `story/`, do nothing here and exit normally. Otherwise the branch key is the branch name after `story/`, and these steps replace the push/PR offer above and the context's `## Finish` section: do not push or open a PR until the gate passes. Run every command from `{project-root}`. If any command below exits in a way not listed for it, report its output and stop.
+1. The story work must already be committed, because the marker pins HEAD. If `git status --porcelain` lists changes, tell the user and offer to commit them; keep any commit within the context's `allowed_write`. If the tree is still dirty, stop without writing the marker.
+2. Read `.orch/context/node-context.json`. If it is missing, or its `story.key` does not match the branch key, report it and stop. Otherwise take the story key from `story.key` and the PR base from `base_branch`.
+3. Run `uv run @ORCH_CLI@ marker write --story <key>`. If it exits non-zero, report its `code` and `error` (or its raw output) and stop. Never write or edit a marker by hand.
+4. Commit only the marker: run `git add -- .orch/stories/<key>.yaml`, then `git diff --quiet HEAD -- .orch/stories/<key>.yaml`. If that exits 0, the marker is unchanged from HEAD: skip the commit and continue. Otherwise run `git commit -m "chore(orch): add marker for story <key>" -- .orch/stories/<key>.yaml`; if the commit fails, report it and stop before the gate.
+5. Run `uv run @ORCH_CLI@ gate --format text` and show the verdict.
+   - Exit 0 (pass): offer, never do automatically, to push the branch and open a PR into `base_branch`.
+   - Exit 1 (fail): show the failing checks with their fix hints. Do not push. A code fix needs a new commit and then steps 3 and 4 again, because the marker pins HEAD. Stop here; do not loop on fixes.
+   - Any other exit (error, e.g. exit 2): show the JSON `code`, `error` and any fix, or the raw output. Claim no verdict, do not push, and stop.
+"""
