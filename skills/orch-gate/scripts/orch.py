@@ -157,7 +157,7 @@ def cmd_claim(args, env: Env):
     if args.action == "list":
         return emit({"ok": True, "remote": remote,
                      "claims": claims.list_claims(repo, remote, fetch=not args.offline)})
-    if args.offline:
+    if args.offline and not args.local:
         # a claim only counts once pushed; --local is the explicit no-remote mode
         raise OrchError(f"claim {args.action} needs the remote; drop --offline (or use --local for a repo without one)",
                         "offline-claim")

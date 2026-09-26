@@ -20,7 +20,7 @@ Run `orch.py next`. When the user already named a story, use the result only to 
 Show, in this order and briefly:
 
 1. **Warnings**: the `warn` entries of `warnings` in one line each, then how many `info` entries there are. `unread_repos` and `notices` go here as caveats: stories in unread repos show as `unknown`, never as ready.
-2. **Yours**: the `mine` stories (claimed by the user, in progress or in review). Offer to resume or release each one.
+2. **Yours**: the `mine` stories (claimed by the user: in progress, in review, or `unknown` when their repo was not read). Offer to resume or release each one.
 3. **Ready**: "N stories ready. Here is what each one unblocks." One line per `ready` entry in `rank` order: id, title, subproject, an arrow when `critical`, and `unblocks` with the `downstream` count. Recommend the top one.
 
 `held` stories are ready but the plan does not define them cleanly. Show them with their `plan_issues` and point to `orch-status` plan validation, but do not offer them: the gate would fail their marker. When nothing is ready, summarise `waiting` (open stories and their holders first, then what the blocked ones wait for) and offer `orch-status`. A top-level `no-epics` plan issue means planning has not run yet.

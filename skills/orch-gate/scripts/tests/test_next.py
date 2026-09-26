@@ -187,3 +187,52 @@ def test_same_user_compares_emails():
     assert work.same_user("Ann <A@x>", "Ann Smith <a@X>")
     assert not work.same_user("Ann <a@x>", "Ann <b@x>")
     assert work.same_user("ann", "ann") and not work.same_user(None, "ann")
+
+
+def test_claims_with_local_work_offline(mono):
+    code, res = cli(mono, "claim", "create", "--story", "1-1", "--user", ANN, "--offline", "--local")
+    assert code == 0, res
+    assert [c["story"] for c in cli(mono, "claim", "list", "--offline", "--local")[1]["claims"]] == ["1-1"]
+
+
+def test_absolute_worktrees_dir_is_kept(tmp_path):
+    from orchlib.config import _rel
+    assert _rel("/home/me/wt", "shop", absolute=True) == "/home/me/wt"
+    assert _rel("~/wt/{project_name}/", "shop", absolute=True) == "~/wt/shop"
+    assert _rel("{project-root}/wt", "shop", absolute=True) == "wt"
+    assert _rel("/home/me/wt", "shop") == "home/me/wt"
+    assert work.default_path(tmp_path, str(tmp_path / "wt"), "1-1") == (tmp_path / "wt").resolve() / "story-1-1"
+
+
+def test_worktree_made_by_hand_still_excludes_the_context(mono, tmp_path):
+    cli(mono, "claim", "create", "--story", "1-1", "--user", ANN)
+    mono.git("worktree", "add", "-q", "-b", "story/1-1", str(tmp_path / "hand"), "main")
+    code, res = cli(mono, "worktree", "--story", "1-1", "--user", ANN)
+    assert code == 0 and res["worktree"]["status"] == "exists", res
+    assert mono.git("-C", str(tmp_path / "hand"), "status", "--porcelain") == ""
+
+
+def test_own_claim_in_an_unread_repo_stays_in_mine(tmp_path):
+    coord, code_repo = Repo(tmp_path / "coord"), Repo(tmp_path / "payment")
+    coord.write(f"{R}/payment-service.yaml", registry_yaml("payment-service", "src", repo=str(code_repo.path)))
+    coord.write("_bmad-output/planning-artifacts/epics.md", "## Epic 1: P\n### Story 1.2: Impl\n**Subproject:** payment-service\n")
+    coord.commit()
+    code_repo.write("src/app.py", "x\n").commit()
+    run_cli("claim", "create", "--story", "1-2", "--user", ANN, "--repo", str(coord.path))
+    code, res = run_cli("next", "--no-host", "--offline", "--user", ANN, "--repo", str(coord.path))
+    assert code == 0, res
+    assert [(m["key"], m["state"]) for m in res["mine"]] == [("1-2", "unknown")] and res["mine"][0]["claim_sha"]
+
+
+def test_missing_canonical_gets_no_snapshot(tmp_path):
+    root = tmp_path / "wt"
+    root.mkdir()
+    ctx = {"story": {"id": "1.2", "key": "1-2", "subproject": "payment-service", "depends_on": [],
+                     "contract_change": "none", "source": "e.md:1", "text": "x\n"},
+           "subproject": {"name": "payment-service", "repo": ".", "path": "src", "allowed_read": [], "allowed_write": []},
+           "branch": "story/1-2", "base_branch": "main", "marker": "m.yaml", "coord_ref": "main", "coord_sha": "0" * 40,
+           "plan_issues": [], "contracts": [{"path": OAS, "type": "openapi", "owner": "payment-service",
+                                             "role": "import", "copy": None, "sha": None, "consumers": []}]}
+    coord = SimpleNamespace(files=lambda path: {}, kind=lambda path: None)
+    res = work.write(root, ctx, coord, snapshot=True)
+    assert res["snapshots"] == {} and "snapshot `" not in (root / work.CONTEXT_MD).read_text()
