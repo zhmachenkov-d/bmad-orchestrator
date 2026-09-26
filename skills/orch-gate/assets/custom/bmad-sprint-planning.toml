@@ -1,0 +1,39 @@
+# orch override for stock bmad-sprint-planning — TEMPLATE shipped with orch-gate.
+#
+# What it does: folds `orch.py plan-check --working-tree` into the readiness
+# gate, so a plan the orch gate would reject story by story (missing or unknown
+# subprojects, forward dependencies, a `narrow` without its migrations, ...)
+# does not pass readiness, and tells the gate that orch-shaped plans
+# (dependency chains, contract and migration stories) are expected, not
+# defects. It applies to the readiness and sprint-planning intents only.
+#
+# Installation (done by orch-setup, not by hand), in the coordination repo:
+# - Substitute every `@ORCH_CLI@` with a `{project-root}`-relative path to
+#   orch.py, by default `{project-root}/.claude/skills/orch-gate/scripts/orch.py`.
+#   Never an absolute path (this file is committed team config shared by every
+#   clone) and never `{skill-root}` (it names the planning skill, not orch-gate).
+# - Substitute every `@ORCH_REGISTRY_DIR@` with the normalized `registry_dir`
+#   that `uv run <orch.py> config` prints: repo-relative, with no
+#   `{project-root}` prefix and with `{project_name}` expanded (e.g.
+#   `_bmad-output/orch/subprojects`).
+# - Install the result as `_bmad/custom/bmad-sprint-planning.toml` in the
+#   coordination repo (the repo holding the registry and the epics). If that
+#   file already exists, merge into it: `persistent_facts` is a list and
+#   appends, so add this entry to the existing ones.
+#
+# Uses only stock bmad-sprint-planning customization keys, with their stock
+# types, and only `persistent_facts`: there is deliberately no `on_complete`,
+# because stock runs it whatever the intent (status, validate and fix too) and
+# a string would replace an existing team one.
+
+[workflow]
+
+persistent_facts = [
+"""
+orch readiness rule — applies only to the **readiness** and **sprint-planning** intents; for the status, validate and fix intents ignore this fact and run no orch command. This project plans with orch. While running the readiness gate, and before stating the gate verdict, run `uv run @ORCH_CLI@ plan-check --working-tree` from `{project-root}` (it reads the epics and registry as saved, committed or not) and fold its result into the verdict:
+1. Verdict mapping: plan-check FAIL → FAIL, CONCERNS → at least CONCERNS, PASS → no change to the stock verdict. List every plan-check finding with its `code`, story and message, and name `bmad-create-epics-and-stories` (story labels, dependencies, contract order) or `bmad-correct-course` (cross-cutting changes) as the fix. Headless runs put these findings in `findings`.
+2. If the registry dir `{project-root}/@ORCH_REGISTRY_DIR@` holds no `*.yaml` or `*.yml` file, orch has no registry: the verdict is FAIL; point to `orch-setup`. A `no-epics` finding is FAIL too: orch reads the epics only from `epic*.md` files under `planning_artifacts`, so explain that rule and ask for the epics to be saved under such a name (a gitignored `planning_artifacts` dir or registry dir is invisible to the check as well, even though its files are on disk).
+3. Under orch, backward `Depends on` chains between stories, and contract or migration stories (`**Subproject:** contracts`, expand → migrate → narrow) without direct user value, are expected. Do not report them as "not independently completable", as forward dependencies or as orphan stories: plan-check owns the dependency and contract-order checks.
+4. Exit 2, or output without a JSON `verdict` (for example uv missing or a wrong CLI path), is an error, never a verdict: show the JSON `code` and `error`, or the raw output, report the orch check as not run (so readiness is at least CONCERNS), tell the user to check that `uv` is installed and that `@ORCH_CLI@` exists (set in `_bmad/custom/bmad-sprint-planning.toml`), and never re-implement the checks yourself.
+""",
+]

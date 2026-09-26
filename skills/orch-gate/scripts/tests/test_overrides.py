@@ -1,4 +1,7 @@
-"""The bmad-build override template: stock keys only, real orch.py calls, and it renders with BMad."""
+"""The orch override templates: stock keys only, real orch.py calls, and they load with BMad.
+
+Generic checks run over every template in `assets/custom/`; per-template tests pin what each one must say.
+"""
 
 import json
 import re
@@ -12,13 +15,19 @@ from pathlib import Path
 import pytest
 
 import orch
-from conftest import run_cli
-from orchlib import markers, work
+from conftest import R, run_cli
+from orchlib import markers, stories, work
 
 SKILL = Path(__file__).resolve().parents[2]  # skills/orch-gate
-TEMPLATE = SKILL / "assets" / "custom" / "bmad-build.toml"
+CUSTOM = SKILL / "assets" / "custom"
+EPICS_SKILL, SPRINT_SKILL = "bmad-create-epics-and-stories", "bmad-sprint-planning"
+PLANNING = (EPICS_SKILL, SPRINT_SKILL)
+TEMPLATES = ("bmad-build", *PLANNING)
 DEFAULT_CLI = "{project-root}/.claude/skills/orch-gate/scripts/orch.py"
+DEFAULT_REGISTRY_DIR = "_bmad-output/orch/subprojects"
+PLACEHOLDERS = {"@ORCH_CLI@", "@ORCH_REGISTRY_DIR@"}
 ORCH_CALL = re.compile(r"uv run @ORCH_CLI@ ([^`\n]+)")
+ABSOLUTE = re.compile(r"(?<![\w@}.-])/(?:home|Users|workspaces|tmp|usr|opt|root|var|etc)/|\b[A-Za-z]:\\")
 
 
 def _find_up(*relatives: str) -> Path | None:
@@ -30,66 +39,104 @@ def _find_up(*relatives: str) -> Path | None:
     return None
 
 
-def _stock_skill() -> Path:
-    found = _find_up(".claude/skills/bmad-build/customize.toml", ".agents/skills/bmad-build/customize.toml")
+def _stock_skill(name: str = "bmad-build") -> Path:
+    found = _find_up(f".claude/skills/{name}/customize.toml", f".agents/skills/{name}/customize.toml")
     if found is None:
-        pytest.skip("stock bmad-build is not installed")
+        pytest.skip(f"stock {name} is not installed")
     return found.parent
 
 
-def _template() -> dict:
-    with TEMPLATE.open("rb") as f:
+def _path(name: str = "bmad-build") -> Path:
+    return CUSTOM / f"{name}.toml"
+
+
+def _template(name: str = "bmad-build") -> dict:
+    with _path(name).open("rb") as f:
         return tomllib.load(f)
 
 
-def _text() -> str:
-    return TEMPLATE.read_text(encoding="utf-8")
+def _text(name: str = "bmad-build") -> str:
+    return _path(name).read_text(encoding="utf-8")
 
 
-def _values() -> list[str]:
-    wf = _template()["workflow"]
+def _values(name: str = "bmad-build") -> list[str]:
+    wf = _template(name)["workflow"]
     return [v for value in wf.values() for v in (value if isinstance(value, list) else [value])]
 
 
-def test_template_parses_as_toml():
-    data = _template()
+def _substituted(name: str, registry_dir: str = DEFAULT_REGISTRY_DIR) -> str:
+    return _text(name).replace("@ORCH_CLI@", DEFAULT_CLI).replace("@ORCH_REGISTRY_DIR@", registry_dir)
+
+
+def _orch_calls(name: str) -> list:
+    parser = orch.build_parser()
+    return [(argv, parser.parse_args(argv)) for argv in
+            (shlex.split(m.group(1).strip().replace("<key>", "1-2")) for m in ORCH_CALL.finditer("\n".join(_values(name))))]
+
+
+# ---- every template ----
+
+def test_every_shipped_template_is_covered():
+    assert sorted(p.stem for p in CUSTOM.glob("*.toml")) == sorted(TEMPLATES)
+
+
+@pytest.mark.parametrize("name", TEMPLATES)
+def test_template_parses_as_toml(name):
+    data = _template(name)
     assert list(data) == ["workflow"]
     assert isinstance(data["workflow"], dict)
 
 
-def test_template_keys_and_types_match_stock_bmad_build():
-    with (_stock_skill() / "customize.toml").open("rb") as f:
+@pytest.mark.parametrize("name", TEMPLATES)
+def test_template_keys_and_types_match_stock(name):
+    with (_stock_skill(name) / "customize.toml").open("rb") as f:
         stock = tomllib.load(f)["workflow"]
-    ours = _template()["workflow"]
+    ours = _template(name)["workflow"]
+    assert 0 < len(ours) <= 4
     for key, value in ours.items():
-        assert key in stock, f"{key} is not a stock bmad-build key"
+        assert key in stock, f"{key} is not a stock {name} key"
         assert type(value) is type(stock[key]), f"{key}: {type(value).__name__} != {type(stock[key]).__name__}"
         if isinstance(value, list):
             assert value and all(isinstance(i, str) and i.strip() for i in value), f"{key}: empty or non-string item"
 
 
-def test_template_shape_and_forbidden_tokens():
+@pytest.mark.parametrize("name", TEMPLATES)
+def test_template_uses_placeholders_only(name):
+    text, values = _text(name), "\n".join(_values(name))
+    assert set(re.findall(r"@[A-Z_]+@", text)) <= PLACEHOLDERS
+    assert "@ORCH_CLI@" in values
+    assert "{skill-root}" not in values
+    assert "orch.py" not in values  # only @ORCH_CLI@ stands for the CLI path
+    assert not ABSOLUTE.search(values), ABSOLUTE.search(values)
+    # no path to orch.py but the placeholder, and file: facts only under the registry placeholder
+    assert all(m.group(0).startswith("uv run @ORCH_CLI@") for m in re.finditer(r"uv run \S+", values))
+    for value in _values(name):
+        if value.startswith("file:"):
+            assert value.startswith("file:{project-root}/@ORCH_REGISTRY_DIR@/"), value
+
+
+@pytest.mark.parametrize("name", TEMPLATES)
+def test_template_orch_calls_parse_with_the_cli(name):
+    calls = _orch_calls(name)
+    assert calls, "a template with no orch call"
+    for argv, args in calls:
+        assert args.coord is None and args.coord_ref is None and args.repo is None
+
+
+# ---- bmad-build ----
+
+def test_bmad_build_shape_and_story_gating():
     wf = _template()["workflow"]
     assert set(wf) == {"activation_steps_prepend", "persistent_facts", "on_complete"}
-    assert "@ORCH_CLI@" in _text()
-    values = "\n".join(_values())
-    assert "{skill-root}" not in values
-    assert "file:" not in values
-    assert "orch.py" not in values  # only @ORCH_CLI@ stands for the CLI path
+    assert "file:" not in "\n".join(_values())
     # every orch instruction is gated on the story branch
     for value in _values():
         assert "git symbolic-ref --short HEAD" in value or "starts with `story/`" in value
-    # no absolute path to orch.py: only the placeholder
-    assert all(m.group(0).startswith("uv run @ORCH_CLI@") for m in re.finditer(r"uv run \S+", values))
 
 
-def test_template_orch_calls_parse_with_the_cli():
-    calls = [m.group(1).strip() for m in ORCH_CALL.finditer("\n".join(_values()))]
+def test_bmad_build_orch_calls():
     commands = set()
-    parser = orch.build_parser()
-    for call in calls:
-        argv = shlex.split(call.replace("<key>", "1-2"))
-        args = parser.parse_args(argv)
+    for argv, args in _orch_calls("bmad-build"):
         commands.add(" ".join(argv[:2]) if args.cmd == "marker" else args.cmd)
         if args.cmd == "context":
             assert args.write and args.story is None  # key comes from the story branch
@@ -183,3 +230,122 @@ def test_template_renders_with_stock_bmad_build(tmp_path):
             assert needle in text, f"{name} lacks {needle!r}"
     for path in out.rglob("*.md"):
         assert "@ORCH_CLI@" not in path.read_text(encoding="utf-8"), path
+
+
+# ---- planning templates ----
+
+def _facts(name: str) -> list[str]:
+    return _template(name)["workflow"]["persistent_facts"]
+
+
+@pytest.mark.parametrize("name", PLANNING)
+def test_planning_template_sets_only_persistent_facts(name):
+    assert set(_template(name)["workflow"]) == {"persistent_facts"}
+
+
+@pytest.mark.parametrize("name", PLANNING)
+def test_planning_template_runs_plan_check_on_the_working_tree(name):
+    calls = _orch_calls(name)
+    assert {args.cmd for _, args in calls} == {"plan-check"}
+    assert all(args.working_tree for _, args in calls)
+
+
+def test_epics_template_loads_the_registry():
+    facts = _facts(EPICS_SKILL)
+    assert facts[:2] == ["file:{project-root}/@ORCH_REGISTRY_DIR@/*.yaml", "file:{project-root}/@ORCH_REGISTRY_DIR@/*.yml"]
+    assert len(facts) == 4
+
+
+def test_epics_template_covers_the_orch_story_rules():
+    rules, check = _facts(EPICS_SKILL)[2:]
+    for label in ("**Subproject:**", "**Depends on:**", "**Contract change:**"):
+        assert label in rules
+    # the label lines it shows parse as the gate parses them, in order
+    shown = [stories.LABEL_RE.match(line) for line in rules.splitlines()]
+    assert [m.group(1).lower() for m in shown if m] == ["subproject", "depends on", "contract change"]
+    for value in stories.CONTRACT_CHANGES:
+        assert f"`{value}`" in rules
+    for phrase in ("overrides the stock story format", "\"user value only\"", "Every story gets all three label lines",
+                   "right after the \"So that\" line", "before `**Acceptance Criteria:**`", "outside any code fence",
+                   "before any other heading", "exact registry file stem", "`contracts` is an implicit pseudo-subproject",
+                   "letter suffix", "registry `imports`", "expand → migrate → narrow", "one migration story per consumer",
+                   "comes after the `expand` and depends on every migration story", "even without direct user value",
+                   "`epic*.md`", "`epics-v1.md`", "`orch-setup`"):
+        assert phrase in rules, phrase
+    for phrase in ("Step 4", "before offering [C]", "plan-check --working-tree", "offer to fix the epics first",
+                   "`no-epics`", "`orch-setup`", "never a verdict", "never re-implement the checks"):
+        assert phrase in check, phrase
+
+
+def test_sprint_template_covers_the_readiness_rule():
+    (fact,) = _facts(SPRINT_SKILL)
+    for phrase in ("only to the **readiness** and **sprint-planning** intents",
+                   "for the status, validate and fix intents ignore this fact and run no orch command",
+                   "before stating the gate verdict", "plan-check --working-tree",
+                   "FAIL → FAIL", "CONCERNS → at least CONCERNS", "PASS → no change",
+                   "`code`, story and message", "`bmad-create-epics-and-stories`", "`bmad-correct-course`",
+                   "Headless runs put these findings in `findings`",
+                   "`orch-setup`", "`no-epics`", "`epic*.md`",
+                   "not independently completable", "orphan", "plan-check owns",
+                   "never a verdict", "orch check as not run", "at least CONCERNS", "never re-implement the checks"):
+        assert phrase in fact, phrase
+
+
+@pytest.mark.parametrize("name", PLANNING)
+def test_planning_template_resolves_with_the_bmad_resolver(name, tmp_path):
+    resolver = _find_up("_bmad/scripts/resolve_customization.py")
+    if resolver is None:
+        pytest.skip("BMad customization resolver is not installed")
+    project = tmp_path / "project"
+    (project / "_bmad" / "custom").mkdir(parents=True)
+    skill = project / ".claude" / "skills" / name
+    shutil.copytree(_stock_skill(name), skill)
+    (project / "_bmad" / "custom" / f"{name}.toml").write_text(_substituted(name), encoding="utf-8")
+
+    res = subprocess.run([sys.executable, str(resolver), "--skill", str(skill), "--project-root", str(project),
+                          "--key", "workflow"], capture_output=True, text=True, timeout=60)
+    assert res.returncode == 0, res.stdout + res.stderr
+    wf = json.loads(res.stdout)["workflow"]
+    facts = wf["persistent_facts"]
+    text = "\n".join(facts)
+    assert f"uv run {DEFAULT_CLI} plan-check --working-tree" in text
+    assert not re.search(r"@[A-Z_]+@", json.dumps(wf))
+    assert wf.get("on_complete", "") == ""  # stock value: the template never sets it
+    if name == EPICS_SKILL:
+        assert f"file:{{project-root}}/{DEFAULT_REGISTRY_DIR}/*.yaml" in facts
+        assert f"file:{{project-root}}/{DEFAULT_REGISTRY_DIR}/*.yml" in facts
+        assert "orch story rules" in text and "orch plan check" in text
+    else:
+        assert "orch readiness rule" in text and f"{{project-root}}/{DEFAULT_REGISTRY_DIR}" in text
+
+
+def test_registry_dir_placeholder_matches_the_normalized_config(mono):
+    """A `{project-root}/...` orch_registry_dir with {project_name} normalizes to what the template needs."""
+    custom = "_bmad-output/shop/subprojects"
+    mono.write("_bmad/custom/config.toml", '[core]\nproject_name = "shop"\n\n[modules.orch]\n'
+                                           'registry_dir = "{project-root}/_bmad-output/{project_name}/subprojects"\n')
+    (mono.path / custom).parent.mkdir(parents=True)
+    mono.git("mv", R, custom)
+    mono.commit("move registry")
+    code, res = run_cli("config", "--repo", str(mono.path))
+    assert code == 0, res
+    registry_dir = res["config"]["registry_dir"]
+    assert registry_dir == custom
+    facts = tomllib.loads(_substituted(EPICS_SKILL, registry_dir))["workflow"]["persistent_facts"]
+    globs = [f.removeprefix("file:{project-root}/") for f in facts if f.startswith("file:")]
+    assert globs == [f"{custom}/*.yaml", f"{custom}/*.yml"]
+    loaded = sorted(p.name for g in globs for p in mono.path.glob(g))
+    assert loaded == ["payment-service.yaml", "user-service.yaml"]
+    # plan-check reads the same registry the facts load
+    code, res = run_cli("plan-check", "--working-tree", "--repo", str(mono.path))
+    assert code == 0 and res["verdict"] == "PASS", res
+
+
+def test_stock_anchors_named_by_the_planning_facts_still_exist():
+    epics, sprint = _stock_skill(EPICS_SKILL), _stock_skill(SPRINT_SKILL)
+    assert "[C] Complete" in (epics / "steps" / "step-04-final-validation.md").read_text(encoding="utf-8")
+    step3 = (epics / "steps" / "step-03-create-stories.md").read_text(encoding="utf-8")
+    assert "STORY FORMAT" in step3 and "So that" in step3
+    skill = (sprint / "SKILL.md").read_text(encoding="utf-8")
+    for intent in ("readiness", "sprint-planning", "status", "validate", "fix"):
+        assert f"**{intent}**" in skill, intent

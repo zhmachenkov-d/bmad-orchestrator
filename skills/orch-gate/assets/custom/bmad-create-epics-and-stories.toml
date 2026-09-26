@@ -1,0 +1,49 @@
+# orch override for stock bmad-create-epics-and-stories — TEMPLATE shipped with orch-gate.
+#
+# What it does: loads the orch subproject registry and the orch story rules as
+# persistent facts, so every story the workflow writes carries the
+# `**Subproject:**`, `**Depends on:**` and `**Contract change:**` labels the orch
+# gate reads, and runs `orch.py plan-check --working-tree` during Step 4 so orch
+# plan defects show up before the epics are declared complete, not when a story
+# PR hits the gate.
+#
+# Installation (done by orch-setup, not by hand), in the coordination repo:
+# - Substitute every `@ORCH_CLI@` with a `{project-root}`-relative path to
+#   orch.py, by default `{project-root}/.claude/skills/orch-gate/scripts/orch.py`.
+#   Never an absolute path (this file is committed team config shared by every
+#   clone) and never `{skill-root}` (it names the planning skill, not orch-gate).
+# - Substitute every `@ORCH_REGISTRY_DIR@` with the normalized `registry_dir`
+#   that `uv run <orch.py> config` prints: repo-relative, with no
+#   `{project-root}` prefix and with `{project_name}` expanded (e.g.
+#   `_bmad-output/orch/subprojects`).
+# - Install the result as `_bmad/custom/bmad-create-epics-and-stories.toml` in
+#   the coordination repo (the repo holding the registry and the epics). If that
+#   file already exists, merge into it: `persistent_facts` is a list and
+#   appends, so add these entries to the existing ones.
+#
+# Uses only stock bmad-create-epics-and-stories customization keys, with their
+# stock types, and only `persistent_facts`: there is deliberately no
+# `on_complete` (a string would replace an existing team one, and the plan
+# check belongs before the final menu, not after it).
+
+[workflow]
+
+persistent_facts = [
+"file:{project-root}/@ORCH_REGISTRY_DIR@/*.yaml",
+"file:{project-root}/@ORCH_REGISTRY_DIR@/*.yml",
+"""
+orch story rules — this project plans with orch, and this fact overrides the stock story format (step 3 STORY FORMAT) and the stock "user value only" / "independently completable" story examples wherever they conflict. The registry files loaded above (`@ORCH_REGISTRY_DIR@/*.yaml` and `*.yml`) name the subprojects; each file stem is a subproject name. If no registry file was loaded, tell the user orch has no registry yet and to run `orch-setup` to create it, but still write the labels below, asking the user for each story's `Subproject`.
+1. Every story gets all three label lines, in this order, right after the "So that" line of the user story and before `**Acceptance Criteria:**`, outside any code fence and before any other heading:
+   **Subproject:** <name>
+   **Depends on:** <ids or none>
+   **Contract change:** <none | expand | narrow>
+2. `Subproject` is the exact registry file stem, or `contracts`. `contracts` is an implicit pseudo-subproject with no registry file: its stories write only the contracts dir (the canonical contracts), never service code.
+3. `Depends on` lists earlier story ids only (`N.M`, a letter suffix such as `2.3a` is allowed), comma-separated, or `none`. Never a later story. A dependency on a story of another subproject should follow the registry `imports` (the depending subproject imports the other one's contracts).
+4. `Contract change` is `none` for every story except `contracts` stories, which may use `expand` (additive, backward-compatible change) or `narrow` (removes or breaks something). The allowed values are exactly `none`, `expand` and `narrow`.
+5. A contract story comes before the stories that build against it, and they depend on it. A breaking contract change is split into expand → migrate → narrow: a `contracts` story with `expand`; then one migration story per consumer, where the consumers of a contract are the registry entries whose `imports` name its exporter; then a `contracts` story with `narrow` that comes after the `expand` and depends on every migration story. Contract and migration stories are valid stories even without direct user value.
+6. orch reads the epics only from `epic*.md` files under `planning_artifacts`: every `.md` file whose name starts with `epic` (any case) anywhere under it, subfolders included. Keep one current file per epic set: save to `epics.md` as usual, and keep no older copies or archives (e.g. `epics-v1.md`, `archive/epics-old.md`) anywhere under `planning_artifacts` (their stories would be read too).
+""",
+"""
+orch plan check — during Step 4 (Final Validation), after the epics file is saved and before offering [C] Complete, run `uv run @ORCH_CLI@ plan-check --working-tree` from `{project-root}` (it reads the saved epics and registry even if they are not committed) and show the user its `verdict` and every finding with its `code`, story and message. On FAIL or CONCERNS, offer to fix the epics first, save, and run the check again before offering [C]. A `no-epics` finding means the epics are not in an `epic*.md` file under `planning_artifacts`; `unknown-subproject` findings with no registry file loaded above mean orch has no registry yet and needs `orch-setup`; otherwise they mean a `Subproject` label does not match a registry file stem. Exit 2, or output without a JSON `verdict` (for example uv missing or a wrong CLI path), is an error, never a verdict: show the JSON `code` and `error`, or the raw output, say the orch check did not run and to check that `uv` is installed and that `@ORCH_CLI@` exists (set in `_bmad/custom/bmad-create-epics-and-stories.toml`), and never re-implement the checks yourself.
+""",
+]

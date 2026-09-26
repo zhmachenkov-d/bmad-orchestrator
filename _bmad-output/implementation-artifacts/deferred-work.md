@@ -13,3 +13,7 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-orch-bmad-build-override.md`
   summary: orch-setup must merge the bmad-build override safely — combine an existing team `on_complete`, define ordering of appended `activation_steps_prepend` entries, and warn when a `bmad-build.user.toml` `on_complete` would drop the orch marker and gate steps; cover the merge with tests.
   evidence: Code review of the override template; merge behavior is documented only in the template header and orch-setup does not exist yet.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-orch-planning-overrides.md`
+  summary: Test `plan-check --working-tree` with a separate coordination repo (`--coord` / `ORCH_COORD` pointing away from `--repo`) to prove the snapshot is taken of the coordination repo, not the acting repo.
+  evidence: Every working-tree test uses a single repo where `coord_root == repo`, so snapshotting `Env.repo` instead would pass; the shipped planning templates never pass `--coord`, so only direct CLI use is exposed.
