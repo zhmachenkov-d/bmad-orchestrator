@@ -5,7 +5,7 @@ import os
 from types import SimpleNamespace
 
 import yaml
-from conftest import C, EPICS, fake_bin, run_cli
+from conftest import C, EPICS, R, check, fake_bin, registry_yaml, run_cli
 
 from orchlib import status as status_mod
 
@@ -360,7 +360,7 @@ def test_plan_check_flags_an_ambiguous_narrow_target(mono):
     from conftest import R, registry_yaml
     ledger = f"{C}/ledger-service/openapi.yaml"
     mono.write(f"{R}/ledger-service.yaml", registry_yaml("ledger-service", "services/ledger", exports=[("openapi", ledger, None)]))
-    mono.write(ledger, "openapi: 3.0.0\npaths: {}\n")
+    mono.write(ledger, "openapi: 3.0.0\npaths: {}\n").write("services/ledger/app.py", "print('ledger')\n")
     mono.write(f"{R}/payment-service.yaml", registry_yaml("payment-service", "services/payment", imports=["ledger-service"],
                                                          exports=[("openapi", OAS, COPY)]))
     mono.write(f"{R}/user-service.yaml", registry_yaml("user-service", "services/user", imports=["payment-service", "ledger-service"]))
@@ -392,11 +392,63 @@ def test_shallow_clone_cut_through_the_markers_refuses_to_guess_the_order(mono, 
     for depth, cut in ((1, True), (3, False)):     # 3 reaches the plan commit, before any marker
         clone = tmp_path / f"clone{depth}"
         mono.git("clone", "-q", f"--depth={depth}", f"file://{mono.path}", str(clone))
-        code, res = run_cli("status", "--no-host", "--repo", str(clone))
+        mono.git("-C", str(clone), "remote", "set-url", "origin", str(tmp_path / "gone.git"))
+        mono.git("-C", str(clone), "update-ref", "refs/remotes/origin/main", "HEAD")
+        code, res = run_cli("status", "--no-host", "--offline", "--repo", str(clone))
         if cut:
             assert code == 2 and "shallow clone" in res["error"], res
         else:
             assert code == 0 and "pin-drift" not in codes(res), res
+
+
+def test_shallow_clone_deepens_itself_from_origin(mono, tmp_path):
+    _reversed_history(mono)
+    clone = tmp_path / "clone"
+    mono.git("clone", "-q", "--depth=1", f"file://{mono.path}", str(clone))
+    code, res = run_cli("status", "--no-host", "--repo", str(clone))
+    assert code == 0 and "pin-drift" not in codes(res), res
+    assert mono.git("-C", str(clone), "rev-parse", "--is-shallow-repository") == "false"
+
+
+def _record_branch(mono, contract_stories: int):
+    """Main with epic 1 archived, and orch/close-epic-1-record built on it; `contract_stories` 1 or 2 change the contract."""
+    if contract_stories == 2:
+        _run_epic(mono, adopt=True)
+    else:
+        mono.write("_bmad-output/planning-artifacts/epics.md", EPICS.split("### Story 1.4")[0]).commit("plan")
+        v1 = "openapi: 3.0.0\npaths: {/pay: {}}\n"
+        land(mono, "1-1", {OAS: v1})
+        land(mono, "1-2", {COPY: v1, "services/payment/app.py": "v1\n"})
+        land(mono, "1-3", {"services/user/app.py": "migrated\n"})
+    cli(mono, "epic", "close", "--epic", "1", "--push", "--user", "Ann <a@x>")
+    mono.git("merge", "-q", "--no-ff", "orch/close-epic-1")
+    code, res = cli(mono, "epic", "close", "--epic", "1", "--push", "--user", "Ann <a@x>")
+    assert res["pass"] == "record", res
+
+
+def _gate_in_clone(mono, tmp_path, depth, origin_reachable):
+    clone = tmp_path / f"ci{depth}{origin_reachable}"
+    mono.git("clone", "-q", "--no-single-branch", f"--depth={depth}", f"file://{mono.path}", str(clone))
+    mono.git("-C", str(clone), "checkout", "-q", "orch/close-epic-1-record")
+    if not origin_reachable:
+        mono.git("-C", str(clone), "remote", "set-url", "origin", str(tmp_path / "gone.git"))
+    return run_cli("gate", "--repo", str(clone), "--base", "origin/main", env={"CI": "true"})
+
+
+def test_record_pr_gate_needs_no_history_while_each_contract_changed_once(mono, tmp_path):
+    _record_branch(mono, contract_stories=1)
+    code, res = _gate_in_clone(mono, tmp_path, 2, origin_reachable=False)
+    assert code == 0 and res["verdict"] == "pass", res
+
+
+def test_record_pr_gate_deepens_a_ci_clone_or_fails_with_a_hint(mono, tmp_path):
+    _record_branch(mono, contract_stories=2)      # expand then narrow: the merge order decides convergence
+    code, res = _gate_in_clone(mono, tmp_path, 2, origin_reachable=True)
+    assert code == 0 and res["verdict"] == "pass", res
+    code, res = _gate_in_clone(mono, tmp_path, 2, origin_reachable=False)
+    found = [f for f in check(res, "sprint-status")["findings"] if f["level"] == "fail"]
+    assert code == 1 and [f["code"] for f in found] == ["epic-close-unverifiable"], res
+    assert "fetch-depth: 0" in found[0]["hint"]
 
 
 def test_fast_forward_merge_orders_a_story_by_its_last_marker_rewrite(mono):
@@ -454,3 +506,149 @@ def test_one_migration_draft_covers_every_drifting_contract_of_a_subproject(mono
     drafts = [a["migration_draft"] for a in res["anomalies"] if a["code"] == "pin-drift"]
     assert len(drafts) == 2 and drafts[0] == drafts[1], drafts
     assert drafts[0]["id"] == "1.5" and drafts[0]["contracts"] == sorted([OAS, events])
+
+
+# --- regressions from the code review of orch-status ---
+
+def test_a_second_archive_pass_moves_the_branch_left_by_the_first(mono):
+    _run_epic(mono, adopt=False)
+    cli(mono, "epic", "close", "--epic", "1", "--push", "--user", "Ann <a@x>")
+    mono.git("merge", "-q", "--no-ff", "orch/close-epic-1")
+    mono.write("_bmad-output/planning-artifacts/epics.md", EPICS_ADOPT).commit("plan 1.5")   # the migration story
+    land(mono, "1-5", {COPY: "openapi: 3.0.0\npaths: {/pay: {}}\n"})
+    code, res = cli(mono, "epic", "close", "--epic", "1", "--push", "--user", "Ann <a@x>", "--expect-pass", "archive")
+    assert code == 0 and res["published"][0]["status"] == "updated", res
+    assert ".orch/archive/epic-1/1-5.yaml" in mono.git("ls-tree", "-r", "--name-only", "orch/close-epic-1")
+    code, res = cli(mono, "epic", "close", "--epic", "1", "--push", "--user", "Ann <a@x>", "--expect-pass", "archive")
+    assert res["published"][0]["status"] == "exists", res       # rerun before merging: the PR stays
+    mono.git("merge", "-q", "--no-ff", "orch/close-epic-1")
+    code, res = cli(mono, "epic", "close", "--epic", "1")
+    assert code == 0 and res["pass"] == "record", res
+
+
+REVERT = """## Epic 1: Payments
+
+### Story 1.1: Contract A
+**Subproject:** contracts
+**Depends on:** none
+**Contract change:** expand
+
+### Story 1.2: Payment on A
+**Subproject:** payment-service
+**Depends on:** 1.1
+
+### Story 1.3: Contract B adds extra
+**Subproject:** contracts
+**Depends on:** 1.2
+**Contract change:** expand
+
+### Story 1.4: Payment implements extra
+**Subproject:** payment-service
+**Depends on:** 1.3
+
+### Story 1.5: User service
+**Subproject:** user-service
+**Depends on:** 1.3
+
+### Story 1.6: Drop extra again
+**Subproject:** contracts
+**Depends on:** 1.5
+**Contract change:** narrow
+"""
+
+
+def test_a_contract_reverted_to_an_older_version_still_shows_the_exporter_drift(mono):
+    mono.write("_bmad-output/planning-artifacts/epics.md", REVERT).commit("plan")
+    a, b = "openapi: 3.0.0\npaths: {/pay: {}}\n", "openapi: 3.0.0\npaths: {/pay: {}, /extra: {}}\n"
+    land(mono, "1-1", {OAS: a})
+    land(mono, "1-2", {COPY: a})
+    land(mono, "1-3", {OAS: b})
+    land(mono, "1-4", {COPY: b})
+    land(mono, "1-5", {"services/user/app.py": "x\n"})
+    land(mono, "1-6", {OAS: a})                                  # back to A without migrating payment-service
+    _, res = cli(mono, "status", "--no-host")
+    drift = [(a["story"], a["reason"]) for a in res["anomalies"] if a["code"] == "pin-drift"]
+    assert drift == [("1-4", "not-migrated")] and res["epics"][0]["state"] == "drift", res["anomalies"]
+
+
+def test_status_reads_claims_as_last_fetched_when_origin_is_offline_or_gone(mono, tmp_path):
+    cli(mono, "claim", "create", "--story", "1-1", "--user", "Ann <a@x>", "--local")
+    mono.git("remote", "add", "origin", str(tmp_path / "gone.git"))
+    mono.git("update-ref", "refs/remotes/origin/main", "main")
+    mono.git("update-ref", "refs/orch/claims/1-1", "refs/heads/claim/1-1")      # the mirror of the last fetch
+    for flags, why in ((["--offline"], "claims-offline"), ([], "claims-unreadable")):
+        code, res = cli(mono, "status", "--no-host", *flags)
+        assert code == 0 and why in {u["code"] for u in res["unread_repos"]}, res
+        assert by_key(res)["1-1"]["claimant"] == "Ann <a@x>"
+
+
+def test_plan_check_fails_a_registry_the_gate_rejects(mono):
+    mono.write(f"{R}/user-service.yaml", registry_yaml("user-service", "services/user", imports=["payment-service", "billing"]))
+    mono.commit("typo")
+    code, res = cli(mono, "plan-check")
+    assert code == 1 and res["verdict"] == "FAIL", res
+    assert [f["code"] for f in res["findings"]] == ["unknown-import"]
+
+
+def test_plan_check_passes_a_narrow_of_a_contract_nobody_imports(mono):
+    mono.write(f"{R}/user-service.yaml", registry_yaml("user-service", "services/user")).commit("no imports")
+    code, res = cli(mono, "plan-check")
+    assert code == 0 and res["verdict"] == "PASS", res
+
+
+def test_a_contract_story_nobody_waits_on_is_no_bottleneck(mono):
+    _, res = cli(mono, "status", "--no-host")
+    assert by_key(res)["1-4"]["critical"] and by_key(res)["1-4"]["downstream"] == 0
+    assert [a["story"] for a in res["anomalies"] if a["code"] == "contract-bottleneck"] == ["1-1"]
+
+
+def test_migration_draft_skips_a_closed_epic(mono):
+    mono.write("_bmad-output/planning-artifacts/epics.md", CROSS_EPIC).commit("plan")
+    mono.write(STATUS, "development_status:\n  epic-1: in-progress\n  1-1-payment-api-contract: backlog\n"
+                       "  1-2-implement-payment-api: backlog\n  1-3-user-service-calls-payments: backlog\n"
+                       "  epic-2: in-progress\n  2-1-remove-legacy-field: backlog\n").commit("sprint status")
+    v1, v2 = "openapi: 3.0.0\npaths: {/pay: {}, /legacy: {}}\n", "openapi: 3.0.0\npaths: {/pay: {}}\n"
+    land(mono, "1-1", {OAS: v1})
+    land(mono, "1-2", {COPY: v1})
+    land(mono, "1-3", {"services/user/app.py": "migrated\n"})
+    land(mono, "2-1", {OAS: v2})
+    for _ in ("archive", "record"):
+        code, res = cli(mono, "epic", "close", "--epic", "2", "--push", "--user", "Ann <a@x>")
+        assert code == 0, res
+        mono.checkout("main").git("merge", "-q", "--no-ff", res["published"][0]["branch"])
+    _, res = cli(mono, "status", "--no-host")
+    draft = next(a for a in res["anomalies"] if a["code"] == "pin-drift")["migration_draft"]
+    assert (draft["id"], draft["epic"], draft["new_epic"]) == ("3.1", 3, True), draft
+    mono.write("_bmad-output/planning-artifacts/epics.md", CROSS_EPIC + "\n" + draft["markdown"]).commit("paste")
+    code, res = cli(mono, "plan-check")
+    assert code == 0 and res["verdict"] == "PASS", res
+
+
+def test_story_in_review_without_a_review_host_is_stuck_not_stale_even_after_a_rename(mono):
+    mono.write(STATUS, "development_status:\n  epic-1: in-progress\n  1-1-old-title: review\n").commit("sprint status")
+    cli(mono, "claim", "create", "--story", "1-1", "--user", "Ann <a@x>", env={"GIT_COMMITTER_DATE": OLD})
+    _, res = cli(mono, "status", "--no-host")
+    assert codes(res, "1-1") == {"stuck-review", "contract-bottleneck"}, res["anomalies"]
+
+
+def test_downstream_counts_every_story_of_a_dependency_cycle():
+    from orchlib.stories import Story, StorySet
+    stories = StorySet()
+    for sid, dep in (("1.1", "1.2"), ("1.2", "1.1")):
+        stories[sid.replace(".", "-")] = Story(sid, sid.replace(".", "-"), 1, sid, f"{sid}-t", "x", [dep])
+    assert status_mod._downstream(stories) == {"1-1": {"1-2"}, "1-2": {"1-1"}}
+
+
+def test_a_file_url_has_no_review_host():
+    assert status_mod._host_tool("file:///srv/git/coord.git") is None
+    assert status_mod._host_tool("git@github.com:acme/pay.git") == "gh"
+
+
+def test_report_to_a_pdf_path_keeps_the_html_beside_it(mono, tmp_path):
+    path = fake_bin(tmp_path, "fakechrome", "import sys\n"
+                    "arg = next(a for a in sys.argv if a.startswith('--print-to-pdf='))\n"
+                    "open(arg.split('=', 1)[1], 'wb').write(b'%PDF-1.4')\n")
+    code, res = cli(mono, "report", "--epic", "1", "--no-host", "-o", str(tmp_path / "r.pdf"),
+                    env={"PATH": path, "ORCH_CHROME": "fakechrome"})
+    assert code == 0 and res["html"] == str(tmp_path / "r.html") and res["pdf"] == str(tmp_path / "r.pdf"), res
+    assert (tmp_path / "r.pdf").read_bytes() == b"%PDF-1.4" and "<svg" in (tmp_path / "r.html").read_text()

@@ -10,7 +10,7 @@ import yaml
 
 from . import OrchError
 from .config import Config
-from .gitio import Tree, fetch_tree, normalize_repo, out, sha
+from .gitio import FETCH_TIMEOUT, Tree, fetch_tree, git, normalize_repo, out, remote_url, sha
 from .registry import CONTRACTS, Registry, pin_paths
 from .stories import KEY_RE, Story
 
@@ -152,9 +152,9 @@ def public(merged_map: dict[str, dict]) -> dict[str, dict]:
 
 
 def close_check(epic: int, stories, reg: Registry, merged_map: dict[str, dict], coord: Tree,
-                unknown: set[str] = frozenset()) -> list[dict]:
+                unknown: set[str] = frozenset(), index: PinIndex | None = None) -> list[dict]:
     """An epic may close only when every story is merged, every marker is archived, and every pin matches main."""
-    problems, index = [], None
+    problems = []
     for s in [s for s in stories.values() if s.epic == epic]:
         hit = merged_map.get(s.key)
         if not hit and s.key in unknown:
@@ -212,23 +212,38 @@ def merge_order(tree: Tree) -> dict[str, int]:
 def _require_marker_history(tree: Tree) -> None:
     """A shallow clone cut through the markers' history would make the cut commit look like it added them all.
 
-    Only cuts on the first-parent chain matter: merge commits are read against their first parent.
+    Only cuts on the first-parent chain matter: merge commits are read against their first parent. A cut clone
+    with an origin (a CI checkout with a fetch depth) is deepened once before giving up.
     """
-    if out(tree.repo, "rev-parse", "--is-shallow-repository") != "true":
+    if not _history_cut(tree):
         return
+    if remote_url(tree.repo):
+        try:
+            git(tree.repo, "fetch", "--quiet", "--unshallow", "origin", check=False,
+                env={"GIT_TERMINAL_PROMPT": "0"}, timeout=FETCH_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            pass
+        if not _history_cut(tree):
+            return
+    raise OrchError(f"shallow clone: the history of {MARKER_DIR} on {tree.ref} in {tree.repo} is cut and origin "
+                    "could not deepen it, so the merge order of contract stories is unknown. Fetch full history "
+                    "(actions/checkout fetch-depth: 0, GitLab GIT_DEPTH: 0, or git fetch --unshallow)")
+
+
+def _history_cut(tree: Tree) -> bool:
+    if out(tree.repo, "rev-parse", "--is-shallow-repository") != "true":
+        return False
     shallow = Path(tree.repo, out(tree.repo, "rev-parse", "--git-path", "shallow"))
     chain = set(out(tree.repo, "rev-list", "--first-parent", tree.ref).split())
-    for cut in shallow.read_text().split() if shallow.exists() else []:
-        if cut in chain and out(tree.repo, "ls-tree", "--name-only", cut, "--", MARKER_DIR, ARCHIVE_DIR):
-            raise OrchError(f"shallow clone: the history of {MARKER_DIR} on {tree.ref} in {tree.repo} is cut, so the "
-                            "merge order of contract stories is unknown. Fetch full history (actions/checkout "
-                            "fetch-depth: 0, GitLab GIT_DEPTH: 0, or git fetch --unshallow)")
+    return any(cut in chain and out(tree.repo, "ls-tree", "--name-only", cut, "--", MARKER_DIR, ARCHIVE_DIR)
+               for cut in (shallow.read_text().split() if shallow.exists() else []))
 
 
 class PinIndex:
     """What merged markers pinned: the contract chain and, per (subproject, canonical), the latest pinning story.
 
-    The chain is in merge order on coordination main, where every contract story lands. A subproject's latest
+    The chain is in merge order on coordination main, where every contract story lands; that order is read only
+    when some canonical changed more than once, so shallow clones work until it matters. A subproject's latest
     pinner is the one pinning the newest version in that chain: pins must equal main at merge, so a later merge
     never pins an older version, and this needs no history of the subproject's own repo.
     """
@@ -239,20 +254,52 @@ class PinIndex:
                 for s in stories.values() if s.key in merged_map}
         self.chain: dict[str, list[tuple[Story, str]]] = {}
         contract = [k for k, (s, _) in pins.items() if s.subproject == CONTRACTS]
-        order = merge_order(coord) if contract else {}
+        changes = [path for k in contract for path in pins[k][1]]
+        order = merge_order(coord) if len(changes) > len(set(changes)) else {}
         contract.sort(key=lambda k: (order.get(k, len(order) + plan[k]), plan[k]))
         for k in contract:
             s, p = pins[k]
             for path, sha_ in p.items():
                 self.chain.setdefault(path, []).append((s, sha_))
+        # (story key, canonical) -> chain position of the version that story pinned
+        self.pos: dict[tuple[str, str], int] = {}
         self.latest: dict[tuple[str, str], str] = {}
         rank: dict[tuple[str, str], tuple] = {}
         for k, (s, p) in pins.items():
             for path, sha_ in p.items():
-                pos = max((i for i, (_, v) in enumerate(self.chain.get(path, [])) if v == sha_), default=-1)
+                pos = self.pos[(k, path)] = _pinned_at(k, sha_, self.chain.get(path, []), order, stories)
                 r = (pos, plan[k])
                 if rank.get((s.subproject, path), (-2,)) < r:
                     rank[(s.subproject, path)], self.latest[(s.subproject, path)] = r, k
+
+
+def _pinned_at(key: str, pinned: str, chain: list, order: dict[str, int], stories) -> int:
+    """Chain position of the version `key` pinned, or -1.
+
+    A version appears twice when a contract went back to it (A -> B -> A). The story pinned main at its merge, so
+    it is the last occurrence merged before the story: by merge order when the story lives in the coordination
+    repo, else the last one whose contract story does not depend on it (a dependent merged later).
+    """
+    hits = [i for i, (_, v) in enumerate(chain) if v == pinned]
+    if len(hits) < 2:
+        return hits[0] if hits else -1
+    if own := [i for i in hits if chain[i][0].key == key]:
+        return own[0]
+    if key in order:
+        before = [i for i in hits if order.get(chain[i][0].key, -1) < order[key]]
+    else:
+        before = [i for i in hits if key not in _requires(stories, chain[i][0])]
+    return max(before or hits[:1])
+
+
+def _requires(stories, story: Story) -> set[str]:
+    """Keys of every story `story` depends on, transitively."""
+    found, todo = set(), list(story.depends_on)
+    while todo:
+        if (d := stories.by_id(todo.pop())) and d.key not in found:
+            found.add(d.key)
+            todo += d.depends_on
+    return found
 
 
 def pin_drift(story: Story, marker: dict, stories, merged_map: dict[str, dict], coord: Tree,
@@ -272,15 +319,15 @@ def pin_drift(story: Story, marker: dict, stories, merged_map: dict[str, dict], 
         if pinned == current or index.latest.get((story.subproject, path), story.key) != story.key:
             continue
         versions = index.chain.get(path, [])
-        where = [i for i, (_, v) in enumerate(versions) if v == pinned]
-        later = versions[where[-1] + 1:] if where else versions
+        pos = index.pos.get((story.key, path), -1)
+        later = versions[pos + 1:]
         base = {"path": path, "pinned": pinned, "current": current}
         if not versions or versions[-1][1] != current:
             drift.append({**base, "reason": "unrecorded-change",
                           "message": f"pin {path} = {pinned[:10]} but main has {(current or 'nothing')[:10]}, "
                                      "and no merged contract story produced main's version"})
             continue
-        if story.subproject == CONTRACTS and where:
+        if story.subproject == CONTRACTS and pos >= 0:
             continue
         unmigrated = [cs for cs, _ in later if cs.contract_change == "narrow"
                       and not any((d := stories.by_id(dep)) and d.subproject == story.subproject for dep in cs.depends_on)]

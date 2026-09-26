@@ -256,8 +256,9 @@ def cmd_status(args, env: Env):
 
 def cmd_plan_check(args, env: Env):
     reg = env.registry()
-    res = plan.check(env.stories(reg), reg)
-    return emit({"ok": res["verdict"] != "FAIL", "registry_issues": reg.issues, **res}, 1 if res["verdict"] == "FAIL" else 0)
+    issues = registry.validate(reg, env.coord, env.cfg)
+    res = plan.check(env.stories(reg), reg, issues)
+    return emit({"ok": res["verdict"] != "FAIL", "registry_issues": issues, **res}, 1 if res["verdict"] == "FAIL" else 0)
 
 
 def cmd_report(args, env: Env):
@@ -268,11 +269,14 @@ def cmd_report(args, env: Env):
     stamp = res["now"][:16].replace(":", "").replace("-", "").replace("T", "-")
     path = Path(args.output) if args.output else (
         env.coord_root / env.cfg.implementation_artifacts / "orch" / "reports" / f"epic-{args.epic}-{stamp}.html")
+    pdf_path = None
+    if path.suffix.lower() == ".pdf":  # -o names the PDF: the HTML goes beside it
+        pdf_path, path, args.pdf = path, path.with_suffix(".html"), True
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
     out = {"ok": True, "html": str(path)}
     if args.pdf:
-        pdf, why = report.to_pdf(path)
+        pdf, why = report.to_pdf(path, pdf_path)
         out.update({"pdf": str(pdf) if pdf else None, "pdf_error": why})
     return emit(out)
 
@@ -394,7 +398,7 @@ def build_parser() -> argparse.ArgumentParser:
     rp.add_argument("--epic", type=int, required=True)
     rp.add_argument("--pdf", action="store_true", help="also print it to PDF with headless Chromium/Chrome")
     rp.add_argument("--no-host", action="store_true", help="do not ask gh/glab for open reviews")
-    rp.add_argument("-o", "--output", help="HTML path (default: {implementation_artifacts}/orch/reports/epic-N-<stamp>.html)")
+    rp.add_argument("-o", "--output", help="HTML path, or a .pdf path to get the PDF there and the HTML beside it (default: {implementation_artifacts}/orch/reports/epic-N-<stamp>.html)")
 
     g = sub.add_parser("gate", parents=[common], help="pre-merge verdict for the current branch/PR")
     g.add_argument("--base", help="target branch ref (default: origin/main or main)")

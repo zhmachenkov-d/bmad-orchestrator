@@ -74,9 +74,21 @@ def branch_activity(reg: Registry, coord_root: Path, cache_root: Path, offline: 
     return tips, unread
 
 
+def _claims(coord_root: Path, remote: str | None, now: float, offline: bool) -> tuple[list[dict], list[dict]]:
+    """Claims from `remote`, or as last fetched when offline or the remote does not answer; plus why they may be stale."""
+    if remote and offline:
+        return claims_mod.list_claims(coord_root, remote, now, fetch=False), [
+            {"code": "claims-offline", "repo": remote, "message": f"offline: claims as last fetched from {remote}"}]
+    try:
+        return claims_mod.list_claims(coord_root, remote, now), []
+    except OrchError as exc:
+        return claims_mod.list_claims(coord_root, remote, now, fetch=False), [
+            {"code": "claims-unreadable", "repo": remote, "message": f"cannot fetch claims from {remote} ({exc}); showing them as last fetched"}]
+
+
 def _host_tool(url: str) -> str | None:
     host = normalize_repo(url).split("/", 1)[0]
-    if "/" not in normalize_repo(url) or url.startswith(("/", ".")):
+    if "/" not in normalize_repo(url) or url.startswith(("/", ".", "file:")):
         return None  # a local path has no review host
     return "glab" if "gitlab" in host else "gh"
 
@@ -147,21 +159,17 @@ def _parse_time(value: str | None) -> float | None:
 
 
 def _downstream(stories: StorySet) -> dict[str, set[str]]:
-    """key -> every story that transitively depends on it."""
+    """key -> every story that transitively depends on it (a walk per story, so a dependency cycle counts fully)."""
     direct = {k: set(stories.dependents(k)) for k in stories}
-    memo: dict[str, set[str]] = {}
-
-    def walk(k: str, path: frozenset) -> set[str]:
-        if k in memo:
-            return memo[k]
-        acc = set()
-        for d in direct[k]:
-            if d not in path:
-                acc |= {d} | walk(d, path | {d})
-        memo[k] = acc
-        return acc
-
-    return {k: walk(k, frozenset({k})) for k in stories}
+    result = {}
+    for k in stories:
+        seen, todo = set(), list(direct[k])
+        while todo:
+            if (d := todo.pop()) not in seen and d != k:
+                seen.add(d)
+                todo += direct.get(d, ())
+        result[k] = seen
+    return result
 
 
 def critical_path(stories: StorySet, epic: int, done: set[str]) -> list[str]:
@@ -181,13 +189,16 @@ def build(reg: Registry, stories: StorySet, coord_root: Path, coord: Tree, cfg: 
     now = now if now is not None else time.time()
     merged_map, unread = markers.merged(reg, coord, cache_root, offline=offline)
     unknown = markers.unknown_keys(stories, unread)
-    claim_list = claims_mod.list_claims(coord_root, remote, now)
+    claim_list, claims_unread = _claims(coord_root, remote, now, offline)
     claimed = {c["story"]: c for c in claim_list}
     tips, branch_unread = branch_activity(reg, coord_root, cache_root, offline)
+    branch_unread += claims_unread
     open_reviews, review_source, notices = reviews(reg, coord_root) if host and not offline else ({}, {}, [])
     closed = markers.closed_epics(coord, cfg)
     sprint_text = coord.text(cfg.sprint_status)
     sprint = (sprint_status.parsed(sprint_text) or {}) if sprint_text else {}
+    # by story key: a renamed story keeps its key while the slug in its sprint key changes
+    sprint_state = {sk: v for k, v in sprint.items() if (sk := sprint_status.story_key(k))}
     done = set(merged_map)
     downstream = _downstream(stories)
     # states and anomalies over every epic, so --epic filters the output without changing it
@@ -234,14 +245,14 @@ def build(reg: Registry, stories: StorySet, coord_root: Path, coord: Tree, cfg: 
             "critical": s.key in on_critical,
         }
         rows.append(row)
-        anomalies += _story_anomalies(row, s, cfg, sprint, review_source.get(ident, "none"), now)
+        anomalies += _story_anomalies(row, s, cfg, sprint_state.get(s.key), review_source.get(ident, "none"))
 
     by_key = {r["key"]: r for r in rows}
     for r in rows:
         s = stories[r["key"]]
         if s.subproject == CONTRACTS and r["state"] not in ("done", "unknown"):
             waiting = [d for d in r["dependents"] if by_key.get(d, {}).get("blocked_by") == [r["key"]]]
-            if len(waiting) >= 2 or r["critical"]:
+            if len(waiting) >= 2 or (r["critical"] and r["downstream"]):
                 anomalies.append({"code": "contract-bottleneck", "story": r["key"], "severity": "warn",
                                   "message": f"contract story {r['id']} ({r['state']}) blocks {len(waiting)} waiting stories"
                                              f"{' and is on the critical path' if r['critical'] else ''}; {r['downstream']} downstream",
@@ -263,7 +274,7 @@ def build(reg: Registry, stories: StorySet, coord_root: Path, coord: Tree, cfg: 
             anomalies.append(a)
     drafted: dict[int, int] = {}
     for sub, found in sorted(migrate.items()):
-        draft = migration_draft(stories, merged_map, sub, [(s, d) for _, s, d in found], index, drafted)
+        draft = migration_draft(stories, merged_map, sub, [(s, d) for _, s, d in found], index, drafted, closed)
         for a, _, _ in found:
             a["migration_draft"] = draft
 
@@ -295,7 +306,7 @@ def build(reg: Registry, stories: StorySet, coord_root: Path, coord: Tree, cfg: 
         if e in closed:
             state, problems = "closed", []
         elif mine and counts["done"] == len(mine):
-            problems = markers.close_check(e, stories, reg, merged_map, coord, unknown)
+            problems = markers.close_check(e, stories, reg, merged_map, coord, unknown, index)
             drift = [p for p in problems if p.get("code") == "pin-drift"]
             state = "drift" if drift else ("archive-needed" if problems else "closable")
         else:
@@ -309,33 +320,44 @@ def build(reg: Registry, stories: StorySet, coord_root: Path, coord: Tree, cfg: 
             "review_source": review_source, "claims": claim_list}
 
 
-def migration_draft(stories: StorySet, merged_map: dict, sub: str, found: list, index, drafted: dict[int, int]) -> dict:
+def migration_draft(stories: StorySet, merged_map: dict, sub: str, found: list, index, drafted: dict[int, int],
+                    closed: set[int] = frozenset()) -> dict:
     """One story that makes `sub` build against every contract it drifts from, as a ready-to-paste plan block.
 
     A new story of the subproject pins all of its contracts at once, so one draft covers every drifting path. It
     goes last in the latest epic among the drifting stories and its dependencies, so it depends on nothing later
-    in the plan, and takes a number no story in the plan or on main has used.
+    in the plan, and takes a number no story in the plan or on main has used. A closed epic takes no new story:
+    the draft moves to the next open epic, or opens a new one (`new_epic`, with its heading in the markdown).
     """
     paths = sorted({d["path"] for _, d in found})
     deps = [stories[k] for k in stories if k in {c[-1][0].key for p in paths if (c := index.chain.get(p))}]
     depends = [x.id for x in deps]
     epic = max([s.epic for s, _ in found] + [x.epic for x in deps])
+    epics = {s.epic for s in stories.values()}
+    new_epic = False
+    if epic in closed:
+        later = sorted(e for e in epics if e > epic and e not in closed)
+        new_epic = not later
+        epic = later[0] if later else max(epics | set(closed)) + 1
     taken = [int(m.group(1)) for x in stories.values() if x.epic == epic and (m := re.match(r"^\d+\.(\d+)", x.id))]
     taken += [int(m.group(1)) for k in merged_map if (m := re.match(rf"^{epic}-(\d+)", k))]
     drafted[epic] = max([*taken, drafted.get(epic, 0)], default=0) + 1
     story_id = f"{epic}.{drafted[epic]}"
     names = ", ".join(PurePosixPath(p).name for p in paths)
     title = f"{sub} builds against the current {names}"
-    block = (f"### Story {story_id}: {title}\n**Subproject:** {sub}\n"
+    block = (f"## Epic {epic}: Contract migrations\n\n" if new_epic and drafted[epic] == 1 else "") + (
+             f"### Story {story_id}: {title}\n**Subproject:** {sub}\n"
              f"**Depends on:** {', '.join(depends) or 'none'}\n**Contract change:** none\n")
-    return {"id": story_id, "title": title, "subproject": sub, "epic": epic, "depends_on": depends,
-            "contract_change": "none", "contracts": paths, "markdown": block}
+    return {"id": story_id, "title": title, "subproject": sub, "epic": epic, "new_epic": new_epic,
+            "depends_on": depends, "contract_change": "none", "contracts": paths, "markdown": block}
 
 
-def _story_anomalies(row: dict, s, cfg: Config, sprint: dict, source: str, now: float) -> list[dict]:
+def _story_anomalies(row: dict, s, cfg: Config, sprint_value: str | None, source: str) -> list[dict]:
     found = []
     key, idle = row["key"], row["idle_hours"]
-    if row["state"] == "in-progress" and idle is not None and idle > cfg.stale_claim_hours:
+    # without a review host, sprint status is what says the story waits for review, not for its claimant
+    in_review = source == "none" and row["state"] == "in-progress" and sprint_value == "review"
+    if row["state"] == "in-progress" and not in_review and idle is not None and idle > cfg.stale_claim_hours:
         blind = row["activity_source"] == "claim-only"
         found.append({"code": "stale-claim", "story": key, "severity": "info" if blind else "warn",
                       "message": f"story {s.id} claimed by {row['claimant']}: no activity for {idle:.0f}h (> {cfg.stale_claim_hours:g}h)"
@@ -346,8 +368,7 @@ def _story_anomalies(row: dict, s, cfg: Config, sprint: dict, source: str, now: 
         found.append({"code": "stuck-review", "story": key, "severity": "warn", "source": source,
                       "message": f"story {s.id} in review for {row['review']['age_hours']:.0f}h (> {cfg.review_wait_hours:g}h), "
                                  f"{row['downstream']} stories downstream", "url": row["review"]["url"], "actions": []})
-    elif (source == "none" and row["state"] == "in-progress" and sprint.get(s.sprint_key) == "review"
-          and idle is not None and idle > cfg.review_wait_hours):
+    elif in_review and idle is not None and idle > cfg.review_wait_hours:
         found.append({"code": "stuck-review", "story": key, "severity": "warn", "source": "branch-age",
                       "message": f"story {s.id} is 'review' in sprint status and its branch is idle for {idle:.0f}h "
                                  f"(> {cfg.review_wait_hours:g}h)", "actions": []})
