@@ -359,6 +359,18 @@ def test_registry_dir_placeholder_matches_the_normalized_config(mono):
     assert code == 0 and res["verdict"] == "PASS", res
 
 
+def test_planning_templates_describe_each_stock_anchor_by_meaning_too():
+    """Installed projects get BMad updates without our tests: every exact stock anchor has a fallback by meaning."""
+    rules, check = _facts(EPICS_SKILL)[2:]
+    assert "or wherever the workflow defines the story block" in rules
+    assert "if the workflow names its steps or menu differently" in check and "before its final completion menu" in check
+    (step,) = _template(SPRINT_SKILL)["workflow"]["activation_steps_append"]
+    (fact,) = _facts(SPRINT_SKILL)
+    for text in (step, fact):
+        assert "checking implementation readiness, alone or as part of generating the sprint plan" in text
+    assert "If the intent is not known yet when this step runs" in step
+
+
 def test_stock_anchors_named_by_the_planning_facts_still_exist():
     epics, sprint = _stock_skill(EPICS_SKILL), _stock_skill(SPRINT_SKILL)
     assert "[C] Complete" in (epics / "steps" / "step-04-final-validation.md").read_text(encoding="utf-8")
