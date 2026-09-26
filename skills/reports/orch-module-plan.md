@@ -112,7 +112,7 @@ Shared context for every brief: module `orch` expands BMad Method (`bmm`). Harde
 | Ready list | "N stories ready — here is what each unblocks": stories whose `depends_on` are all merged to main and unclaimed, ranked by downstream count / critical path | epics/stories, story DAG, merge status | choice list |
 | Claim | Atomic claim of the chosen story | story id, user identity | claim ref; failure if lost race |
 | Take over | Claim a stale story from someone else (offered, never automatic) | stale claim | rewritten claim ref, existing branch reused |
-| Prepare worktree | Story branch + worktree in the right repo (coordination repo for `contracts` stories, code repo otherwise) | registry `repo`, `path`; `orch_worktrees_dir` | worktree path, branch |
+| Prepare worktree | Story branch `story/<N-M>` + worktree in the right repo (coordination repo for `contracts` stories, code repo otherwise); `orch-status` measures claim activity and finds reviews by this branch name | registry `repo`, `path`; `orch_worktrees_dir` | worktree path, branch |
 | Node context | Scoped context: story, subproject `allowed_read`, imported canonical contracts, pinned contract/PRD hashes | registry, contracts, story | context file consumed by the `bmad-build` override |
 | Hand off | Start `bmad-build` for the story in the worktree | — | `bmad-build` session |
 
@@ -151,7 +151,7 @@ Shared context for every brief: module `orch` expands BMad Method (`bmm`). Harde
 
 **Design Notes:** Detectors are adapters keyed by `contracts.exports[].type`. Optimistic contract concurrency: a contract story must be rebased onto the latest contract and re-approved (gate checks pins against main). Client hooks are optional hardening, not the guarantee.
 
-**Shared library owner:** `orch-gate/scripts/` owns the shared orch library (registry loading and validation, story/DAG parsing, claim refs, shard reading, sprint-status derivation). `orch-setup`, `orch-next` and `orch-status` invoke `orch-gate` scripts rather than duplicating logic. Consequence: `orch-gate` is always installed and is built first. Calling convention, which each consuming skill states in its own SKILL.md: `uv run <calling skill's directory>/../orch-gate/scripts/orch.py <command>` (the orch skills install side by side). Output is JSON on stdout. Exit 1 is a verdict or validation result, and exit 2 is an error, never a verdict.
+**Shared library owner:** `orch-gate/scripts/` owns the shared orch library (registry loading and validation, story/DAG parsing, claim refs, shard reading, sprint-status derivation, and for `orch-status` and `orch-next`: `status` with anomalies, `plan-check`, `epic close`, `report`). `orch-setup`, `orch-next` and `orch-status` invoke `orch-gate` scripts rather than duplicating logic. Consequence: `orch-gate` is always installed and is built first. Calling convention, which each consuming skill states in its own SKILL.md: `uv run <calling skill's directory>/../orch-gate/scripts/orch.py <command>` (the orch skills install side by side). Output is JSON on stdout. Exit 1 is a verdict or validation result, and exit 2 is an error, never a verdict.
 
 **Relationships:** runs on every PR; library dependency of every other orch skill.
 
@@ -179,9 +179,9 @@ Shared context for every brief: module `orch` expands BMad Method (`bmm`). Harde
 
 **Activation Modes:** interactive; headless for rebuild and report generation.
 
-**Tool Dependencies:** git; git host CLI optional; HTML → PDF renderer (choose in BW).
+**Tool Dependencies:** git; git host CLI optional (`gh`/`glab` for review waits); headless Chromium/Chrome optional for PDF (`ORCH_CHROME` overrides), otherwise the HTML is printed from a browser.
 
-**Design Notes:** Pull-only notification model — no bots or push. Stock BMad never sets `epic-N: done`, so orch owns that transition. Retro may optionally consume orch data (review waits, take-overs, bottlenecks).
+**Design Notes:** Pull-only notification model — no bots or push. Stock BMad never sets `epic-N: done`, so orch owns that transition. Close epic runs as two gated PR passes: `orch/close-epic-N` archives markers in every repo, then `orch/close-epic-N-record` adds the close record, `epic-N: done` and the retro data file `orch-epic-N.json` that `bmad-retrospective` can consume. Pins converge when, per subproject and canonical, the story pinning the newest version equals main or every later contract version (in the order their final markers landed on coordination main, which needs its full history: a shallow clone cut through the markers is an error) is compatible or a `narrow` that depends on a story of that subproject; `pin-drift` offers one drafted migration story per subproject when a new story can converge it, numbered last in the latest epic it depends on. The record pass waits until every registry repo was read.
 
 **Relationships:** anytime; close epic precedes `bmad-retrospective`.
 

@@ -52,7 +52,7 @@ The gate reads these bold labels under each stock `### Story N.M: Title` heading
 
 ## CLI behavior
 
-Output is JSON on stdout. Exit code 1 means a failing verdict, a lost race, validation issues, a missing detector, or `epic close-check` problems. Exit code 2 means a usage, environment or internal error, so report it and do not explain it as a verdict. `orch.py --help` lists the commands. CI mode is `--ci` or any common CI provider variable, and `ci_source` records which. `gate --format markdown` renders a CI step summary. `deps --probe` checks installed detectors against built-in compatible and breaking fixtures.
+Output is JSON on stdout. Exit code 1 means a failing verdict, a lost race, validation issues (including a `plan-check` FAIL), a missing detector, or `epic close-check` or `epic close` problems. Exit code 2 means a usage, environment or internal error, so report it and do not explain it as a verdict. `orch.py --help` lists the commands. CI mode is `--ci` or any common CI provider variable, and `ci_source` records which. `gate --format markdown` renders a CI step summary. `deps --probe` checks installed detectors against built-in compatible and breaking fixtures.
 
 ## Gotchas
 

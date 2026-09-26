@@ -274,6 +274,34 @@ def fetch_tree(url: str, branch: str, cache_dir: Path) -> Tree:
     return Tree(bare, f"refs/heads/{branch}")
 
 
+def branch_tips(repo: Path, prefixes: tuple[str, ...]) -> dict[str, tuple[str, int]]:
+    """Branch name (without prefix) -> (sha, committer unix time) for refs under `prefixes`; the newest tip wins."""
+    fmt = "%(refname)%00%(objectname)%00%(committerdate:unix)"
+    tips: dict[str, tuple[str, int]] = {}
+    for prefix in prefixes:
+        for line in out(repo, "for-each-ref", f"--format={fmt}", prefix).splitlines():
+            ref, obj, ts = line.split("\0")
+            name, when = ref[len(prefix):], int(ts or 0)
+            if name not in tips or when > tips[name][1]:
+                tips[name] = (obj, when)
+    return tips
+
+
+def fetch_branches(url: str, prefix: str, cache_dir: Path) -> dict[str, tuple[str, int]]:
+    """Tips of the remote's `refs/heads/<prefix>*` branches, shallow-fetched into the shared bare cache."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    bare = cache_dir / (hashlib.sha1(normalize_repo(url).encode()).hexdigest()[:16] + ".git")
+    mirror = f"refs/orch-branches/{prefix}"
+    with _locked(bare.with_suffix(".lock")):
+        if not bare.exists():
+            subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True, capture_output=True, env=git_env())
+        for stale in (bare / "shallow.lock", bare / "packed-refs.lock", bare / "config.lock", *bare.glob("refs/**/*.lock")):
+            stale.unlink(missing_ok=True)
+        git(bare, "fetch", "--depth=1", "--quiet", "--prune", url, f"+refs/heads/{prefix}*:{mirror}*",
+            env={"GIT_TERMINAL_PROMPT": "0"}, timeout=FETCH_TIMEOUT)
+        return branch_tips(bare, (mirror,))
+
+
 @contextmanager
 def _locked(path: Path):
     try:
