@@ -1,0 +1,35 @@
+{
+  "scanner": "path-standards",
+  "script": "scan-path-standards.py",
+  "version": "3.0.0",
+  "skill_path": "/workspaces/bmad-orchestrator/skills/orch-next",
+  "timestamp": "2026-09-26T10:25:44.230358+00:00",
+  "files_scanned": [
+    ".analysis/2026-09-26-1025/prepass-prompt-metrics.json",
+    ".analysis/2026-09-26-1025/prepass-workflow-integrity.json",
+    ".analysis/2026-09-26-1025/scan-path-standards.json",
+    "SKILL.md"
+  ],
+  "status": "pass",
+  "findings": [],
+  "assessments": {},
+  "summary": {
+    "total_findings": 0,
+    "by_severity": {
+      "critical": 0,
+      "high": 0,
+      "medium": 0,
+      "low": 0
+    },
+    "by_category": {
+      "double_prefix": 0,
+      "bare_bmad": 0,
+      "absolute_path": 0,
+      "relative_prefix": 0,
+      "cross_dir_dot_slash": 0,
+      "frontmatter": 0,
+      "structure": 0
+    },
+    "assessment": "Path standards scan complete"
+  }
+}

@@ -45,7 +45,7 @@ def _sync(repo: Path, remote: str | None, fetch: bool = True) -> str:
             git(repo, "fetch", "--quiet", "--prune", remote, f"+{PREFIX}*:{MIRROR}*",
                 env={"GIT_TERMINAL_PROMPT": "0"}, timeout=FETCH_TIMEOUT)
         except subprocess.TimeoutExpired:
-            raise OrchError(f"no answer from {remote} within {FETCH_TIMEOUT}s while fetching claims") from None
+            raise OrchError(f"no answer from {remote} within {FETCH_TIMEOUT}s while fetching claims", "remote-timeout") from None
     return MIRROR
 
 

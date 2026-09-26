@@ -88,7 +88,7 @@ def resolve(coord_root: Path, explicit_ref: str | None = None) -> tuple[Config, 
             ref, source = default_base(coord_root, DEFAULTS["orch_main_branch"]), "default branch name"
         except OrchError as exc:
             raise OrchError(f"cannot find the coordination main in {coord_root} (no origin/HEAD, origin/main or main); "
-                            "pass --coord-ref <ref of the coordination main>") from exc
+                            "pass --coord-ref <ref of the coordination main>", "coord-main-missing") from exc
     cfg = load(Tree(coord_root, ref))
     if cfg.main_branch not in (ref, ref.removeprefix("origin/")):
         try:
