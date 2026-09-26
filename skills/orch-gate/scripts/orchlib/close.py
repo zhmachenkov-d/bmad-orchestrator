@@ -137,18 +137,27 @@ def build_commit(repo: Path, base_ref: str, moves: list[dict], adds: dict[str, b
     return out(repo, "commit-tree", tree, "-p", sha(repo, base_ref), "-m", message, env=_identity(user))
 
 
-def publish(repo: Path, commit: str, branch: str, target: str | None) -> dict:
-    """Push `commit` as a new branch to `target` (a remote name or URL); a local branch when there is no target."""
-    ref = f"refs/heads/{branch}"
+def publish(repo: Path, commit: str, branch: str, target: str | None, need: list[str]) -> dict:
+    """Push `commit` as `branch` to `target` (a remote name or URL); a local branch when there is no target.
+
+    A branch left by an earlier run stays (`exists`, its PR is the one to merge) while it holds every path in
+    `need`. Otherwise it is moved to `commit` (`updated`), e.g. when a story merged after that branch did and
+    its marker still needs archiving; the lease keeps a concurrent push from being overwritten.
+    """
+    ref, env = f"refs/heads/{branch}", {"GIT_TERMINAL_PROMPT": "0"}
     if target is None:
-        if ref_exists(repo, ref):
-            return {"branch": branch, "status": "exists"}
-        git(repo, "update-ref", ref, commit, "")
-        return {"branch": branch, "status": "created-local"}
-    if out(repo, "ls-remote", target, ref, env={"GIT_TERMINAL_PROMPT": "0"}):
+        old = sha(repo, ref) if ref_exists(repo, ref) else None
+    else:
+        old = (out(repo, "ls-remote", target, ref, env=env).split() or [None])[0]
+        if old:
+            git(repo, "fetch", "--quiet", target, ref, env=env)
+    if old and all(out(repo, "ls-tree", "--name-only", old, "--", p) for p in need):
         return {"branch": branch, "status": "exists"}
-    git(repo, "push", "--quiet", target, f"{commit}:{ref}", env={"GIT_TERMINAL_PROMPT": "0"})
-    return {"branch": branch, "status": "pushed"}
+    if target is None:
+        git(repo, "update-ref", ref, commit, old or "")
+    else:
+        git(repo, "push", "--quiet", f"--force-with-lease={ref}:{old or ''}", target, f"{commit}:{ref}", env=env)
+    return {"branch": branch, "status": "updated" if old else ("created-local" if target is None else "pushed")}
 
 
 def execute(p: dict, coord_root: Path, coord: Tree, cfg: Config, merged_map: dict, stories, user: str,
@@ -164,7 +173,8 @@ def execute(p: dict, coord_root: Path, coord: Tree, cfg: Config, merged_map: dic
             repo = coord_root if local else tree.repo
             commit = build_commit(repo, tree.ref, r["moves"], {}, f"chore(orch): archive epic {epic} story markers", user)
             target = ("origin" if remote_url(coord_root) else None) if local else r["repo"]
-            results.append({"repo": r["repo"], "base": _base_branch(tree), **publish(repo, commit, r["branch"], target)})
+            results.append({"repo": r["repo"], "base": _base_branch(tree),
+                            **publish(repo, commit, r["branch"], target, [m["to"] for m in r["moves"]])})
     elif p["pass"] == "record":
         record = {"epic": epic, "closed_at": iso(time.time()), "closed_by": user,
                   "stories": {k: {"repo": merged_map[k]["repo"], "marker": merged_map[k]["path"]} for k in p["stories"]}}
@@ -177,7 +187,8 @@ def execute(p: dict, coord_root: Path, coord: Tree, cfg: Config, merged_map: dic
             adds[retro_path(cfg, epic)] = (json.dumps(retro_data(epic, stories, status, coord_root), indent=2) + "\n").encode()
         commit = build_commit(coord_root, coord.ref, [], adds, f"chore(orch): close epic {epic}", user)
         target = "origin" if remote_url(coord_root) else None
-        results.append({"repo": ".", "base": _base_branch(coord), **publish(coord_root, commit, p["branch"], target)})
+        results.append({"repo": ".", "base": _base_branch(coord),
+                        **publish(coord_root, commit, p["branch"], target, [record_path(cfg, epic)])})
     return results
 
 

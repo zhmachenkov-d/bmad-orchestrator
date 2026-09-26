@@ -13,7 +13,7 @@ import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import markers, registry, sprint_status, stories
+from . import OrchError, markers, registry, sprint_status, stories
 from .config import Config
 from .detectors import run as run_detector
 from .detectors import version as detector_version
@@ -423,7 +423,13 @@ def run(ctx: Context) -> dict:
                 checks["sprint-status"].warn(f.pop("code"), f.pop("message"), **f)
         newly_closed = closed - markers.closed_epics(mb_tree, ctx.cfg)
         for epic in sorted(newly_closed):
-            for p in markers.close_check(epic, ctx.stories, ctx.reg, mm, ctx.coord, unknown):
+            try:
+                problems = markers.close_check(epic, ctx.stories, ctx.reg, mm, ctx.coord, unknown)
+            except OrchError as exc:
+                checks["sprint-status"].fail("epic-close-unverifiable", f"epic {epic} close record added but the close check cannot run: {exc}",
+                                             hint="fetch full history in CI (fetch-depth: 0 / GIT_DEPTH: 0), then re-run the gate")
+                continue
+            for p in problems:
                 checks["sprint-status"].fail("epic-close-failed", f"epic {epic} close record added but close check fails: {p['message']}",
                                              hint="close epics through orch-status")
     else:

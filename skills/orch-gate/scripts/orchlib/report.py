@@ -100,7 +100,7 @@ table{{border-collapse:collapse;width:100%}} td,th{{border-bottom:1px solid var(
 .dag{{overflow-x:auto;border:1px solid var(--line);border-radius:8px;padding:8px}}
 svg{{color:var(--edge)}} .edge{{fill:none;stroke:var(--edge);stroke-width:1.2}} .edge.crit{{stroke:#ef6c00;stroke-width:3}}
 .critnode{{stroke:#ef6c00;stroke-width:3}} text.n{{fill:#fff;font-size:12px;font-weight:600}} text.s{{fill:#fff;font-size:11px;opacity:.85}}
-@media print{{body{{max-width:none}} .dag{{overflow:visible}} h2{{break-after:avoid}} tr{{break-inside:avoid}}}}
+@media print{{body{{max-width:none}} .dag{{overflow:visible}} .dag svg{{max-width:100%;height:auto}} h2{{break-after:avoid}} tr{{break-inside:avoid}}}}
 </style></head><body>
 <h1>{esc(project)} — epic {epic}</h1>
 <p class="muted">State: <b>{esc(e["state"])}</b> · {e["stories"]} stories · {esc(counts)} · generated {esc(status["now"])}</p>
@@ -121,12 +121,12 @@ def find_browser() -> str | None:
     return next((p for b in BROWSERS if (p := shutil.which(b))), None)
 
 
-def to_pdf(html_path: Path) -> tuple[Path | None, str | None]:
-    """Print the HTML with headless Chromium; (pdf path, None) or (None, why not)."""
+def to_pdf(html_path: Path, pdf: Path | None = None) -> tuple[Path | None, str | None]:
+    """Print the HTML with headless Chromium (to `pdf`, else beside it); (pdf path, None) or (None, why not)."""
     browser = find_browser()
     if not browser:
         return None, "no Chromium/Chrome found (set ORCH_CHROME to its binary); open the HTML and print it to PDF"
-    pdf = html_path.with_suffix(".pdf")
+    pdf = pdf or html_path.with_suffix(".pdf")
     argv = [browser, "--headless", "--disable-gpu", "--no-sandbox", "--no-pdf-header-footer",
             f"--print-to-pdf={pdf}", html_path.resolve().as_uri()]
     try:

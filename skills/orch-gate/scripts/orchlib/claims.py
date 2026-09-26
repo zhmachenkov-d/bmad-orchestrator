@@ -9,11 +9,12 @@ over the same claim cannot both win.
 from __future__ import annotations
 
 import json
+import subprocess
 import time
 from pathlib import Path
 
 from . import OrchError
-from .gitio import EMPTY_TREE, git, out
+from .gitio import EMPTY_TREE, FETCH_TIMEOUT, git, out
 
 PREFIX = "refs/heads/claim/"
 MIRROR = "refs/orch/claims/"
@@ -35,16 +36,22 @@ def _claim_commit(repo: Path, key: str, user: str, action: str, parent: str | No
     return out(repo, *args, env=_identity_env(user))
 
 
-def _sync(repo: Path, remote: str | None) -> str:
-    """Refresh the local mirror of remote claims; return the ref namespace to read."""
+def _sync(repo: Path, remote: str | None, fetch: bool = True) -> str:
+    """Refresh the local mirror of remote claims (unless `fetch` is off); return the ref namespace to read."""
     if not remote:
         return PREFIX
-    git(repo, "fetch", "--quiet", "--prune", remote, f"+{PREFIX}*:{MIRROR}*")
+    if fetch:
+        try:
+            git(repo, "fetch", "--quiet", "--prune", remote, f"+{PREFIX}*:{MIRROR}*",
+                env={"GIT_TERMINAL_PROMPT": "0"}, timeout=FETCH_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            raise OrchError(f"no answer from {remote} within {FETCH_TIMEOUT}s while fetching claims") from None
     return MIRROR
 
 
-def list_claims(repo: Path, remote: str | None = None, now: float | None = None) -> list[dict]:
-    ns = _sync(repo, remote)
+def list_claims(repo: Path, remote: str | None = None, now: float | None = None, fetch: bool = True) -> list[dict]:
+    """Claims on `remote` (local refs without one); with `fetch` off, as of the last fetch."""
+    ns = _sync(repo, remote, fetch)
     now = now if now is not None else time.time()
     fmt = "%(refname)%00%(objectname)%00%(committerdate:unix)%00%(contents)"
     raw = out(repo, "for-each-ref", f"--format={fmt}%01", ns)

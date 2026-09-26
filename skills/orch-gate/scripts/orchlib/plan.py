@@ -1,19 +1,22 @@
 """Plan validation before implementation starts: PASS / CONCERNS / FAIL over the epics and the registry.
 
-FAIL: story-structure issues (the same ones the gate enforces per PR), and a `narrow` contract story that does not
-depend on a story of every registry consumer of the contract it narrows. CONCERNS: a dependency between two
-subprojects that the registry `imports` do not connect, a `narrow` with no earlier `expand` story, and a `narrow` whose
-target exporter the plan leaves ambiguous.
+FAIL: registry and story-structure issues (the same ones the gate enforces per PR), and a `narrow` contract story that
+does not depend on a story of every registry consumer of the contract it narrows. CONCERNS: registry paths not found, a
+dependency between two subprojects that the registry `imports` do not connect, a `narrow` with no earlier `expand`
+story, and a `narrow` whose target exporter the plan leaves ambiguous.
 """
 
 from __future__ import annotations
 
-from .registry import CONTRACTS, Registry
+from .registry import CONTRACTS, EXISTENCE_ISSUES, Registry
 from .stories import StorySet
 
 
-def check(stories: StorySet, reg: Registry) -> dict:
-    findings = [{"severity": "fail", **i} for i in stories.issues]
+def check(stories: StorySet, reg: Registry, registry_issues: list[dict] = ()) -> dict:
+    """`registry_issues` (registry.validate) weigh as the gate weighs them: missing paths concern, the rest fail."""
+    findings = [{"severity": "concern" if i["code"] in EXISTENCE_ISSUES else "fail", "story": None, **i}
+                for i in registry_issues]
+    findings += [{"severity": "fail", **i} for i in stories.issues]
     order = list(stories)
     for s in stories.values():
         deps = [d for dep in s.depends_on if (d := stories.by_id(dep))]
@@ -56,7 +59,14 @@ def _narrow(s, deps, reg: Registry) -> list[dict]:
                  "message": f"story {s.id} covers every consumer of {', '.join(covered)} but not of other exporters its "
                             f"dependencies point at ({gaps}); if it narrows one of those, the gate will fail it"}]
     if not related:
-        missing = "; ".join(f"{n}: {', '.join(c)}" for n, c in sorted(candidates.items()) if c) or "none"
+        unconsumed = sorted(n for n, c in candidates.items() if not c)
+        if len(unconsumed) == len(candidates):
+            return []  # nobody imports these contracts: narrowing one migrates no one, and the gate accepts it
+        missing = "; ".join(f"{n}: {', '.join(c)}" for n, c in sorted(candidates.items()) if c)
+        if unconsumed:
+            return [{"severity": "concern", "code": "ambiguous-narrow-target", "story": s.id,
+                     "message": f"story {s.id} depends on no consumer's migration story: it passes the gate only if it "
+                                f"narrows a contract nobody imports ({', '.join(unconsumed)}), not one of {missing}"}]
         return [{"severity": "fail", "code": "narrow-without-migration", "story": s.id,
                  "message": f"story {s.id} narrows a contract but depends on no consumer's migration story "
                             f"(consumers per exporter: {missing})"}]
