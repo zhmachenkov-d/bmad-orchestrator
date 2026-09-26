@@ -118,6 +118,8 @@ def test_template_covers_failure_paths():
     # stale context from another story is never used: the key must match the branch
     assert "matches the branch key" in prepend and "does not match the branch key" in oc
     assert "`not-story-branch` or `story-not-found`" in prepend and "exits non-zero" in prepend
+    # CLI that cannot run (no JSON): a path/uv problem, never a --coord request
+    assert "orch CLI could not run" in prepend and "do not ask for `--coord`" in prepend
     # On Complete supersedes the context's own Finish section
     assert "supersede the context's own `## Finish` section" in fact and "`## Finish` section" in oc
     assert "stop without writing the marker" in oc and "within the context's `allowed_write`" in oc
