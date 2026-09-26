@@ -273,7 +273,8 @@ def test_epics_template_covers_the_orch_story_rules():
                    "`epic*.md`", "`epics-v1.md`", "`orch-setup`"):
         assert phrase in rules, phrase
     for phrase in ("Step 4", "before offering [C]", "plan-check --working-tree", "offer to fix the epics first",
-                   "`no-epics`", "`orch-setup`", "never a verdict", "never re-implement the checks"):
+                   "`no-epics`", "`orch-setup`", "never a verdict", "never re-implement the checks",
+                   "`snapshot_skipped`", "`snapshot-incomplete`"):
         assert phrase in check, phrase
 
 
@@ -287,7 +288,8 @@ def test_sprint_template_covers_the_readiness_rule():
                    "Headless runs put these findings in `findings`",
                    "`orch-setup`", "`no-epics`", "`epic*.md`",
                    "not independently completable", "orphan", "plan-check owns",
-                   "never a verdict", "orch check as not run", "at least CONCERNS", "never re-implement the checks"):
+                   "never a verdict", "orch check as not run", "at least CONCERNS", "never re-implement the checks",
+                   "`snapshot_skipped`", "`snapshot-incomplete`"):
         assert phrase in fact, phrase
 
 

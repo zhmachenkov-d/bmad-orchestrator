@@ -58,9 +58,17 @@ class Env:
         self.cache_root = gitio.cache_dir(self.repo)
         if self.working_tree:
             # Planning checks of uncommitted files: config, registry and epics all come from one working-tree snapshot.
-            self.coord_ref, self.coord_ref_source = gitio.worktree_tree(self.coord_root), "working tree"
+            self.coord_ref, self.snapshot_skipped = gitio.worktree_tree(self.coord_root)
+            self.coord_ref_source = "working tree"
             self.coord = gitio.Tree(self.coord_root, self.coord_ref)
             self.cfg = config.load(self.coord)
+            # A verdict over missing or stale planning input misleads; a skip elsewhere (a nested repo) only warns.
+            inputs = ["_bmad", self.cfg.planning_artifacts, self.cfg.registry_dir]
+            if bad := [p for p in self.snapshot_skipped
+                       if any(p == d or p.startswith(d + "/") or d.startswith(p + "/") for d in inputs)]:
+                raise OrchError(f"the working-tree snapshot could not read planning input: {', '.join(bad)}; "
+                                "fix its permissions (or commit a nested repo), then re-run", "snapshot-incomplete",
+                                paths=bad)
             return
         # Config, registry and epics are read at one trusted ref; in a monorepo that is the gate's --base.
         explicit = args.coord_ref or (getattr(args, "base", None) if self.same else None)
@@ -276,8 +284,9 @@ def cmd_plan_check(args, env: Env):
     reg = env.registry()
     issues = registry.validate(reg, env.coord, env.cfg)
     res = plan.check(env.stories(reg), reg, issues)
-    read_from = "working-tree" if env.working_tree else "ref"
-    return emit({"ok": res["verdict"] != "FAIL", "read_from": read_from, "coord_ref": env.coord_ref,
+    read_from = {"read_from": "working-tree", "snapshot_skipped": env.snapshot_skipped} if env.working_tree \
+        else {"read_from": "ref"}
+    return emit({"ok": res["verdict"] != "FAIL", **read_from, "coord_ref": env.coord_ref,
                  "registry_issues": issues, **res},
                 1 if res["verdict"] == "FAIL" else 0)
 

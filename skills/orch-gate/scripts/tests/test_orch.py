@@ -1110,6 +1110,21 @@ def test_plan_check_working_tree_skips_a_nested_repo_with_no_commits(mono):
     mono.write("scratch/notes.txt", "x\n")
     code, res = run_cli("plan-check", "--working-tree", "--repo", str(mono.path))
     assert code == 0 and res["verdict"] == "PASS" and res["read_from"] == "working-tree", res
+    assert res["snapshot_skipped"] == ["scratch"], res  # outside planning input: a warning, not an error
+
+
+@pytest.mark.skipif(os.name != "posix" or os.geteuid() == 0, reason="needs an unreadable file (not root)")
+def test_plan_check_working_tree_refuses_unreadable_planning_input(mono):
+    """An epics file git cannot read would leave the snapshot without it (or stale): no verdict, an error."""
+    extra = mono.path / "_bmad-output/planning-artifacts/epics-2.md"
+    extra.write_text("## Epic 2: Later\n", encoding="utf-8")
+    extra.chmod(0)
+    try:
+        code, res = run_cli("plan-check", "--working-tree", "--repo", str(mono.path))
+    finally:
+        extra.chmod(0o644)
+    assert code == 2 and res["code"] == "snapshot-incomplete", res
+    assert res["paths"] == ["_bmad-output/planning-artifacts/epics-2.md"], res
 
 
 def test_plan_check_working_tree_reads_config_from_the_working_tree(mono):

@@ -110,8 +110,12 @@ def dirty_paths(repo: Path, ignore_prefix: str = "") -> list[str]:
     return paths
 
 
-def worktree_tree(repo: Path) -> str:
-    """Tree id of `repo`'s working tree: tracked and untracked files, `.gitignore` respected.
+SKIPPED_RE = re.compile(r"unable to index file '(.+)'|'(.+?)/?' does not have a commit checked out")
+
+
+def worktree_tree(repo: Path) -> tuple[str, list[str]]:
+    """Tree id of `repo`'s working tree (tracked and untracked files, `.gitignore` respected), and the paths git
+    could not add (an unreadable file, a nested repo with no commit), which the snapshot lacks or holds stale.
 
     Built in a throwaway index seeded from a copy of the real one (for its stat cache), or empty when the repo has
     none yet, so the real index and HEAD are never touched. The id works as a `Tree` ref. Planning checks only: the
@@ -127,10 +131,11 @@ def worktree_tree(repo: Path) -> str:
             git(repo, "read-tree", "--empty", env=env)
         # --ignore-errors: an unreadable path (e.g. a nested repo with no commit) is skipped, not fatal (rc 1)
         proc = git(repo, "add", "-A", "--ignore-errors", env=env, check=False)
-        if proc.returncode not in (0, 1):
-            raise OrchError(f"git add -A failed in {repo} while snapshotting the working tree: "
-                            f"{proc.stderr.decode(errors='replace').strip()}")
-        return out(repo, "write-tree", env=env)
+        stderr = proc.stderr.decode(errors="replace").strip()
+        skipped = sorted({m.group(1) or m.group(2) for m in SKIPPED_RE.finditer(stderr)})
+        if proc.returncode not in (0, 1) or (proc.returncode == 1 and not skipped):
+            raise OrchError(f"git add -A failed in {repo} while snapshotting the working tree: {stderr}")
+        return out(repo, "write-tree", env=env), skipped
 
 
 def is_ancestor(repo: Path, a: str, b: str) -> bool:
