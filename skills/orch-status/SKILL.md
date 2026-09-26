@@ -17,10 +17,10 @@ An epic becomes `done` only through the close check: every story merged, every m
 
 ## Status (default)
 
-Run `orch.py status` (add `--epic N` when the user names one). Render a compact table per epic: story, subproject, state, claimant, idle time, blocked-by, and an arrow on the `critical` stories. Then list `anomalies`, most actionable first, and `unread_repos` and `notices` as caveats. Offer the actions each anomaly carries.
+Run `orch.py status` (add `--epic N` when the user names one). Render a compact table per epic: story, subproject, state, claimant, idle time, blocked-by, and an arrow on the `critical` stories. List `closed` epics on one line instead of a table. Then list `anomalies`, most actionable first, and `unread_repos` and `notices` as caveats. Non-empty `plan_issues` are stories the epics do not define cleanly: show them and offer Plan validation. Offer the actions each anomaly carries.
 
 - `actions[].args` are `orch.py` arguments. Run them as `orch.py <args>` plus the same `--coord` you used. Take over and release change a shared claim ref, so confirm first. A `claim-changed` or `lost-race` result means someone else moved first. Show the new holder. Do not retry. After a take over, the new holder continues the work from `origin/story/<N-M>` in a worktree of the story's repo, with `bmad-build`.
-- A `pin-drift` with `migration_draft` needs a new story of that subproject: offer its `markdown`, and suggest a better title if one fits. The user adds it to the epics, because the plan is theirs; then run `plan-check`, and `status` once it passes. Without a draft, reason `unrecorded-change` means main's canonical changed outside a contract story, and a contract story's own drift is also the contract owner's call. Name the contract and its owner; no new story here converges it.
+- A `pin-drift` with `migration_draft` needs a new story of that subproject: offer its `markdown` once (one draft covers every drifting contract of the subproject), placed last in epic `epic`, and suggest a better title if one fits. The user adds it to the epics, because the plan is theirs; then run `plan-check`, and `status` once it passes. Without a draft, no new story converges the drift: name the contract and its owner.
 - `sprint-status-lag` → rebuild (below).
 - An epic in state `closable` or `archive-needed` → offer Close epic. `drift` means close is blocked until the drift stories land.
 
@@ -32,7 +32,7 @@ Closing takes two passes, and each one is a PR the gate checks. Without an epic 
 - `record`: the archive PRs are merged. Branch `orch/close-epic-N-record` in the coordination repo adds the close record, sprint status with `epic-N: done`, and the retro data file `{implementation_artifacts}/orch/reports/orch-epic-N.json`.
 - `blocked`: show the `problems`. `closed`: nothing to do.
 
-Show the plan, and after the user confirms, re-run with `--push --expect-pass <pass>`. A `pass-changed` result means the state moved since the user confirmed: show the new plan instead. For each `published` entry with status `pushed`, open a PR from its `branch` into its `base`: `gh pr create` for GitHub, `glab mr create` for GitLab, with a Conventional Commits title such as `chore(orch): archive epic N markers`. Without those tools, give the branch names. `created-local` means there is no remote, so the user merges it locally. `exists` means an earlier run pushed it already, so its PR is waiting for review. After the archive pass, tell the user to merge those PRs and then ask to close epic N again. After the record PR merges, offer `bmad-retrospective` and point it at the retro data file.
+Show the plan, and after the user confirms, re-run with `--push --expect-pass <pass>`. A `pass-changed` result means the state moved since the user confirmed: show the new plan instead. For each `published` entry with status `pushed`, open a PR in its `repo` from its `branch` into its `base`: `gh pr create --repo` for GitHub, `glab mr create --repo` for GitLab, with a Conventional Commits title such as `chore(orch): archive epic N markers`. Without those tools, give the branch names. `created-local` means there is no remote, so the user merges it locally. `exists` means an earlier run pushed the branch: open its PR if none is open. After the archive pass, tell the user to merge those PRs and then ask to close epic N again. After the record PR merges, offer `bmad-retrospective` and point it at the retro data file.
 
 ## Plan validation
 
@@ -40,11 +40,11 @@ Run `orch.py plan-check`. It returns PASS, CONCERNS or FAIL with coded findings.
 
 ## Rebuild sprint status
 
-Run `orch.py sprint-status derive`, show the `changes`, and after the user confirms, run it again with `--write`. It refuses while registry repos are unread, since it would demote stories it cannot see. Commit the result through a PR.
+Run `orch.py sprint-status derive`, show the `changes`, and after the user confirms, run it again with `--write`. It refuses while registry repos are unread, since it would demote stories it cannot see. Commit it on a branch such as `orch/sprint-status-rebuild`, never on main, and open a PR as in Close epic, titled `chore(orch): rebuild sprint status`.
 
 ## Epic report
 
-Run `orch.py report --epic N`, adding `--pdf` when the user asks for PDF. The report is a self-contained HTML file under `{implementation_artifacts}/orch/reports/`. Give the path. When `pdf_error` is set, relay it; the HTML still prints to PDF from any browser.
+Without an epic number, offer the epics from `status`, open ones first. Run `orch.py report --epic N`, adding `--pdf` when the user asks for PDF. The report is a self-contained HTML file under `{implementation_artifacts}/orch/reports/`. Give the path. When `pdf_error` is set, relay it; the HTML still prints to PDF from any browser.
 
 ## Headless
 
