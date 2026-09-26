@@ -1,0 +1,1226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Skill Analysis Report</title>
+<style>
+  :root {
+    --bg: #0f1b2d;
+    --panel: #16263d;
+    --panel-2: #1d3250;
+    --ink: #e9eef6;
+    --ink-dim: #9fb0c7;
+    --line: #294366;
+    --accent: #b66d46;
+    --accent-ink: #f4d9c8;
+    --critical: #e05656;
+    --high: #e0904a;
+    --medium: #d8c24a;
+    --low: #5aa0d0;
+    --ok: #4caf72;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 28px 20px 80px; }
+  header h1 { font-size: 22px; margin: 0 0 4px; }
+  header .meta { color: var(--ink-dim); font-size: 13px; }
+  header .meta b { color: var(--ink); font-weight: 600; }
+
+  .banner {
+    display: none;
+    background: #3a1414;
+    border: 1px solid var(--critical);
+    color: #ffd9d9;
+    padding: 14px 16px;
+    border-radius: 8px;
+    margin: 16px 0;
+    white-space: pre-wrap;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 13px;
+  }
+  .banner.show { display: block; }
+
+  .overview {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 18px;
+    margin: 18px 0;
+  }
+  .grade {
+    font-size: 34px;
+    font-weight: 800;
+    margin: 0 0 8px;
+    text-transform: capitalize;
+  }
+  .grade.g-excellent { color: var(--ok); }
+  .grade.g-good { color: var(--low); }
+  .grade.g-fair { color: var(--medium); }
+  .grade.g-poor { color: var(--critical); }
+  .verdict { font-size: 16px; font-weight: 600; margin: 0 0 14px; }
+  .summary { color: var(--ink-dim); margin: 0 0 14px; }
+  .counts { display: flex; flex-wrap: wrap; gap: 10px; }
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px;
+    border-radius: 999px;
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    font-size: 13px;
+  }
+  .pill .dot { width: 10px; height: 10px; border-radius: 50%; }
+  .pill .n { font-weight: 700; }
+  .dot.critical { background: var(--critical); }
+  .dot.high { background: var(--high); }
+  .dot.medium { background: var(--medium); }
+  .dot.low { background: var(--low); }
+
+  /* Generic synthesis/agent-block panel */
+  .block {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 18px;
+    margin: 18px 0;
+  }
+  .block > h2 {
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--ink-dim);
+    margin: 0 0 12px;
+  }
+  .block .mono, .block code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 13px;
+    background: var(--panel-2);
+    padding: 1px 5px;
+    border-radius: 4px;
+  }
+  .kv { margin: 0; display: grid; grid-template-columns: 150px 1fr; gap: 6px 14px; }
+  .kv dt { color: var(--ink-dim); font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
+  .kv dd { margin: 0; }
+
+  /* Themes */
+  .theme { padding: 12px 0; border-top: 1px solid var(--line); }
+  .theme:first-of-type { border-top: none; padding-top: 0; }
+  .theme .t-head { display: flex; align-items: center; gap: 10px; }
+  .theme .t-title { font-weight: 600; flex: 1 1 auto; min-width: 0; }
+  .theme .t-cause { color: var(--ink-dim); margin-top: 4px; }
+  .theme .t-action { margin-top: 4px; }
+  .theme .t-findings { margin-top: 8px; padding-left: 12px; border-left: 2px solid var(--line); }
+  .theme .t-finding { font-size: 13px; color: var(--ink-dim); padding: 2px 0; }
+
+  /* Strengths */
+  .strength-list { margin: 0; padding-left: 20px; }
+  .strength-list li { padding: 2px 0; }
+
+  /* Recommendations */
+  .rec { padding: 8px 0; border-top: 1px solid var(--line); }
+  .rec:first-of-type { border-top: none; padding-top: 0; }
+  .rec .rank { font-weight: 700; color: var(--accent-ink); margin-right: 8px; }
+  .rec .resolves { color: var(--ink-dim); font-size: 12px; margin-left: 8px; }
+
+  /* Experience journeys */
+  .block .journey { padding: 8px 0; border-top: 1px solid var(--line); }
+  .block .journey:first-of-type { border-top: none; padding-top: 0; }
+  .block .journey .j-name { font-weight: 600; }
+  .block .journey .j-steps { color: var(--ink-dim); margin-top: 2px; }
+
+  .toolbar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin: 18px 0 10px;
+    flex-wrap: wrap;
+  }
+  .toolbar .sel-count { color: var(--ink-dim); font-size: 13px; }
+  button {
+    font: inherit;
+    cursor: pointer;
+    border-radius: 8px;
+    border: 1px solid var(--line);
+    background: var(--panel-2);
+    color: var(--ink);
+    padding: 8px 14px;
+  }
+  button.primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #1a0e07;
+    font-weight: 600;
+  }
+  button:disabled { opacity: 0.5; cursor: default; }
+  button.link {
+    background: none;
+    border: none;
+    color: var(--accent-ink);
+    padding: 4px 6px;
+    font-size: 13px;
+  }
+  button.small { padding: 5px 10px; font-size: 13px; flex: 0 0 auto; }
+
+  .no-findings {
+    background: var(--panel);
+    border: 1px dashed var(--line);
+    border-radius: 10px;
+    padding: 28px;
+    text-align: center;
+    color: var(--ink-dim);
+  }
+  .no-findings .big { font-size: 18px; color: var(--ok); margin-bottom: 6px; }
+
+  .group { margin: 18px 0; }
+  .group > h2 {
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--ink-dim);
+    margin: 0 0 8px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .finding {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-left: 4px solid var(--line);
+    border-radius: 8px;
+    margin: 8px 0;
+    overflow: hidden;
+  }
+  .finding.sev-critical { border-left-color: var(--critical); }
+  .finding.sev-high { border-left-color: var(--high); }
+  .finding.sev-medium { border-left-color: var(--medium); }
+  .finding.sev-low { border-left-color: var(--low); }
+
+  .finding .row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 14px;
+  }
+  .finding .row .chk { width: 16px; height: 16px; flex: 0 0 auto; cursor: pointer; }
+  .finding .row .head { flex: 1 1 auto; cursor: pointer; min-width: 0; }
+  .finding .row .title { font-weight: 600; }
+  .finding .row .sub { color: var(--ink-dim); font-size: 12px; margin-top: 2px; }
+  .finding .tag {
+    flex: 0 0 auto;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 3px 8px;
+    border-radius: 6px;
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    color: var(--ink-dim);
+  }
+  .finding .caret { flex: 0 0 auto; color: var(--ink-dim); transition: transform 0.15s; cursor: pointer; }
+  .finding.open .caret { transform: rotate(90deg); }
+
+  .finding .body {
+    display: none;
+    padding: 0 14px 14px 42px;
+    border-top: 1px solid var(--line);
+  }
+  .finding.open .body { display: block; }
+  .finding .body dl { margin: 12px 0 0; display: grid; grid-template-columns: 130px 1fr; gap: 6px 14px; }
+  .finding .body dt { color: var(--ink-dim); font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
+  .finding .body dd { margin: 0; }
+  .finding .body code, .finding .body .mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 13px;
+    background: var(--panel-2);
+    padding: 1px 5px;
+    border-radius: 4px;
+  }
+
+  .toast {
+    position: fixed;
+    left: 50%;
+    bottom: 28px;
+    transform: translateX(-50%);
+    background: var(--ok);
+    color: #06160c;
+    padding: 10px 18px;
+    border-radius: 8px;
+    font-weight: 600;
+    opacity: 0;
+    transition: opacity 0.2s;
+    pointer-events: none;
+  }
+  .toast.show { opacity: 1; }
+
+  .fallback-area { margin-top: 12px; display: none; }
+  .fallback-area.show { display: block; }
+  .fallback-area textarea {
+    width: 100%;
+    min-height: 160px;
+    background: var(--panel-2);
+    color: var(--ink);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 10px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 13px;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Skill Analysis Report</h1>
+    <div class="meta">
+      <span>Subject: <b id="m-subject">—</b></span> &nbsp;·&nbsp;
+      <span>Generated: <b id="m-generated">—</b></span> &nbsp;·&nbsp;
+      <span>Schema: <b id="m-schema">—</b></span>
+    </div>
+  </header>
+
+  <div id="parse-banner" class="banner"></div>
+
+  <section id="overview" class="overview" hidden>
+    <div id="grade" class="grade" hidden></div>
+    <p id="verdict" class="verdict"></p>
+    <p id="summary-text" class="summary" hidden></p>
+    <div id="counts" class="counts"></div>
+  </section>
+
+  <!-- Synthesis layer (themes, strengths, recommendations). Hidden when absent. -->
+  <section id="themes" class="block" hidden></section>
+  <section id="strengths" class="block" hidden></section>
+  <section id="recommendations" class="block" hidden></section>
+
+  <!-- Experience: journeys plus headless (experience). Hidden when absent. -->
+  <section id="experience" class="block" hidden></section>
+
+  <div id="toolbar" class="toolbar" hidden>
+    <button id="btn-copy" class="primary" disabled>Copy selected as paste-back prompt</button>
+    <span id="sel-count" class="sel-count">0 selected</span>
+    <button id="btn-select-all" class="link">Select all</button>
+    <button id="btn-clear" class="link">Clear</button>
+    <button id="btn-expand-all" class="link">Expand all</button>
+    <button id="btn-collapse-all" class="link">Collapse all</button>
+  </div>
+
+  <div id="fallback" class="fallback-area">
+    <p class="sel-count">Clipboard was unavailable. Copy the text below manually:</p>
+    <textarea id="fallback-text" readonly></textarea>
+  </div>
+
+  <div id="findings-root"></div>
+</div>
+
+<div id="toast" class="toast">Copied</div>
+
+<!-- scripts/render_report.py replaces the contents of this island per run.
+     The placeholder below is intentionally unusable: the shell refuses to
+     render it, so a failed injection can never look like real findings. -->
+<script type="application/json" id="report-data">
+{
+  "schema_version": 2,
+  "subject": "/workspaces/bmad-orchestrator/skills/orch-status",
+  "generated": "2026-09-26",
+  "verdict": "Fair: the skill is a lean, well-wired layer over the library, but two library bugs write or report wrong shared state: pin convergence assumes merge order equals plan order (determinism-1), and the close record pass ignores unread repos (determinism-2).",
+  "grade": "fair",
+  "summary": "orch-status is lean (1426 tokens), declines customization cleanly, and never derives state itself: every fact comes from orch.py JSON, and close runs as plan, confirm, push through gated PRs. The main opportunity is in the library: make close and drift independent of merge order and of partial reads, and stop heuristics from failing open. Beyond that, a handful of one-line SKILL.md fixes tighten the contract with the library and the handoffs between sessions.",
+  "standards": {
+    "canon": "/workspaces/bmad-orchestrator/.claude/skills/bmad-workflow-builder/references/prompt-quality-canon.md",
+    "principles": "/workspaces/bmad-orchestrator/.claude/skills/bmad-workflow-builder/references/skill-quality-principles.md",
+    "scripts": "/workspaces/bmad-orchestrator/.claude/skills/bmad-workflow-builder/references/script-standards.md"
+  },
+  "themes": [
+    {
+      "title": "Library results depend on merge order and partial reads",
+      "root_cause": "status/close treat plan order as merge order and treat an unread repo or unread branches as if they were absent, so close can deadlock, sprint status can be demoted, and take-over can be offered on active work. Results also shift with the clone or the --epic filter.",
+      "finding_ids": [
+        "determinism-1",
+        "determinism-2",
+        "determinism-3",
+        "determinism-7",
+        "determinism-9",
+        "determinism-10"
+      ],
+      "action": "Order the pin chain and the latest pinner by merge order on main. Block the record pass (or keep unknown keys) while repos are unread. Mark claim-only activity and do not offer take-over there. Read only origin story refs, compute over all stories before filtering, and validate --epic."
+    },
+    {
+      "title": "Heuristics that fail open or hand the prompt unusable output",
+      "root_cause": "Where the script cannot know something (which exporter a narrow breaks, whether a migration story can converge, which review host a repo uses, which contract stories were real bottlenecks), it guesses permissively or labels data too broadly, and the prompt acts on the guess.",
+      "finding_ids": [
+        "determinism-4",
+        "determinism-5",
+        "determinism-6",
+        "determinism-8",
+        "determinism-11"
+      ],
+      "action": "Fail closed or say 'ambiguous' (plan-check narrow target). Emit migration_draft only when it can converge, together with next_id and the rendered block. Paginate review lists and add notices on truncation. Label the retro fields for what they are."
+    },
+    {
+      "title": "SKILL.md and the library disagree on a few contracts",
+      "root_cause": "The skill describes some script outputs differently from what the script does: exit 1, the sprint-status-lag action args, the pdf_error text, and the re-planned --push result.",
+      "finding_ids": [
+        "architecture-1",
+        "architecture-2",
+        "architecture-4",
+        "leanness-1"
+      ],
+      "action": "Document exit 1 as a negative result, return derive without --write from the lag anomaly, relay pdf_error verbatim, and have the --push run check that the pass matches the confirmed plan."
+    },
+    {
+      "title": "Handoffs across sessions and skills are unstated",
+      "root_cause": "The flows span days and skills (close pass 1 then pass 2, take over then orch-next, drift draft then plan-check), but the skill ends each step without naming the next one.",
+      "finding_ids": [
+        "enhancement-1",
+        "enhancement-2",
+        "enhancement-4",
+        "enhancement-5"
+      ],
+      "action": "Add one line per handoff: come back after the archive PRs merge; continue a taken-over story with orch-next; run plan-check after pasting the draft; offer candidate epics or point to orch-setup."
+    },
+    {
+      "title": "Headless scope is narrower than it safely could be",
+      "root_cause": "Headless allows file-writing rebuild but leaves out the read-only status and plan-check.",
+      "finding_ids": [
+        "architecture-3",
+        "enhancement-3"
+      ],
+      "action": "Allow status and plan-check under -H, take the action from the invocation, and print error JSON when it is ambiguous."
+    }
+  ],
+  "strengths": [
+    "Script-first: SKILL.md never infers state, and unread repos surface as unknown, never as not merged",
+    "Close epic is plan, confirm, push, split into two passes the gate checks, with plumbing commits that work in the polyrepo fetch cache",
+    "Actions carry exact orch.py args and claim leases (--expect), so take over and release are race-safe",
+    "No customization surface; thresholds come from module config as in orch-gate",
+    "Lean SKILL.md (1426 tokens) with gotchas the model could not infer"
+  ],
+  "recommendations": [
+    {
+      "rank": 1,
+      "action": "Fix the two high library bugs: pin chain and latest pinner in merge order on main, and no record pass (or unknown keys kept) while repos are unread, each with a regression test",
+      "resolves": [
+        "determinism-1",
+        "determinism-2"
+      ]
+    },
+    {
+      "rank": 2,
+      "action": "Tighten the SKILL.md/library contract: document exit 1, lag action without --write, relay pdf_error, verify the pass on --push, define {skill-root}",
+      "resolves": [
+        "architecture-1",
+        "architecture-2",
+        "architecture-4",
+        "architecture-5",
+        "leanness-1"
+      ]
+    },
+    {
+      "rank": 3,
+      "action": "Close the fail-open gaps in status and plan-check: claim-only activity, ambiguous narrow target, converging-only migration drafts with next_id, origin-only story refs, compute before filtering, validate --epic",
+      "resolves": [
+        "determinism-3",
+        "determinism-4",
+        "determinism-5",
+        "determinism-6",
+        "determinism-7",
+        "determinism-9",
+        "determinism-10"
+      ]
+    },
+    {
+      "rank": 4,
+      "action": "Add the handoff lines and widen headless to status/plan-check",
+      "resolves": [
+        "enhancement-1",
+        "enhancement-2",
+        "enhancement-3",
+        "enhancement-4",
+        "enhancement-5",
+        "architecture-3"
+      ]
+    },
+    {
+      "rank": 5,
+      "action": "Small cleanups: review-host pagination and notices, retro field naming, the two meta sentences and the redundant notice clause",
+      "resolves": [
+        "determinism-8",
+        "determinism-11",
+        "leanness-2",
+        "leanness-3"
+      ]
+    }
+  ],
+  "experience": {
+    "journeys": [
+      {
+        "name": "Delivery lead checks progress",
+        "steps": "Says 'orch status' → table per epic with critical path → anomalies with actions and caveats for unread repos; on a non-orch project, exit 2 without a pointer to orch-setup (gap)"
+      },
+      {
+        "name": "Take over a stale claim",
+        "steps": "stale-claim anomaly → confirm → claim take-over with --expect lease → lost race shows the new holder; after success no next step toward a worktree (gap)"
+      },
+      {
+        "name": "Close an epic over several days",
+        "steps": "closable → plan (archive) → confirm → --push, PRs per repo → no reminder to return after the merges (gap) → re-run gives record → record PR → offer bmad-retrospective with orch-epic-N.json"
+      },
+      {
+        "name": "Pin drift",
+        "steps": "pin-drift with migration_draft → story block for the epics → no plan-check afterwards (gap); a draft is also offered where it cannot converge (determinism-5)"
+      }
+    ],
+    "headless": "Rebuild and report already work headless with pure JSON output; status and plan-check are read-only and could join; take over, release and close stay interactive by design."
+  },
+  "findings": [
+    {
+      "id": "leanness-1",
+      "severity": "medium",
+      "title": "pdf_error line restates the script message and misstates it on browser failure",
+      "location": "SKILL.md: Epic report",
+      "evidence": "SKILL.md hard-codes 'no Chromium or Chrome was found'. report.to_pdf already returns that guidance when no browser exists, and returns '<browser> failed' or '<browser> exited N' when one exists but fails. The hard-coded wording is wrong in those cases.",
+      "recommendation": "Replace with: 'When pdf_error is set, relay it; the HTML still prints to PDF from any browser.'",
+      "lens": "leanness"
+    },
+    {
+      "id": "leanness-2",
+      "severity": "low",
+      "title": "Meta-explanation sentences that change none of the model's moves",
+      "location": "SKILL.md: Plan validation, Rebuild sprint status (last sentences)",
+      "evidence": "'The bmad-sprint-planning readiness check calls this too.' and 'The merge driver uses the same derivation, so it never needs a hand fix.' describe the system to itself.",
+      "recommendation": "Delete the first. Shorten the second to the instruction alone, or delete it.",
+      "lens": "leanness"
+    },
+    {
+      "id": "leanness-3",
+      "severity": "low",
+      "title": "Gotcha restates a notice the script already emits",
+      "location": "SKILL.md: Gotchas, bullet 2",
+      "evidence": "'...and a notice says so' repeats the review-host-unavailable notice that is already shown as a caveat.",
+      "recommendation": "Shorten to: review waits come from open gh/glab PRs whose head is story/<N-M>; without either tool they fall back to branch idle time.",
+      "lens": "leanness"
+    },
+    {
+      "id": "architecture-1",
+      "severity": "medium",
+      "title": "sprint-status-lag action writes without the preview and confirmation the Rebuild section requires",
+      "location": "SKILL.md: Status; orchlib/status.py sprint-status-lag",
+      "evidence": "The anomaly action args are ['sprint-status','derive','--write']. The generic 'run the action' rule would write the file without showing the changes, which contradicts Rebuild's derive, show, confirm, write sequence.",
+      "recommendation": "Have status.py return derive without --write, or route the anomaly to the Rebuild flow explicitly.",
+      "lens": "architecture"
+    },
+    {
+      "id": "architecture-2",
+      "severity": "medium",
+      "title": "Exit code 1 is undocumented, yet plan-check, close and claim actions return results through it",
+      "location": "SKILL.md: Resolution rules",
+      "evidence": "Only exit 2 is described. orch.py exits 1 on plan-check FAIL, a blocked close, close-check problems, and a claim lost-race or claim-changed. All of these are results the skill must render.",
+      "recommendation": "Add: exit 1 is a negative result (FAIL, blocked, lost race); render its JSON as usual.",
+      "lens": "architecture"
+    },
+    {
+      "id": "architecture-3",
+      "severity": "low",
+      "title": "Headless mode leaves out plan-check and gives no way to choose the action",
+      "location": "SKILL.md: Headless",
+      "evidence": "-H allows rebuild and report but not read-only plan-check, and does not say how the action is chosen.",
+      "recommendation": "Allow plan-check (and status) under -H. The action comes from the invocation; an ambiguous request prints error JSON.",
+      "lens": "architecture"
+    },
+    {
+      "id": "architecture-4",
+      "severity": "low",
+      "title": "The --push re-run re-plans without checking that the pass is the one the user confirmed",
+      "location": "SKILL.md: Close epic; orch.py cmd_epic",
+      "evidence": "close.plan runs again on --push. If state changed in between, a different pass or repo list could be pushed than the one approved.",
+      "recommendation": "After --push, compare pass/repos with the confirmed plan and show any difference before opening PRs, or pass the expected pass to the script.",
+      "lens": "architecture"
+    },
+    {
+      "id": "architecture-5",
+      "severity": "low",
+      "title": "The {skill-root} token is used but never defined",
+      "location": "SKILL.md: Resolution rules",
+      "evidence": "orch.py resolves via {skill-root}/../orch-gate but the token has no definition.",
+      "recommendation": "Define {skill-root} as this skill's installed directory.",
+      "lens": "architecture"
+    },
+    {
+      "id": "determinism-1",
+      "severity": "high",
+      "title": "Pin chain and latest pinner assume merge order equals plan order, so an epic can be stuck in drift for good",
+      "location": "orch-gate/scripts/orchlib/markers.py: PinIndex, pin_drift",
+      "evidence": "When two contract stories on one canonical merge in reverse plan order (the later one rebased), versions[-1] != main. Reproduced: both stories and a consumer get 'unrecorded-change', so close stays blocked.",
+      "recommendation": "Order the chain and the latest pinner by merge order on main (the commit that added each marker), or at least accept current when any chain entry equals it. Add a reverse-merge test.",
+      "lens": "determinism"
+    },
+    {
+      "id": "determinism-2",
+      "severity": "high",
+      "title": "Close record pass rewrites sprint status while other repos are unread, demoting their done stories",
+      "location": "orch-gate/scripts/orchlib/close.py: plan/execute",
+      "evidence": "plan() blocks only on the epic's own unmerged or unknown stories. execute() runs derive with a partial merged_map, which demotes done stories of unread repos to review. cmd_sprint_status refuses in the same situation.",
+      "recommendation": "Block the record pass while any repo is unread, or make derive leave unknown keys untouched. Add a polyrepo test.",
+      "lens": "determinism"
+    },
+    {
+      "id": "determinism-3",
+      "severity": "medium",
+      "title": "stale-claim offers take-over when story branches could not be read",
+      "location": "orchlib/status.py: branch_activity, _story_anomalies",
+      "evidence": "A branches-unreadable repo leaves activity at claim time only, so an active claim is presented as stale with take-over actions.",
+      "recommendation": "Mark such rows activity_source=claim-only and skip stale-claim for them, or emit it without actions and say activity is unknown.",
+      "lens": "determinism"
+    },
+    {
+      "id": "determinism-4",
+      "severity": "medium",
+      "title": "plan-check guesses which exporter a narrow story breaks, and passes when any guess fits",
+      "location": "orchlib/plan.py: _narrow",
+      "evidence": "With exporters A{B,C} and D{B}, a narrow of A that depends only on B passes, because D's consumers are covered. The gate will later fail it.",
+      "recommendation": "Fail closed: require coverage of every related exporter, or emit CONCERNS ambiguous-narrow-target when more than one fits.",
+      "lens": "determinism"
+    },
+    {
+      "id": "determinism-5",
+      "severity": "medium",
+      "title": "migration_draft is offered even for drift that a 'Contract change: none' story cannot fix",
+      "location": "orchlib/status.py: pin-drift anomaly",
+      "evidence": "The draft is emitted for every drift, including unrecorded-change and drift of contracts stories, where a new story pins nothing and cannot converge.",
+      "recommendation": "Emit migration_draft only for reason not-migrated outside contracts. Otherwise emit a distinct code explained in SKILL.md.",
+      "lens": "determinism"
+    },
+    {
+      "id": "determinism-6",
+      "severity": "low",
+      "title": "Agent must work out the new story's N.M and title to render the migration draft",
+      "location": "SKILL.md pin-drift bullet; status.py migration_draft",
+      "evidence": "The draft has no id, so the model has to count the stories to pick a free N.M. A duplicate id becomes a FAIL.",
+      "recommendation": "The script emits next_id and the rendered markdown block; the prompt only suggests the title.",
+      "lens": "determinism"
+    },
+    {
+      "id": "determinism-7",
+      "severity": "low",
+      "title": "Branch activity reads clone-local refs, so idle times differ between clones",
+      "location": "orchlib/status.py: branch_activity; gitio.refresh",
+      "evidence": "For '.', local refs/heads/story/* count, and fetching without prune keeps deleted remote branches.",
+      "recommendation": "Read only refs/remotes/origin/story/* and prune story refs on refresh.",
+      "lens": "determinism"
+    },
+    {
+      "id": "determinism-8",
+      "severity": "low",
+      "title": "Review host chosen by hostname substring, and review lists silently truncated",
+      "location": "orchlib/status.py: _host_tool, _open_reviews",
+      "evidence": "Any host without 'gitlab' in its name goes to gh. glab --per-page 100 and gh --limit 500 truncate without warning, so a story whose PR is past the limit can look in-progress or stale.",
+      "recommendation": "Paginate, and add a notice when a limit is hit; consider an explicit host config with the guess as default.",
+      "lens": "determinism"
+    },
+    {
+      "id": "determinism-9",
+      "severity": "low",
+      "title": "--epic filter changes the contract-bottleneck result",
+      "location": "orchlib/status.py: contract-bottleneck",
+      "evidence": "by_key holds only the filtered epic's rows, so dependents in other epics are ignored.",
+      "recommendation": "Compute states for all stories, then filter the output.",
+      "lens": "determinism"
+    },
+    {
+      "id": "determinism-10",
+      "severity": "low",
+      "title": "status/report accept an epic that has no stories",
+      "location": "orchlib/status.py; orch.py cmd_report",
+      "evidence": "A mistyped epic gives an empty 'open' row and an empty report with ok:true, while close.plan raises an error for the same input.",
+      "recommendation": "Validate --epic against the stories and exit with a clear message.",
+      "lens": "determinism"
+    },
+    {
+      "id": "determinism-11",
+      "severity": "low",
+      "title": "Retro data labels every contract story as a bottleneck",
+      "location": "orchlib/close.py: retro_data",
+      "evidence": "contract_bottlenecks lists all contract stories by downstream count, not the decided bottleneck definition.",
+      "recommendation": "Rename it to contract_stories_by_downstream, or record real bottleneck anomalies.",
+      "lens": "determinism"
+    },
+    {
+      "id": "enhancement-1",
+      "severity": "medium",
+      "title": "Add: tell the user how to resume between close passes",
+      "location": "SKILL.md: Close epic",
+      "evidence": "Pass 2 may run days later in a new session. The skill never says to come back once the archive PRs merge, and a re-run that returns only 'exists' entries is not explained.",
+      "recommendation": "End pass 1 with 'merge these PRs, then ask to close epic N again'. When every archive entry is 'exists', say the PRs are waiting to merge.",
+      "lens": "enhancement"
+    },
+    {
+      "id": "enhancement-2",
+      "severity": "medium",
+      "title": "Add: next step after a successful take over",
+      "location": "SKILL.md: Status actions",
+      "evidence": "After a take over, the user holds a claim but has no worktree or bmad-build session, and the skill says nothing about what to do next.",
+      "recommendation": "Point to orch-next, or until it ships, to git worktree add on origin/story/<N-M> and then bmad-build.",
+      "lens": "enhancement"
+    },
+    {
+      "id": "enhancement-3",
+      "severity": "medium",
+      "title": "Opportunity: extend -H to the read-only commands status and plan-check",
+      "location": "SKILL.md: Headless",
+      "evidence": "status and plan-check only read and already print JSON. CI, digests and the readiness step could use them headless.",
+      "recommendation": "Headless runs rebuild, report, status or plan-check. Only take over, release and close need a human. Note that headless rebuild writes but does not commit.",
+      "lens": "enhancement"
+    },
+    {
+      "id": "enhancement-4",
+      "severity": "low",
+      "title": "Add: re-validate after the user adds a pin-drift migration story",
+      "location": "SKILL.md: pin-drift bullet",
+      "evidence": "Nothing checks the pasted story before close is blocked again.",
+      "recommendation": "After the story is added, run plan-check, then status.",
+      "lens": "enhancement"
+    },
+    {
+      "id": "enhancement-5",
+      "severity": "low",
+      "title": "Add: route users who invoke the skill without an epic or before setup",
+      "location": "SKILL.md: Close epic / Epic report / Resolution rules",
+      "evidence": "--epic is required but the skill does not say how to choose one. A first-timer gets exit 2 with no pointer to orch-setup.",
+      "recommendation": "Offer candidate epics from status. On a missing config, registry or epics, suggest orch-setup or planning.",
+      "lens": "enhancement"
+    }
+  ]
+}
+</script>
+
+<script>
+(function () {
+  "use strict";
+
+  var SEVERITIES = ["critical", "high", "medium", "low"];
+  var SEV_LABEL = { critical: "Critical", high: "High", medium: "Medium", low: "Low" };
+  var GRADES = ["excellent", "good", "fair", "poor"];
+  var PLACEHOLDER_SUBJECT = "__PLACEHOLDER__";
+
+  var els = {
+    banner: document.getElementById("parse-banner"),
+    overview: document.getElementById("overview"),
+    grade: document.getElementById("grade"),
+    verdict: document.getElementById("verdict"),
+    summaryText: document.getElementById("summary-text"),
+    counts: document.getElementById("counts"),
+    themes: document.getElementById("themes"),
+    strengths: document.getElementById("strengths"),
+    recommendations: document.getElementById("recommendations"),
+    experience: document.getElementById("experience"),
+    toolbar: document.getElementById("toolbar"),
+    root: document.getElementById("findings-root"),
+    subject: document.getElementById("m-subject"),
+    generated: document.getElementById("m-generated"),
+    schema: document.getElementById("m-schema"),
+    selCount: document.getElementById("sel-count"),
+    btnCopy: document.getElementById("btn-copy"),
+    btnSelectAll: document.getElementById("btn-select-all"),
+    btnClear: document.getElementById("btn-clear"),
+    btnExpandAll: document.getElementById("btn-expand-all"),
+    btnCollapseAll: document.getElementById("btn-collapse-all"),
+    fallback: document.getElementById("fallback"),
+    fallbackText: document.getElementById("fallback-text"),
+    toast: document.getElementById("toast")
+  };
+
+  var selected = Object.create(null);
+  var findings = [];
+  var findingsById = Object.create(null);
+  var subjectPath = "";
+  var standards = null;
+
+  function showBanner(message) {
+    els.banner.textContent = message;
+    els.banner.classList.add("show");
+  }
+
+  function esc(value) {
+    var s = value == null ? "" : String(value);
+    return s.replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  // Normalize an arbitrary parsed object against schema_version 2, supplying
+  // defaults so a partial or future island still renders. Unknown fields are
+  // ignored, not fatal. Severity counts are always derived from the findings
+  // array, never read from the island, so they cannot disagree with it. The
+  // synthesis blocks (grade, summary, themes, strengths, recommendations) and
+  // the experience block are OPTIONAL: each normalizes to an empty value that
+  // renders nothing rather than an empty panel or an error.
+  function normalize(raw) {
+    var obj = raw && typeof raw === "object" ? raw : {};
+    var rawFindings = Array.isArray(obj.findings) ? obj.findings : [];
+
+    var norm = {
+      schema_version: typeof obj.schema_version === "number" ? obj.schema_version : 2,
+      subject: obj.subject != null ? String(obj.subject) : "(unspecified)",
+      generated: obj.generated != null ? String(obj.generated) : "(unspecified)",
+      verdict: obj.verdict != null ? String(obj.verdict) : "(no verdict supplied)",
+      grade: GRADES.indexOf(String(obj.grade || "").toLowerCase()) >= 0
+        ? String(obj.grade).toLowerCase() : "",
+      summary: typeof obj.summary === "string" ? obj.summary : "",
+      standards: (obj.standards && typeof obj.standards === "object") ? {
+        canon: obj.standards.canon != null ? String(obj.standards.canon) : "",
+        principles: obj.standards.principles != null ? String(obj.standards.principles) : "",
+        scripts: obj.standards.scripts != null ? String(obj.standards.scripts) : ""
+      } : null,
+      themes: normalizeThemes(obj.themes),
+      strengths: normalizeStrengths(obj.strengths),
+      recommendations: normalizeRecommendations(obj.recommendations),
+      experience: normalizeExperience(obj.experience),
+      counts: { critical: 0, high: 0, medium: 0, low: 0 },
+      findings: []
+    };
+
+    rawFindings.forEach(function (f, i) {
+      if (!f || typeof f !== "object") { return; }
+      var sev = SEVERITIES.indexOf(f.severity) >= 0 ? f.severity : "low";
+      norm.findings.push({
+        id: f.id != null ? String(f.id) : "finding-" + (i + 1),
+        lens: f.lens != null ? String(f.lens) : "(unknown)",
+        severity: sev,
+        title: f.title != null ? String(f.title) : "(untitled finding)",
+        location: f.location != null ? String(f.location) : "",
+        evidence: f.evidence != null ? String(f.evidence) : "",
+        recommendation: f.recommendation != null ? String(f.recommendation) : "",
+        proposed_smallest: f.proposed_smallest != null ? String(f.proposed_smallest) : "",
+        predicted_delta: f.predicted_delta != null ? String(f.predicted_delta) : ""
+      });
+      norm.counts[sev] += 1;
+    });
+
+    return norm;
+  }
+
+  function normalizeThemes(raw) {
+    if (!Array.isArray(raw)) { return []; }
+    var list = [];
+    raw.forEach(function (t) {
+      if (!t || typeof t !== "object") { return; }
+      var ids = [];
+      if (Array.isArray(t.finding_ids)) {
+        t.finding_ids.forEach(function (id) { if (id != null) { ids.push(String(id)); } });
+      }
+      var title = t.title != null ? String(t.title) : "";
+      if (!title && !ids.length) { return; }
+      list.push({
+        title: title || "(untitled theme)",
+        root_cause: t.root_cause != null ? String(t.root_cause) : "",
+        action: t.action != null ? String(t.action) : "",
+        finding_ids: ids
+      });
+    });
+    return list;
+  }
+
+  function normalizeStrengths(raw) {
+    if (!Array.isArray(raw)) { return []; }
+    var list = [];
+    raw.forEach(function (s) {
+      if (typeof s === "string" && s) { list.push(s); }
+      else if (s && typeof s === "object" && s.title) {
+        list.push(String(s.title) + (s.detail ? " — " + String(s.detail) : ""));
+      }
+    });
+    return list;
+  }
+
+  function normalizeRecommendations(raw) {
+    if (!Array.isArray(raw)) { return []; }
+    var list = [];
+    raw.forEach(function (r, i) {
+      if (!r || typeof r !== "object") { return; }
+      var action = r.action != null ? String(r.action) : "";
+      if (!action) { return; }
+      var resolves = "";
+      if (Array.isArray(r.resolves)) { resolves = r.resolves.map(String).join(", "); }
+      else if (typeof r.resolves === "number") { resolves = r.resolves + " findings"; }
+      else if (r.resolves != null) { resolves = String(r.resolves); }
+      list.push({
+        rank: typeof r.rank === "number" ? r.rank : i + 1,
+        action: action,
+        resolves: resolves
+      });
+    });
+    list.sort(function (a, b) { return a.rank - b.rank; });
+    return list;
+  }
+
+  // Optional experience block: journeys plus a headless note. Returns null when
+  // neither is usable.
+  function normalizeExperience(raw) {
+    if (!raw || typeof raw !== "object") { return null; }
+    var journeys = [];
+    if (Array.isArray(raw.journeys)) {
+      raw.journeys.forEach(function (j) {
+        if (!j || typeof j !== "object") { return; }
+        var name = j.name != null ? String(j.name) : "";
+        var steps = j.steps != null ? String(j.steps) : "";
+        if (!name && !steps) { return; }
+        journeys.push({ name: name, steps: steps });
+      });
+    }
+    var headless = raw.headless != null ? String(raw.headless) : "";
+    if (!journeys.length && !headless) { return null; }
+    return { journeys: journeys, headless: headless };
+  }
+
+  function renderOverview(data) {
+    els.subject.textContent = data.subject;
+    els.generated.textContent = data.generated;
+    els.schema.textContent = String(data.schema_version);
+    els.verdict.textContent = data.verdict;
+
+    if (data.grade) {
+      els.grade.textContent = data.grade;
+      els.grade.className = "grade g-" + data.grade;
+      els.grade.hidden = false;
+    }
+    if (data.summary) {
+      els.summaryText.textContent = data.summary;
+      els.summaryText.hidden = false;
+    }
+
+    els.counts.innerHTML = "";
+    SEVERITIES.forEach(function (s) {
+      var pill = document.createElement("span");
+      pill.className = "pill";
+      pill.innerHTML =
+        '<span class="dot ' + s + '"></span>' +
+        '<span class="lbl">' + SEV_LABEL[s] + '</span>' +
+        '<span class="n">' + data.counts[s] + "</span>";
+      els.counts.appendChild(pill);
+    });
+    els.overview.hidden = false;
+  }
+
+  // Every copied fix prompt opens by anchoring the fixing session to the same
+  // standards that produced the findings, so the fix is held to the bar too.
+  function standardsPreamble() {
+    if (!standards || !standards.canon) { return []; }
+    var bar = standards.canon + (standards.principles ? " and " + standards.principles : "");
+    var lines = [
+      "Hold " + bar + " as the bar for every line you change — a fix that adds ceremony is a new finding, not a fix."
+    ];
+    if (standards.scripts) {
+      lines.push("If the fix adds or changes scripts, follow " + standards.scripts + ".");
+    }
+    lines.push("");
+    return lines;
+  }
+
+  function composeThemePrompt(theme, resolved) {
+    var lines = standardsPreamble();
+    lines.push("Fix the following theme in " + subjectPath + ": " + theme.title);
+    lines.push("");
+    if (theme.root_cause) { lines.push("Root cause: " + theme.root_cause); }
+    if (theme.action) { lines.push("Fix: " + theme.action); }
+    if (resolved.length) {
+      lines.push("");
+      lines.push("Findings to address:");
+      resolved.forEach(function (f, i) {
+        lines.push((i + 1) + ". " + f.title);
+        if (f.location) { lines.push("   Location: " + f.location); }
+        if (f.evidence) { lines.push("   Evidence: " + f.evidence); }
+        if (f.recommendation) { lines.push("   Recommendation: " + f.recommendation); }
+      });
+    }
+    return lines.join("\n") + "\n";
+  }
+
+  function renderThemes(themes) {
+    if (!themes.length) { els.themes.hidden = true; return; }
+    els.themes.innerHTML = "<h2>Themes</h2>";
+    themes.forEach(function (t) {
+      var resolved = t.finding_ids
+        .map(function (id) { return findingsById[id]; })
+        .filter(function (f) { return !!f; });
+      var items = resolved.map(function (f) {
+        return '<div class="t-finding"><span class="mono">' + esc(f.id) + "</span> " +
+          esc(f.title) +
+          (f.location ? ' · <span class="mono">' + esc(f.location) + "</span>" : "") +
+          "</div>";
+      }).join("");
+
+      var node = document.createElement("div");
+      node.className = "theme";
+      node.innerHTML =
+        '<div class="t-head"><span class="t-title">' + esc(t.title) + "</span>" +
+        '<button class="small t-fix">Fix This Theme</button></div>' +
+        (t.root_cause ? '<div class="t-cause">Root cause: ' + esc(t.root_cause) + "</div>" : "") +
+        (t.action ? '<div class="t-action"><b>Fix:</b> ' + esc(t.action) + "</div>" : "") +
+        (items ? '<div class="t-findings">' + items + "</div>" : "");
+      node.querySelector(".t-fix").addEventListener("click", function () {
+        copyText(composeThemePrompt(t, resolved));
+      });
+      els.themes.appendChild(node);
+    });
+    els.themes.hidden = false;
+  }
+
+  function renderStrengths(list) {
+    if (!list.length) { els.strengths.hidden = true; return; }
+    els.strengths.innerHTML =
+      "<h2>Strengths</h2><ul class=\"strength-list\">" +
+      list.map(function (s) { return "<li>" + esc(s) + "</li>"; }).join("") +
+      "</ul>";
+    els.strengths.hidden = false;
+  }
+
+  function renderRecommendations(recs) {
+    if (!recs.length) { els.recommendations.hidden = true; return; }
+    var html = "<h2>Recommendations</h2>";
+    recs.forEach(function (r) {
+      html += '<div class="rec"><span class="rank">#' + esc(String(r.rank)) + "</span>" +
+        esc(r.action) +
+        (r.resolves ? '<span class="resolves">resolves: ' + esc(r.resolves) + "</span>" : "") +
+        "</div>";
+    });
+    els.recommendations.innerHTML = html;
+    els.recommendations.hidden = false;
+  }
+
+  function renderExperience(exp) {
+    if (!exp) { els.experience.hidden = true; return; }
+    var html = "<h2>Experience</h2>";
+    if (exp.journeys.length) {
+      html += exp.journeys.map(function (j) {
+        return '<div class="journey">' +
+          '<div class="j-name">' + esc(j.name || "(unnamed journey)") + "</div>" +
+          (j.steps ? '<div class="j-steps">' + esc(j.steps) + "</div>" : "") +
+          "</div>";
+      }).join("");
+    }
+    if (exp.headless) {
+      html += '<dl class="kv" style="margin-top:12px"><dt>Headless</dt><dd>' +
+        esc(exp.headless) + "</dd></dl>";
+    }
+    els.experience.innerHTML = html;
+    els.experience.hidden = false;
+  }
+
+  function renderNoFindings() {
+    els.root.innerHTML =
+      '<div class="no-findings">' +
+      '<div class="big">No findings</div>' +
+      "<div>The scanners returned a clean pass for this subject.</div>" +
+      "</div>";
+  }
+
+  function findingNode(f) {
+    var node = document.createElement("div");
+    node.className = "finding sev-" + f.severity;
+    node.setAttribute("data-id", f.id);
+
+    var sub =
+      esc(f.lens) +
+      (f.location ? ' · <span class="mono">' + esc(f.location) + "</span>" : "");
+
+    var rows =
+      "<dt>Lens</dt><dd>" + esc(f.lens) + "</dd>" +
+      (f.location ? "<dt>Location</dt><dd><code>" + esc(f.location) + "</code></dd>" : "") +
+      (f.evidence ? "<dt>Evidence</dt><dd>" + esc(f.evidence) + "</dd>" : "") +
+      (f.recommendation ? "<dt>Recommendation</dt><dd>" + esc(f.recommendation) + "</dd>" : "") +
+      (f.proposed_smallest ? "<dt>Proposed smallest</dt><dd>" + esc(f.proposed_smallest) + "</dd>" : "") +
+      (f.predicted_delta ? "<dt>Predicted delta</dt><dd>" + esc(f.predicted_delta) + "</dd>" : "");
+
+    node.innerHTML =
+      '<div class="row">' +
+      '<input type="checkbox" class="chk" aria-label="Select finding">' +
+      '<div class="head">' +
+      '<div class="title">' + esc(f.title) + "</div>" +
+      '<div class="sub">' + sub + "</div>" +
+      "</div>" +
+      '<span class="tag">' + SEV_LABEL[f.severity] + "</span>" +
+      '<span class="caret">▸</span>' +
+      "</div>" +
+      '<div class="body"><dl>' + rows + "</dl></div>";
+
+    var chk = node.querySelector(".chk");
+    chk.checked = !!selected[f.id];
+    chk.addEventListener("change", function () {
+      if (chk.checked) { selected[f.id] = true; } else { delete selected[f.id]; }
+      updateSelection();
+    });
+
+    var head = node.querySelector(".head");
+    var caret = node.querySelector(".caret");
+    function toggle() { node.classList.toggle("open"); }
+    head.addEventListener("click", toggle);
+    caret.addEventListener("click", toggle);
+
+    return node;
+  }
+
+  function renderFindings(list) {
+    els.root.innerHTML = "";
+    if (list.length === 0) {
+      renderNoFindings();
+      els.toolbar.hidden = true;
+      return;
+    }
+    els.toolbar.hidden = false;
+
+    SEVERITIES.forEach(function (sev) {
+      var group = list.filter(function (f) { return f.severity === sev; });
+      if (group.length === 0) { return; }
+      var wrap = document.createElement("div");
+      wrap.className = "group";
+      var h = document.createElement("h2");
+      h.innerHTML = '<span class="dot ' + sev + '"></span>' + SEV_LABEL[sev] + " (" + group.length + ")";
+      wrap.appendChild(h);
+      group.forEach(function (f) { wrap.appendChild(findingNode(f)); });
+      els.root.appendChild(wrap);
+    });
+  }
+
+  function updateSelection() {
+    var n = Object.keys(selected).length;
+    els.selCount.textContent = n + " selected";
+    els.btnCopy.disabled = n === 0;
+  }
+
+  function composePrompt() {
+    var picked = findings.filter(function (f) { return selected[f.id]; });
+    if (picked.length === 0) { return ""; }
+    var lines = standardsPreamble();
+    lines.push("Fix the following issues in " + subjectPath + ":");
+    lines.push("");
+    picked.forEach(function (f, i) {
+      lines.push((i + 1) + ". " + f.title);
+      if (f.location) { lines.push("   Location: " + f.location); }
+      if (f.evidence) { lines.push("   Evidence: " + f.evidence); }
+      if (f.recommendation) { lines.push("   Recommendation: " + f.recommendation); }
+      if (f.proposed_smallest) { lines.push("   Proposed smallest: " + f.proposed_smallest); }
+      lines.push("");
+    });
+    return lines.join("\n").replace(/\n+$/, "\n");
+  }
+
+  function showToast(text) {
+    els.toast.textContent = text;
+    els.toast.classList.add("show");
+    setTimeout(function () { els.toast.classList.remove("show"); }, 1600);
+  }
+
+  function fallbackCopy(text) {
+    els.fallbackText.value = text;
+    els.fallback.classList.add("show");
+    els.fallbackText.focus();
+    els.fallbackText.select();
+    try {
+      var ok = document.execCommand && document.execCommand("copy");
+      if (ok) {
+        showToast("Copied");
+        return;
+      }
+    } catch (e) { /* fall through to manual */ }
+    showToast("Copy the text shown below");
+  }
+
+  function copyText(text) {
+    if (!text) { return; }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(
+        function () { showToast("Copied"); },
+        function () { fallbackCopy(text); }
+      );
+    } else {
+      fallbackCopy(text);
+    }
+  }
+
+  function doCopy() {
+    copyText(composePrompt());
+  }
+
+  function wireToolbar() {
+    els.btnCopy.addEventListener("click", doCopy);
+    els.btnSelectAll.addEventListener("click", function () {
+      findings.forEach(function (f) { selected[f.id] = true; });
+      document.querySelectorAll(".finding .chk").forEach(function (c) { c.checked = true; });
+      updateSelection();
+    });
+    els.btnClear.addEventListener("click", function () {
+      selected = Object.create(null);
+      document.querySelectorAll(".finding .chk").forEach(function (c) { c.checked = false; });
+      els.fallback.classList.remove("show");
+      updateSelection();
+    });
+    els.btnExpandAll.addEventListener("click", function () {
+      document.querySelectorAll(".finding").forEach(function (n) { n.classList.add("open"); });
+    });
+    els.btnCollapseAll.addEventListener("click", function () {
+      document.querySelectorAll(".finding").forEach(function (n) { n.classList.remove("open"); });
+    });
+  }
+
+  function init() {
+    var island = document.getElementById("report-data");
+    var parsed;
+    try {
+      if (!island) { throw new Error("report-data island element not found"); }
+      parsed = JSON.parse(island.textContent);
+    } catch (err) {
+      showBanner(
+        "Could not parse the report data island.\n\n" +
+        "Error: " + (err && err.message ? err.message : String(err)) + "\n\n" +
+        "The findings could not be rendered. The JSON inside the " +
+        'report-data island (the application/json script tag) is malformed.'
+      );
+      return;
+    }
+
+    var data = normalize(parsed);
+
+    if (data.subject === PLACEHOLDER_SUBJECT) {
+      els.subject.textContent = data.subject;
+      showBanner(
+        "This is the unfilled report shell.\n\n" +
+        "The report-data island still carries the placeholder subject, so " +
+        "there are no findings here. Generate a real report with " +
+        "scripts/render_report.py."
+      );
+      return;
+    }
+
+    findings = data.findings;
+    subjectPath = data.subject;
+    standards = data.standards;
+    findingsById = Object.create(null);
+    findings.forEach(function (f) { findingsById[f.id] = f; });
+
+    renderOverview(data);
+    renderThemes(data.themes);
+    renderStrengths(data.strengths);
+    renderRecommendations(data.recommendations);
+    renderExperience(data.experience);
+    renderFindings(findings);
+    wireToolbar();
+    updateSelection();
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init);
+  } else {
+    init();
+  }
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,373 @@
+{
+  "schema_version": 2,
+  "subject": "/workspaces/bmad-orchestrator/skills/orch-status",
+  "generated": "2026-09-26",
+  "verdict": "Fair: the skill is a lean, well-wired layer over the library, but two library bugs write or report wrong shared state: pin convergence assumes merge order equals plan order (determinism-1), and the close record pass ignores unread repos (determinism-2).",
+  "grade": "fair",
+  "summary": "orch-status is lean (1426 tokens), declines customization cleanly, and never derives state itself: every fact comes from orch.py JSON, and close runs as plan, confirm, push through gated PRs. The main opportunity is in the library: make close and drift independent of merge order and of partial reads, and stop heuristics from failing open. Beyond that, a handful of one-line SKILL.md fixes tighten the contract with the library and the handoffs between sessions.",
+  "standards": {
+    "canon": "/workspaces/bmad-orchestrator/.claude/skills/bmad-workflow-builder/references/prompt-quality-canon.md",
+    "principles": "/workspaces/bmad-orchestrator/.claude/skills/bmad-workflow-builder/references/skill-quality-principles.md",
+    "scripts": "/workspaces/bmad-orchestrator/.claude/skills/bmad-workflow-builder/references/script-standards.md"
+  },
+  "themes": [
+    {
+      "title": "Library results depend on merge order and partial reads",
+      "root_cause": "status/close treat plan order as merge order and treat an unread repo or unread branches as if they were absent, so close can deadlock, sprint status can be demoted, and take-over can be offered on active work. Results also shift with the clone or the --epic filter.",
+      "finding_ids": [
+        "determinism-1",
+        "determinism-2",
+        "determinism-3",
+        "determinism-7",
+        "determinism-9",
+        "determinism-10"
+      ],
+      "action": "Order the pin chain and the latest pinner by merge order on main. Block the record pass (or keep unknown keys) while repos are unread. Mark claim-only activity and do not offer take-over there. Read only origin story refs, compute over all stories before filtering, and validate --epic."
+    },
+    {
+      "title": "Heuristics that fail open or hand the prompt unusable output",
+      "root_cause": "Where the script cannot know something (which exporter a narrow breaks, whether a migration story can converge, which review host a repo uses, which contract stories were real bottlenecks), it guesses permissively or labels data too broadly, and the prompt acts on the guess.",
+      "finding_ids": [
+        "determinism-4",
+        "determinism-5",
+        "determinism-6",
+        "determinism-8",
+        "determinism-11"
+      ],
+      "action": "Fail closed or say 'ambiguous' (plan-check narrow target). Emit migration_draft only when it can converge, together with next_id and the rendered block. Paginate review lists and add notices on truncation. Label the retro fields for what they are."
+    },
+    {
+      "title": "SKILL.md and the library disagree on a few contracts",
+      "root_cause": "The skill describes some script outputs differently from what the script does: exit 1, the sprint-status-lag action args, the pdf_error text, and the re-planned --push result.",
+      "finding_ids": [
+        "architecture-1",
+        "architecture-2",
+        "architecture-4",
+        "leanness-1"
+      ],
+      "action": "Document exit 1 as a negative result, return derive without --write from the lag anomaly, relay pdf_error verbatim, and have the --push run check that the pass matches the confirmed plan."
+    },
+    {
+      "title": "Handoffs across sessions and skills are unstated",
+      "root_cause": "The flows span days and skills (close pass 1 then pass 2, take over then orch-next, drift draft then plan-check), but the skill ends each step without naming the next one.",
+      "finding_ids": [
+        "enhancement-1",
+        "enhancement-2",
+        "enhancement-4",
+        "enhancement-5"
+      ],
+      "action": "Add one line per handoff: come back after the archive PRs merge; continue a taken-over story with orch-next; run plan-check after pasting the draft; offer candidate epics or point to orch-setup."
+    },
+    {
+      "title": "Headless scope is narrower than it safely could be",
+      "root_cause": "Headless allows file-writing rebuild but leaves out the read-only status and plan-check.",
+      "finding_ids": [
+        "architecture-3",
+        "enhancement-3"
+      ],
+      "action": "Allow status and plan-check under -H, take the action from the invocation, and print error JSON when it is ambiguous."
+    }
+  ],
+  "strengths": [
+    "Script-first: SKILL.md never infers state, and unread repos surface as unknown, never as not merged",
+    "Close epic is plan, confirm, push, split into two passes the gate checks, with plumbing commits that work in the polyrepo fetch cache",
+    "Actions carry exact orch.py args and claim leases (--expect), so take over and release are race-safe",
+    "No customization surface; thresholds come from module config as in orch-gate",
+    "Lean SKILL.md (1426 tokens) with gotchas the model could not infer"
+  ],
+  "recommendations": [
+    {
+      "rank": 1,
+      "action": "Fix the two high library bugs: pin chain and latest pinner in merge order on main, and no record pass (or unknown keys kept) while repos are unread, each with a regression test",
+      "resolves": [
+        "determinism-1",
+        "determinism-2"
+      ]
+    },
+    {
+      "rank": 2,
+      "action": "Tighten the SKILL.md/library contract: document exit 1, lag action without --write, relay pdf_error, verify the pass on --push, define {skill-root}",
+      "resolves": [
+        "architecture-1",
+        "architecture-2",
+        "architecture-4",
+        "architecture-5",
+        "leanness-1"
+      ]
+    },
+    {
+      "rank": 3,
+      "action": "Close the fail-open gaps in status and plan-check: claim-only activity, ambiguous narrow target, converging-only migration drafts with next_id, origin-only story refs, compute before filtering, validate --epic",
+      "resolves": [
+        "determinism-3",
+        "determinism-4",
+        "determinism-5",
+        "determinism-6",
+        "determinism-7",
+        "determinism-9",
+        "determinism-10"
+      ]
+    },
+    {
+      "rank": 4,
+      "action": "Add the handoff lines and widen headless to status/plan-check",
+      "resolves": [
+        "enhancement-1",
+        "enhancement-2",
+        "enhancement-3",
+        "enhancement-4",
+        "enhancement-5",
+        "architecture-3"
+      ]
+    },
+    {
+      "rank": 5,
+      "action": "Small cleanups: review-host pagination and notices, retro field naming, the two meta sentences and the redundant notice clause",
+      "resolves": [
+        "determinism-8",
+        "determinism-11",
+        "leanness-2",
+        "leanness-3"
+      ]
+    }
+  ],
+  "experience": {
+    "journeys": [
+      {
+        "name": "Delivery lead checks progress",
+        "steps": "Says 'orch status' \u2192 table per epic with critical path \u2192 anomalies with actions and caveats for unread repos; on a non-orch project, exit 2 without a pointer to orch-setup (gap)"
+      },
+      {
+        "name": "Take over a stale claim",
+        "steps": "stale-claim anomaly \u2192 confirm \u2192 claim take-over with --expect lease \u2192 lost race shows the new holder; after success no next step toward a worktree (gap)"
+      },
+      {
+        "name": "Close an epic over several days",
+        "steps": "closable \u2192 plan (archive) \u2192 confirm \u2192 --push, PRs per repo \u2192 no reminder to return after the merges (gap) \u2192 re-run gives record \u2192 record PR \u2192 offer bmad-retrospective with orch-epic-N.json"
+      },
+      {
+        "name": "Pin drift",
+        "steps": "pin-drift with migration_draft \u2192 story block for the epics \u2192 no plan-check afterwards (gap); a draft is also offered where it cannot converge (determinism-5)"
+      }
+    ],
+    "headless": "Rebuild and report already work headless with pure JSON output; status and plan-check are read-only and could join; take over, release and close stay interactive by design."
+  },
+  "findings": [
+    {
+      "id": "leanness-1",
+      "severity": "medium",
+      "title": "pdf_error line restates the script message and misstates it on browser failure",
+      "location": "SKILL.md: Epic report",
+      "evidence": "SKILL.md hard-codes 'no Chromium or Chrome was found'. report.to_pdf already returns that guidance when no browser exists, and returns '<browser> failed' or '<browser> exited N' when one exists but fails. The hard-coded wording is wrong in those cases.",
+      "recommendation": "Replace with: 'When pdf_error is set, relay it; the HTML still prints to PDF from any browser.'",
+      "lens": "leanness"
+    },
+    {
+      "id": "leanness-2",
+      "severity": "low",
+      "title": "Meta-explanation sentences that change none of the model's moves",
+      "location": "SKILL.md: Plan validation, Rebuild sprint status (last sentences)",
+      "evidence": "'The bmad-sprint-planning readiness check calls this too.' and 'The merge driver uses the same derivation, so it never needs a hand fix.' describe the system to itself.",
+      "recommendation": "Delete the first. Shorten the second to the instruction alone, or delete it.",
+      "lens": "leanness"
+    },
+    {
+      "id": "leanness-3",
+      "severity": "low",
+      "title": "Gotcha restates a notice the script already emits",
+      "location": "SKILL.md: Gotchas, bullet 2",
+      "evidence": "'...and a notice says so' repeats the review-host-unavailable notice that is already shown as a caveat.",
+      "recommendation": "Shorten to: review waits come from open gh/glab PRs whose head is story/<N-M>; without either tool they fall back to branch idle time.",
+      "lens": "leanness"
+    },
+    {
+      "id": "architecture-1",
+      "severity": "medium",
+      "title": "sprint-status-lag action writes without the preview and confirmation the Rebuild section requires",
+      "location": "SKILL.md: Status; orchlib/status.py sprint-status-lag",
+      "evidence": "The anomaly action args are ['sprint-status','derive','--write']. The generic 'run the action' rule would write the file without showing the changes, which contradicts Rebuild's derive, show, confirm, write sequence.",
+      "recommendation": "Have status.py return derive without --write, or route the anomaly to the Rebuild flow explicitly.",
+      "lens": "architecture"
+    },
+    {
+      "id": "architecture-2",
+      "severity": "medium",
+      "title": "Exit code 1 is undocumented, yet plan-check, close and claim actions return results through it",
+      "location": "SKILL.md: Resolution rules",
+      "evidence": "Only exit 2 is described. orch.py exits 1 on plan-check FAIL, a blocked close, close-check problems, and a claim lost-race or claim-changed. All of these are results the skill must render.",
+      "recommendation": "Add: exit 1 is a negative result (FAIL, blocked, lost race); render its JSON as usual.",
+      "lens": "architecture"
+    },
+    {
+      "id": "architecture-3",
+      "severity": "low",
+      "title": "Headless mode leaves out plan-check and gives no way to choose the action",
+      "location": "SKILL.md: Headless",
+      "evidence": "-H allows rebuild and report but not read-only plan-check, and does not say how the action is chosen.",
+      "recommendation": "Allow plan-check (and status) under -H. The action comes from the invocation; an ambiguous request prints error JSON.",
+      "lens": "architecture"
+    },
+    {
+      "id": "architecture-4",
+      "severity": "low",
+      "title": "The --push re-run re-plans without checking that the pass is the one the user confirmed",
+      "location": "SKILL.md: Close epic; orch.py cmd_epic",
+      "evidence": "close.plan runs again on --push. If state changed in between, a different pass or repo list could be pushed than the one approved.",
+      "recommendation": "After --push, compare pass/repos with the confirmed plan and show any difference before opening PRs, or pass the expected pass to the script.",
+      "lens": "architecture"
+    },
+    {
+      "id": "architecture-5",
+      "severity": "low",
+      "title": "The {skill-root} token is used but never defined",
+      "location": "SKILL.md: Resolution rules",
+      "evidence": "orch.py resolves via {skill-root}/../orch-gate but the token has no definition.",
+      "recommendation": "Define {skill-root} as this skill's installed directory.",
+      "lens": "architecture"
+    },
+    {
+      "id": "determinism-1",
+      "severity": "high",
+      "title": "Pin chain and latest pinner assume merge order equals plan order, so an epic can be stuck in drift for good",
+      "location": "orch-gate/scripts/orchlib/markers.py: PinIndex, pin_drift",
+      "evidence": "When two contract stories on one canonical merge in reverse plan order (the later one rebased), versions[-1] != main. Reproduced: both stories and a consumer get 'unrecorded-change', so close stays blocked.",
+      "recommendation": "Order the chain and the latest pinner by merge order on main (the commit that added each marker), or at least accept current when any chain entry equals it. Add a reverse-merge test.",
+      "lens": "determinism"
+    },
+    {
+      "id": "determinism-2",
+      "severity": "high",
+      "title": "Close record pass rewrites sprint status while other repos are unread, demoting their done stories",
+      "location": "orch-gate/scripts/orchlib/close.py: plan/execute",
+      "evidence": "plan() blocks only on the epic's own unmerged or unknown stories. execute() runs derive with a partial merged_map, which demotes done stories of unread repos to review. cmd_sprint_status refuses in the same situation.",
+      "recommendation": "Block the record pass while any repo is unread, or make derive leave unknown keys untouched. Add a polyrepo test.",
+      "lens": "determinism"
+    },
+    {
+      "id": "determinism-3",
+      "severity": "medium",
+      "title": "stale-claim offers take-over when story branches could not be read",
+      "location": "orchlib/status.py: branch_activity, _story_anomalies",
+      "evidence": "A branches-unreadable repo leaves activity at claim time only, so an active claim is presented as stale with take-over actions.",
+      "recommendation": "Mark such rows activity_source=claim-only and skip stale-claim for them, or emit it without actions and say activity is unknown.",
+      "lens": "determinism"
+    },
+    {
+      "id": "determinism-4",
+      "severity": "medium",
+      "title": "plan-check guesses which exporter a narrow story breaks, and passes when any guess fits",
+      "location": "orchlib/plan.py: _narrow",
+      "evidence": "With exporters A{B,C} and D{B}, a narrow of A that depends only on B passes, because D's consumers are covered. The gate will later fail it.",
+      "recommendation": "Fail closed: require coverage of every related exporter, or emit CONCERNS ambiguous-narrow-target when more than one fits.",
+      "lens": "determinism"
+    },
+    {
+      "id": "determinism-5",
+      "severity": "medium",
+      "title": "migration_draft is offered even for drift that a 'Contract change: none' story cannot fix",
+      "location": "orchlib/status.py: pin-drift anomaly",
+      "evidence": "The draft is emitted for every drift, including unrecorded-change and drift of contracts stories, where a new story pins nothing and cannot converge.",
+      "recommendation": "Emit migration_draft only for reason not-migrated outside contracts. Otherwise emit a distinct code explained in SKILL.md.",
+      "lens": "determinism"
+    },
+    {
+      "id": "determinism-6",
+      "severity": "low",
+      "title": "Agent must work out the new story's N.M and title to render the migration draft",
+      "location": "SKILL.md pin-drift bullet; status.py migration_draft",
+      "evidence": "The draft has no id, so the model has to count the stories to pick a free N.M. A duplicate id becomes a FAIL.",
+      "recommendation": "The script emits next_id and the rendered markdown block; the prompt only suggests the title.",
+      "lens": "determinism"
+    },
+    {
+      "id": "determinism-7",
+      "severity": "low",
+      "title": "Branch activity reads clone-local refs, so idle times differ between clones",
+      "location": "orchlib/status.py: branch_activity; gitio.refresh",
+      "evidence": "For '.', local refs/heads/story/* count, and fetching without prune keeps deleted remote branches.",
+      "recommendation": "Read only refs/remotes/origin/story/* and prune story refs on refresh.",
+      "lens": "determinism"
+    },
+    {
+      "id": "determinism-8",
+      "severity": "low",
+      "title": "Review host chosen by hostname substring, and review lists silently truncated",
+      "location": "orchlib/status.py: _host_tool, _open_reviews",
+      "evidence": "Any host without 'gitlab' in its name goes to gh. glab --per-page 100 and gh --limit 500 truncate without warning, so a story whose PR is past the limit can look in-progress or stale.",
+      "recommendation": "Paginate, and add a notice when a limit is hit; consider an explicit host config with the guess as default.",
+      "lens": "determinism"
+    },
+    {
+      "id": "determinism-9",
+      "severity": "low",
+      "title": "--epic filter changes the contract-bottleneck result",
+      "location": "orchlib/status.py: contract-bottleneck",
+      "evidence": "by_key holds only the filtered epic's rows, so dependents in other epics are ignored.",
+      "recommendation": "Compute states for all stories, then filter the output.",
+      "lens": "determinism"
+    },
+    {
+      "id": "determinism-10",
+      "severity": "low",
+      "title": "status/report accept an epic that has no stories",
+      "location": "orchlib/status.py; orch.py cmd_report",
+      "evidence": "A mistyped epic gives an empty 'open' row and an empty report with ok:true, while close.plan raises an error for the same input.",
+      "recommendation": "Validate --epic against the stories and exit with a clear message.",
+      "lens": "determinism"
+    },
+    {
+      "id": "determinism-11",
+      "severity": "low",
+      "title": "Retro data labels every contract story as a bottleneck",
+      "location": "orchlib/close.py: retro_data",
+      "evidence": "contract_bottlenecks lists all contract stories by downstream count, not the decided bottleneck definition.",
+      "recommendation": "Rename it to contract_stories_by_downstream, or record real bottleneck anomalies.",
+      "lens": "determinism"
+    },
+    {
+      "id": "enhancement-1",
+      "severity": "medium",
+      "title": "Add: tell the user how to resume between close passes",
+      "location": "SKILL.md: Close epic",
+      "evidence": "Pass 2 may run days later in a new session. The skill never says to come back once the archive PRs merge, and a re-run that returns only 'exists' entries is not explained.",
+      "recommendation": "End pass 1 with 'merge these PRs, then ask to close epic N again'. When every archive entry is 'exists', say the PRs are waiting to merge.",
+      "lens": "enhancement"
+    },
+    {
+      "id": "enhancement-2",
+      "severity": "medium",
+      "title": "Add: next step after a successful take over",
+      "location": "SKILL.md: Status actions",
+      "evidence": "After a take over, the user holds a claim but has no worktree or bmad-build session, and the skill says nothing about what to do next.",
+      "recommendation": "Point to orch-next, or until it ships, to git worktree add on origin/story/<N-M> and then bmad-build.",
+      "lens": "enhancement"
+    },
+    {
+      "id": "enhancement-3",
+      "severity": "medium",
+      "title": "Opportunity: extend -H to the read-only commands status and plan-check",
+      "location": "SKILL.md: Headless",
+      "evidence": "status and plan-check only read and already print JSON. CI, digests and the readiness step could use them headless.",
+      "recommendation": "Headless runs rebuild, report, status or plan-check. Only take over, release and close need a human. Note that headless rebuild writes but does not commit.",
+      "lens": "enhancement"
+    },
+    {
+      "id": "enhancement-4",
+      "severity": "low",
+      "title": "Add: re-validate after the user adds a pin-drift migration story",
+      "location": "SKILL.md: pin-drift bullet",
+      "evidence": "Nothing checks the pasted story before close is blocked again.",
+      "recommendation": "After the story is added, run plan-check, then status.",
+      "lens": "enhancement"
+    },
+    {
+      "id": "enhancement-5",
+      "severity": "low",
+      "title": "Add: route users who invoke the skill without an epic or before setup",
+      "location": "SKILL.md: Close epic / Epic report / Resolution rules",
+      "evidence": "--epic is required but the skill does not say how to choose one. A first-timer gets exit 2 with no pointer to orch-setup.",
+      "recommendation": "Offer candidate epics from status. On a missing config, registry or epics, suggest orch-setup or planning.",
+      "lens": "enhancement"
+    }
+  ]
+}
