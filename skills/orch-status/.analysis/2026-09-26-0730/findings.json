@@ -1,0 +1,137 @@
+{
+  "schema_version": 2,
+  "subject": "skills/orch-status",
+  "generated": "2026-09-26",
+  "verdict": "Good: the 24 findings of the first run are fixed, but the new merge-order rule still depends on clone depth and merge style (determinism-1, determinism-2), so pin drift can differ between a shallow CI clone and a full one.",
+  "grade": "good",
+  "summary": "The skill stays a lean judgment layer over a script-first library: SKILL.md matches the CLI on flags, codes and exit semantics, and the fix pass added only lines that carry a contract or a handoff. The main opportunity is in the library: merge_order must refuse shallow history and follow what main actually holds rather than the first add of each marker, and the migration draft should be placed and grouped so it passes plan-check as pasted.",
+  "standards": {
+    "canon": "/workspaces/bmad-orchestrator/.claude/skills/bmad-workflow-builder/references/prompt-quality-canon.md",
+    "principles": "/workspaces/bmad-orchestrator/.claude/skills/bmad-workflow-builder/references/skill-quality-principles.md",
+    "scripts": "/workspaces/bmad-orchestrator/.claude/skills/bmad-workflow-builder/references/script-standards.md"
+  },
+  "themes": [
+    {
+      "title": "Merge order read from history that may be cut or fast-forwarded",
+      "root_cause": "merge_order takes the first add of each marker on first-parent history. A shallow clone makes the boundary commit look like a root that adds every marker in path order, and a fast-forward merge exposes branch commit order instead of landing order, so the contract chain and pin drift depend on the clone rather than on main.",
+      "finding_ids": ["determinism-1", "determinism-2"],
+      "action": "In merge_order, raise the fetch-depth OrchError on a shallow repository, and order the chain by the first-parent position where each pinned canonical version first appears on main; add shallow-clone and fast-forward regression tests."
+    },
+    {
+      "title": "Migration draft is not placed or grouped the way the plan needs it",
+      "root_cause": "The draft takes its id from the drifting story's epic while depending on the latest contract story, which may sit in a later epic, and it is emitted once per drifting path although one story of the subproject converges all of them.",
+      "finding_ids": ["determinism-3", "determinism-4"],
+      "action": "Group drift by subproject into one draft listing every contract path, allocate its id in the epic of its latest dependency (excluding merged keys), and test that plan-check passes on the pasted draft."
+    },
+    {
+      "title": "Close PR handoff overstates what publish knows",
+      "root_cause": "publish reports only whether the branch exists in a given repo; SKILL.md reads `exists` as an open PR and does not say which repo each PR belongs to.",
+      "finding_ids": ["leanness-1", "architecture-1"],
+      "action": "Say: open the PR in each entry's `repo` from its `branch` into its `base`; for `exists`, open one if no PR is open for that branch."
+    },
+    {
+      "title": "Status output and flows the prompt leaves unrouted",
+      "root_cause": "Some status output (plan_issues, closed epics) and two entry points (report without an epic, committing a rebuild) have no named next step.",
+      "finding_ids": ["architecture-2", "enhancement-1", "enhancement-2", "enhancement-3"],
+      "action": "Render plan_issues and offer plan-check, collapse closed epics to one line, offer epics when report has no number, and name the branch and PR for a sprint-status rebuild."
+    }
+  ],
+  "strengths": [
+    "All 24 findings of the first run are resolved, and each library fix has a regression test that fails on the old code (108 tests pass).",
+    "SKILL.md stays at 1624 tokens and owns only judgment: every state, order and code comes from orch.py JSON.",
+    "Two-pass close with --expect-pass never pushes a pass the user did not confirm, and the record pass waits for every repo to be read.",
+    "No customize.toml by design; the new constants are internal limits that surface as notices when they bite."
+  ],
+  "recommendations": [
+    { "rank": 1, "action": "Make merge_order fail loud on shallow history and order by when main first held each pinned version", "resolves": ["determinism-1", "determinism-2"] },
+    { "rank": 2, "action": "Fix the close PR sentence in SKILL.md: target each entry's repo and treat exists as 'open a PR if none is open'", "resolves": ["leanness-1", "architecture-1"] },
+    { "rank": 3, "action": "One migration draft per subproject, placed in the epic of its latest dependency", "resolves": ["determinism-3", "determinism-4"] },
+    { "rank": 4, "action": "Route plan_issues, closed epics, report without epic and the rebuild commit in SKILL.md, and shorten the no-draft sentence", "resolves": ["architecture-2", "enhancement-1", "enhancement-2", "enhancement-3", "leanness-2"] }
+  ],
+  "experience": {
+    "journeys": [
+      { "name": "Delivery lead checks progress", "steps": "orch status -> per-epic table and anomalies -> take over or migration draft -> status again" },
+      { "name": "Closing an epic", "steps": "close epic N -> confirm archive pass -> merge PRs -> close again -> confirm record pass -> merge" }
+    ],
+    "headless": "-H runs status, plan-check, rebuild --write without commit, and report; anything ambiguous prints an error JSON."
+  },
+  "findings": [
+    {
+      "id": "leanness-1", "lens": "leanness", "severity": "medium",
+      "title": "Added 'exists' clause claims a PR exists, but the script only knows the branch exists",
+      "location": "skills/orch-status/SKILL.md:35",
+      "evidence": "close.publish returns `exists` when ls-remote (or the local ref) finds the branch; it never checks for a PR. A branch pushed by an earlier session that never opened its PR is reported as 'waiting for review' and the close stalls.",
+      "recommendation": "Say: '`exists` means an earlier run pushed the branch; open its PR if none is open.'"
+    },
+    {
+      "id": "leanness-2", "lens": "leanness", "severity": "low",
+      "title": "Added 'without a draft' sentence repeats what the drift message already says",
+      "location": "skills/orch-status/SKILL.md:23",
+      "evidence": "The pin-drift message already explains unrecorded-change; only 'name the contract and its owner; no new story converges it' changes behaviour.",
+      "recommendation": "Cut to: 'Without a draft, no new story converges the drift: name the contract and its owner.'"
+    },
+    {
+      "id": "architecture-1", "lens": "architecture", "severity": "low",
+      "title": "The PR step does not say to target each published entry's repo, and it reads 'exists' as an open PR",
+      "location": "skills/orch-status/SKILL.md:35",
+      "evidence": "close.execute returns {repo, base, branch, status} per repo; for code repos the branch is pushed to the registry URL. Running gh pr create from the coordination repo opens the archive PRs of other repos against the wrong project or fails.",
+      "recommendation": "Say: 'open a PR in its `repo` from its `branch` into its `base` (gh/glab with --repo, or from that repo)'."
+    },
+    {
+      "id": "architecture-2", "lens": "architecture", "severity": "low",
+      "title": "status emits plan_issues but the Status section never renders or routes them",
+      "location": "skills/orch-status/SKILL.md:20",
+      "evidence": "cmd_status returns plan_issues next to anomalies, unread_repos and notices; SKILL.md lists only the last three, so a malformed story shows as an unexplained '?' row.",
+      "recommendation": "Add plan_issues to the caveats and offer plan-check when it is non-empty."
+    },
+    {
+      "id": "determinism-1", "lens": "determinism", "severity": "high",
+      "title": "merge_order returns path order in shallow clones, bringing back stuck drift",
+      "location": "skills/orch-gate/scripts/orchlib/markers.py:185",
+      "evidence": "In a --depth 2 clone the boundary commit counts as adding every live marker in path order: the REVERSED fixture gives {1-1:0,1-2:1,1-3:2} instead of {1-2:0,1-1:1,1-3:2}, so status shows unrecorded-change drift and blocks close while a full clone passes; the gate's close_check with GitLab's default GIT_DEPTH is affected too.",
+      "recommendation": "Check `git rev-parse --is-shallow-repository` in merge_order and raise the same fetch-depth OrchError as gitio.merge_base; add a shallow-clone regression test."
+    },
+    {
+      "id": "determinism-2", "lens": "determinism", "severity": "medium",
+      "title": "Chain order uses the marker's first add, so fast-forward merges order by branch commit time",
+      "location": "skills/orch-gate/scripts/orchlib/markers.py:199",
+      "evidence": "A story that commits its marker early, then merges main and rewrites the marker before main fast-forwards to it, keeps its early position: merge_order gives {1-1:0,1-2:1} and status reports unrecorded-change on 1-2 though main equals 1-1's pin.",
+      "recommendation": "Order by the first-parent position where each pinned canonical version first appears on main; at minimum use the last add/modify of the marker. Add a fast-forward test."
+    },
+    {
+      "id": "determinism-3", "lens": "determinism", "severity": "medium",
+      "title": "migration_draft places the story in the drifting story's epic but depends on a later epic's contract story",
+      "location": "skills/orch-gate/scripts/orchlib/status.py:307",
+      "evidence": "With the narrow moved to Epic 2 as 2.1, the draft is 'Story 1.4 ... Depends on: 2.1'; pasted at the end of Epic 1, plan-check fails with forward-dependency. The id allocation also ignores merged keys that left the plan.",
+      "recommendation": "Allocate the id in max(story epic, epic of the latest chain story), exclude merged_map keys from taken, and test plan-check on the pasted draft."
+    },
+    {
+      "id": "determinism-4", "lens": "determinism", "severity": "low",
+      "title": "One migration draft per drifting canonical, though one story converges them all",
+      "location": "skills/orch-gate/scripts/orchlib/status.py:256",
+      "evidence": "A new story of the subproject pins every pin_paths(reg, subproject), yet each drifting path gets its own draft with the next id, leaving the prompt to notice the overlap.",
+      "recommendation": "Group drift by (subproject, epic) and emit one draft listing every contract path."
+    },
+    {
+      "id": "enhancement-1", "lens": "enhancement", "severity": "medium",
+      "title": "Add: collapse closed epics in the default status view",
+      "location": "skills/orch-status/SKILL.md:20",
+      "evidence": "status returns every epic including closed ones, and the skill renders a table per epic, so on a long project the actionable epics and anomalies fall below the fold.",
+      "recommendation": "Render full tables only for open, drift, archive-needed and closable epics; list closed ones on one line."
+    },
+    {
+      "id": "enhancement-2", "lens": "enhancement", "severity": "low",
+      "title": "Add: choose an epic when the report is requested without one",
+      "location": "skills/orch-status/SKILL.md:47",
+      "evidence": "report requires --epic (orch.py argparse); 'orch epic report' without a number ends in an argparse error with no guidance.",
+      "recommendation": "Without an epic number, offer the epics from status, open ones first."
+    },
+    {
+      "id": "enhancement-3", "lens": "enhancement", "severity": "low",
+      "title": "Add: name the branch and PR step when committing the rebuilt sprint status",
+      "location": "skills/orch-status/SKILL.md:43",
+      "evidence": "'Commit the result through a PR' names no branch; --write edits the coordination checkout, usually on main, and the sprint-status-lag anomaly routes here.",
+      "recommendation": "Commit on a branch such as orch/sprint-status-rebuild, never main, and open a PR as in Close epic titled 'chore(orch): rebuild sprint status'."
+    }
+  ]
+}
