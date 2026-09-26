@@ -377,3 +377,80 @@ def test_truncated_review_list_adds_a_notice(tmp_path, monkeypatch):
     reg = {"pay": SimpleNamespace(repo="git@github.com:acme/pay.git")}
     found, _, notices = status_mod.reviews(reg, tmp_path)
     assert found and [n["code"] for n in notices] == ["review-list-truncated"]
+
+
+# --- regressions from the second analyze report ---
+
+def _reversed_history(mono):
+    mono.write("_bmad-output/planning-artifacts/epics.md", REVERSED).commit("plan")
+    land(mono, "1-2", {OAS: "openapi: 3.0.0\npaths: {/a: {}}\n"})
+    land(mono, "1-1", {OAS: "openapi: 3.0.0\npaths: {/a: {}, /b: {}}\n"})
+
+
+def test_shallow_clone_cut_through_the_markers_refuses_to_guess_the_order(mono, tmp_path):
+    _reversed_history(mono)
+    for depth, cut in ((1, True), (3, False)):     # 3 reaches the plan commit, before any marker
+        clone = tmp_path / f"clone{depth}"
+        mono.git("clone", "-q", f"--depth={depth}", f"file://{mono.path}", str(clone))
+        code, res = run_cli("status", "--no-host", "--repo", str(clone))
+        if cut:
+            assert code == 2 and "shallow clone" in res["error"], res
+        else:
+            assert code == 0 and "pin-drift" not in codes(res), res
+
+
+def test_fast_forward_merge_orders_a_story_by_its_last_marker_rewrite(mono):
+    mono.write("_bmad-output/planning-artifacts/epics.md", REVERSED).commit("plan")
+    mono.branch("story/1-1").write("docs/1-1.md", "draft\n").commit("early")
+    assert cli(mono, "marker", "write", "--story", "1-1")[0] == 0
+    mono.commit("early marker")
+    mono.checkout("main")
+    land(mono, "1-2", {OAS: "openapi: 3.0.0\npaths: {/a: {}}\n"})
+    mono.checkout("story/1-1").git("merge", "-q", "--no-edit", "main")
+    mono.write(OAS, "openapi: 3.0.0\npaths: {/a: {}, /b: {}}\n").commit("contract")
+    assert cli(mono, "marker", "write", "--story", "1-1")[0] == 0
+    mono.commit("marker rewrite")
+    mono.checkout("main").git("merge", "-q", "--ff-only", "story/1-1")
+    _, res = cli(mono, "status", "--no-host")
+    assert "pin-drift" not in codes(res), res["anomalies"]
+
+
+CROSS_EPIC = EPICS.split("### Story 1.4")[0] + """## Epic 2: Cleanup
+### Story 2.1: Remove legacy field
+**Subproject:** contracts
+**Depends on:** 1.3
+**Contract change:** narrow
+"""
+
+
+def test_migration_draft_lands_after_its_dependency_and_passes_plan_check(mono):
+    mono.write("_bmad-output/planning-artifacts/epics.md", CROSS_EPIC).commit("plan")
+    v1, v2 = "openapi: 3.0.0\npaths: {/pay: {}, /legacy: {}}\n", "openapi: 3.0.0\npaths: {/pay: {}}\n"
+    land(mono, "1-1", {OAS: v1})
+    land(mono, "1-2", {COPY: v1})
+    land(mono, "1-3", {"services/user/app.py": "migrated\n"})
+    land(mono, "2-1", {OAS: v2})
+    _, res = cli(mono, "status", "--no-host")
+    draft = next(a for a in res["anomalies"] if a["code"] == "pin-drift")["migration_draft"]
+    assert (draft["id"], draft["epic"], draft["depends_on"]) == ("2.2", 2, ["2.1"]), draft
+    mono.write("_bmad-output/planning-artifacts/epics.md", CROSS_EPIC + "\n" + draft["markdown"]).commit("paste")
+    code, res = cli(mono, "plan-check")
+    assert code == 0 and res["verdict"] == "PASS", res
+
+
+def test_one_migration_draft_covers_every_drifting_contract_of_a_subproject(mono):
+    from conftest import R, registry_yaml
+    events, events_copy = f"{C}/payment-service/events.yaml", "services/payment/events.yaml"
+    mono.write(f"{R}/payment-service.yaml", registry_yaml("payment-service", "services/payment",
+                                                         exports=[("openapi", OAS, COPY), ("events", events, events_copy)]))
+    mono.write(events, "asyncapi: 2.0.0\n").write(events_copy, "asyncapi: 2.0.0\n").commit("second contract")
+    e1, e2 = "asyncapi: 2.0.0\nchannels: {a: {}, legacy: {}}\n", "asyncapi: 2.0.0\nchannels: {a: {}}\n"
+    v1, v2 = "openapi: 3.0.0\npaths: {/pay: {}, /legacy: {}}\n", "openapi: 3.0.0\npaths: {/pay: {}}\n"
+    land(mono, "1-1", {OAS: v1, events: e1})
+    land(mono, "1-2", {COPY: v1, events_copy: e1})
+    land(mono, "1-3", {"services/user/app.py": "migrated\n"})
+    land(mono, "1-4", {OAS: v2, events: e2})
+    _, res = cli(mono, "status", "--no-host")
+    drafts = [a["migration_draft"] for a in res["anomalies"] if a["code"] == "pin-drift"]
+    assert len(drafts) == 2 and drafts[0] == drafts[1], drafts
+    assert drafts[0]["id"] == "1.5" and drafts[0]["contracts"] == sorted([OAS, events])

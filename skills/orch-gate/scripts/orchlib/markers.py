@@ -183,22 +183,46 @@ def load_marker(hit: dict, key: str) -> dict | None:
 
 
 def merge_order(tree: Tree) -> dict[str, int]:
-    """Story key -> position at which its marker landed on the tree's first-parent history (0 = first).
+    """Story key -> first-parent position (0 = oldest) of the commit where the tree's final marker content landed.
 
-    A merge commit counts as the moment its branch's marker landed, so a story rebased and merged later sorts
-    later, whatever its plan order. Empty when the history is not there (a shallow clone).
+    Following the final content rather than the marker's first add keeps the order right for every merge style:
+    a merge or squash commit adds it, and a fast-forward brings the branch's last rewrite of it, after any main
+    it merged in. The archive move keeps the content, so archived markers keep their position.
     """
-    try:
-        raw = out(tree.repo, "log", "--first-parent", "-m", "--reverse", "--diff-filter=A", "--name-only",
-                  "--format=", tree.ref, "--", MARKER_DIR)
-    except subprocess.CalledProcessError:
-        return {}
-    order: dict[str, int] = {}
+    _require_marker_history(tree)
+    raw = out(tree.repo, "log", "--first-parent", "-m", "--reverse", "--raw", "--no-abbrev", "--no-renames",
+              "--format=%x01", tree.ref, "--", MARKER_DIR, ARCHIVE_DIR)
+    first: dict[str, int] = {}
+    pos = -1
     for line in raw.splitlines():
-        m = MARKER_RE.match(line.strip())
-        if m:
-            order.setdefault(m.group(1), len(order))
+        if line == "\x01":
+            pos += 1
+        elif line.startswith(":"):
+            meta, _ = line.split("\t", 1)
+            _, _, _, blob, status = meta.split()
+            if status[0] in "AM":
+                first.setdefault(blob, pos)
+    order = {}
+    for key, path in keys_in(tree).items():
+        if (blob := tree.blob_sha(path)) in first:
+            order[key] = first[blob]
     return order
+
+
+def _require_marker_history(tree: Tree) -> None:
+    """A shallow clone cut through the markers' history would make the cut commit look like it added them all.
+
+    Only cuts on the first-parent chain matter: merge commits are read against their first parent.
+    """
+    if out(tree.repo, "rev-parse", "--is-shallow-repository") != "true":
+        return
+    shallow = Path(tree.repo, out(tree.repo, "rev-parse", "--git-path", "shallow"))
+    chain = set(out(tree.repo, "rev-list", "--first-parent", tree.ref).split())
+    for cut in shallow.read_text().split() if shallow.exists() else []:
+        if cut in chain and out(tree.repo, "ls-tree", "--name-only", cut, "--", MARKER_DIR, ARCHIVE_DIR):
+            raise OrchError(f"shallow clone: the history of {MARKER_DIR} on {tree.ref} in {tree.repo} is cut, so the "
+                            "merge order of contract stories is unknown. Fetch full history (actions/checkout "
+                            "fetch-depth: 0, GitLab GIT_DEPTH: 0, or git fetch --unshallow)")
 
 
 class PinIndex:
@@ -210,13 +234,13 @@ class PinIndex:
     """
 
     def __init__(self, stories, merged_map: dict[str, dict], coord: Tree):
-        order = merge_order(coord)
         plan = {k: i for i, k in enumerate(stories)}
         pins = {s.key: (s, (load_marker(merged_map[s.key], s.key) or {}).get("contract_pins") or {})
                 for s in stories.values() if s.key in merged_map}
         self.chain: dict[str, list[tuple[Story, str]]] = {}
-        contract = sorted((k for k, (s, _) in pins.items() if s.subproject == CONTRACTS),
-                          key=lambda k: (order.get(k, len(order) + plan[k]), plan[k]))
+        contract = [k for k, (s, _) in pins.items() if s.subproject == CONTRACTS]
+        order = merge_order(coord) if contract else {}
+        contract.sort(key=lambda k: (order.get(k, len(order) + plan[k]), plan[k]))
         for k in contract:
             s, p = pins[k]
             for path, sha_ in p.items():

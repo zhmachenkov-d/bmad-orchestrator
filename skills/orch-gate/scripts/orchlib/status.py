@@ -248,7 +248,7 @@ def build(reg: Registry, stories: StorySet, coord_root: Path, coord: Tree, cfg: 
                                   "waiting": waiting, "downstream": r["downstream"], "actions": []})
 
     index = markers.PinIndex(stories, merged_map, coord)
-    drafted: dict[int, int] = {}
+    migrate: dict[str, list[tuple[dict, object, dict]]] = {}
     for key, hit in merged_map.items():
         s = stories.get(key)
         if not s or s.epic in closed or not (m := markers.load_marker(hit, key)):
@@ -259,8 +259,13 @@ def build(reg: Registry, stories: StorySet, coord_root: Path, coord: Tree, cfg: 
             # a new story of this subproject converges only a not-migrated pin; an unrecorded change needs a
             # contract story, and a contract story's own drift is the contract owner's call
             if d["reason"] == "not-migrated" and s.subproject != CONTRACTS:
-                a["migration_draft"] = migration_draft(stories, s, d, index, drafted)
+                migrate.setdefault(s.subproject, []).append((a, s, d))
             anomalies.append(a)
+    drafted: dict[int, int] = {}
+    for sub, found in sorted(migrate.items()):
+        draft = migration_draft(stories, merged_map, sub, [(s, d) for _, s, d in found], index, drafted)
+        for a, _, _ in found:
+            a["migration_draft"] = draft
 
     for key, c in claimed.items():
         if key in done:
@@ -304,18 +309,27 @@ def build(reg: Registry, stories: StorySet, coord_root: Path, coord: Tree, cfg: 
             "review_source": review_source, "claims": claim_list}
 
 
-def migration_draft(stories: StorySet, s, drift: dict, index, drafted: dict[int, int]) -> dict:
-    """A story that makes `s`'s subproject build against the current contract, as a ready-to-paste plan block."""
-    taken = [int(m.group(1)) for x in stories.values() if x.epic == s.epic and (m := re.match(r"^\d+\.(\d+)", x.id))]
-    drafted[s.epic] = max([*taken, drafted.get(s.epic, 0)], default=0) + 1
-    story_id = f"{s.epic}.{drafted[s.epic]}"
-    chain = index.chain.get(drift["path"], [])
-    depends = [chain[-1][0].id] if chain else []
-    title = f"{s.subproject} builds against the current {PurePosixPath(drift['path']).name}"
-    block = (f"### Story {story_id}: {title}\n**Subproject:** {s.subproject}\n"
+def migration_draft(stories: StorySet, merged_map: dict, sub: str, found: list, index, drafted: dict[int, int]) -> dict:
+    """One story that makes `sub` build against every contract it drifts from, as a ready-to-paste plan block.
+
+    A new story of the subproject pins all of its contracts at once, so one draft covers every drifting path. It
+    goes last in the latest epic among the drifting stories and its dependencies, so it depends on nothing later
+    in the plan, and takes a number no story in the plan or on main has used.
+    """
+    paths = sorted({d["path"] for _, d in found})
+    deps = [stories[k] for k in stories if k in {c[-1][0].key for p in paths if (c := index.chain.get(p))}]
+    depends = [x.id for x in deps]
+    epic = max([s.epic for s, _ in found] + [x.epic for x in deps])
+    taken = [int(m.group(1)) for x in stories.values() if x.epic == epic and (m := re.match(r"^\d+\.(\d+)", x.id))]
+    taken += [int(m.group(1)) for k in merged_map if (m := re.match(rf"^{epic}-(\d+)", k))]
+    drafted[epic] = max([*taken, drafted.get(epic, 0)], default=0) + 1
+    story_id = f"{epic}.{drafted[epic]}"
+    names = ", ".join(PurePosixPath(p).name for p in paths)
+    title = f"{sub} builds against the current {names}"
+    block = (f"### Story {story_id}: {title}\n**Subproject:** {sub}\n"
              f"**Depends on:** {', '.join(depends) or 'none'}\n**Contract change:** none\n")
-    return {"id": story_id, "title": title, "subproject": s.subproject, "epic": s.epic, "depends_on": depends,
-            "contract_change": "none", "contract": drift["path"], "markdown": block}
+    return {"id": story_id, "title": title, "subproject": sub, "epic": epic, "depends_on": depends,
+            "contract_change": "none", "contracts": paths, "markdown": block}
 
 
 def _story_anomalies(row: dict, s, cfg: Config, sprint: dict, source: str, now: float) -> list[dict]:
