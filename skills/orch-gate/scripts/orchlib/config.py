@@ -65,11 +65,16 @@ class Config:
         return {**asdict(self), "closed_dir": self.closed_dir, "sprint_status": self.sprint_status, "prd": self.prd}
 
 
-def _rel(value: str, project_name: str) -> str:
+def _rel(value: str, project_name: str, absolute: bool = False) -> str:
+    """A config path relative to the coordination repo root; with `absolute`, a `/...` or `~...` path is kept as is."""
     v = str(value).replace("{project_name}", project_name)
     for prefix in ("{project-root}/", "{project-root}"):
         if v.startswith(prefix):
             v = v[len(prefix):]
+            break
+    else:
+        if absolute and v.startswith(("/", "~")):
+            return v.rstrip("/") or "/"
     return v.strip("/") if not v.startswith("..") else v.rstrip("/")
 
 
@@ -128,7 +133,7 @@ def user_settings(root: Path, cfg: Config) -> dict:
         if key not in merged:
             out[attr] = getattr(cfg, attr, None)
         else:
-            out[attr] = _rel(merged[key], name) if is_path else merged[key]
+            out[attr] = _rel(merged[key], name, absolute=True) if is_path else merged[key]
     return out
 
 
@@ -140,7 +145,7 @@ def load(tree: Tree) -> Config:
         coordination_repo=str(values["orch_coordination_repo"]),
         registry_dir=_rel(values["orch_registry_dir"], name),
         contracts_dir=_rel(values["orch_contracts_dir"], name),
-        worktrees_dir=_rel(values["orch_worktrees_dir"], name),
+        worktrees_dir=_rel(values["orch_worktrees_dir"], name, absolute=True),
         stale_claim_hours=float(values["orch_stale_claim_hours"]),
         review_wait_hours=float(values["orch_review_wait_hours"]),
         main_branch=str(values["orch_main_branch"]),

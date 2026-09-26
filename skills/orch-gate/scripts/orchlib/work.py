@@ -78,7 +78,9 @@ def pick(snapshot: dict, stories: StorySet, reg: Registry, user: str) -> dict:
     mine = [{"key": r["key"], "id": r["id"], "title": r["title"], "subproject": r["subproject"], "state": r["state"],
              "repo": _repo_of(reg, stories[r["key"]]), "claim_sha": r["claim_sha"], "branch": r["branch"],
              "idle_hours": r["idle_hours"]}
-            for r in rows if r["state"] in OPEN and same_user(r["claimant"], user)]
+            # an unread repo leaves a claimed story `unknown`: still the user's to resume or release
+            for r in rows if (r["state"] in OPEN or (r["state"] == "unknown" and r["claimant"]))
+            and same_user(r["claimant"], user)]
     severity = {"warn": 0, "info": 1}
     warnings = sorted(snapshot["anomalies"], key=lambda a: severity.get(a.get("severity"), 2))
     counts = {st: sum(r["state"] == st for r in rows) for st in ("done", "review", "in-progress", "ready", "blocked", "unknown")}
@@ -147,6 +149,7 @@ def prepare(repo: Path, key: str, main_branch: str, path: Path) -> dict:
     branch = story_branch(key)
     existing = worktrees(repo).get(branch)
     if existing is not None:
+        exclude_context(repo)   # a worktree made by hand has no exclude entry yet
         return {"status": "exists", "path": str(existing), "branch": branch}
     if path.exists() and any(path.iterdir()):
         raise OrchError(f"{path} exists and is not empty; pass --path <empty dir> for the worktree", "path-not-empty", path=str(path))
@@ -285,7 +288,10 @@ def write(worktree: Path, ctx: dict, coord: Tree, snapshot: bool) -> dict:
     shutil.rmtree(root / CONTEXT_DIR / "contracts", ignore_errors=True)  # a canonical dropped since the last write
     if snapshot:
         for c in ctx["contracts"]:
-            for rel, data in coord.files(c["path"]).items():
+            files = coord.files(c["path"])
+            if not files:
+                continue   # not in the coordination repo yet: nothing to snapshot
+            for rel, data in files.items():
                 dest = PurePosixPath(CONTEXT_DIR) / "contracts" / c["path"]
                 if coord.kind(c["path"]) == "tree":
                     dest = dest / rel
