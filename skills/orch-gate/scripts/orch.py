@@ -28,7 +28,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from orchlib import OrchError, SCHEMA_VERSION  # noqa: E402
-from orchlib import claims, close, config, detectors, gate, gitio, markers, plan, registry, report, sprint_status, stories  # noqa: E402
+from orchlib import claims, close, config, detectors, gate, gitio, markers, plan, registry, report, sprint_status, stories, work  # noqa: E402
 from orchlib import status as status_mod  # noqa: E402
 from orchlib.stories import key_from_any  # noqa: E402
 
@@ -261,6 +261,57 @@ def cmd_plan_check(args, env: Env):
     return emit({"ok": res["verdict"] != "FAIL", "registry_issues": issues, **res}, 1 if res["verdict"] == "FAIL" else 0)
 
 
+def cmd_next(args, env: Env):
+    reg = env.registry()
+    st = env.stories(reg)
+    snap = _status(args, env, reg, st)
+    user = args.user or _git_user(env.coord_root)
+    return emit({"ok": True, "coord_ref": env.coord_ref, **work.pick(snap, st, reg, user), "plan_issues": st.issues})
+
+
+def cmd_worktree(args, env: Env):
+    reg = env.registry()
+    st = env.stories(reg)
+    key = need_key(args.story)
+    s, sub = work.story_subproject(reg, st, key)
+    clone = work.local_clone(sub, env.repo, env.coord_root)
+    if clone is None:
+        raise OrchError(f"story {s.id} ({sub.name}) lives in {sub.repo}; run from a local clone of it "
+                        "or pass --repo <local clone> with --coord <coordination repo>")
+    user = args.user or _git_user(env.coord_root)
+    claim = next((c for c in claims.list_claims(env.coord_root, _claims_remote(env), fetch=not args.offline)
+                  if c["story"] == key), None)
+    if not claim or not work.same_user(claim["user"], user):
+        # the worktree is for the claimant: claim first, or take over a stale claim
+        return emit({"ok": False, "reason": "claimed-by-other" if claim else "not-claimed", "story": key,
+                     "claim": claim, "user": user}, 1)
+    path = Path(args.path) if args.path else work.default_path(
+        env.coord_root, config.user_settings(env.coord_root, env.cfg)["worktrees_dir"], key)
+    wt = work.prepare(clone, key, sub.branch, path)
+    ctx = work.context(reg, st, key, env.coord, env.cfg, gitio.sha(env.coord_root, env.coord_ref))
+    written = work.write(Path(wt["path"]), ctx, env.coord, snapshot=clone.resolve() != env.coord_root.resolve())
+    return emit({"ok": True, "story": key, "subproject": sub.name, "repo": sub.repo, "clone": str(clone),
+                 "claim": claim, "worktree": wt, "context": written, "plan_issues": ctx["plan_issues"]})
+
+
+def cmd_context(args, env: Env):
+    reg = env.registry()
+    st = env.stories(reg)
+    if args.story:
+        key = need_key(args.story)
+    else:
+        branch = gitio.out(env.repo, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
+        key = key_from_any(branch.removeprefix(status_mod.STORY_BRANCH)) if branch.startswith(status_mod.STORY_BRANCH) else None
+        if not key:
+            raise OrchError(f"not on a story/<N-M> branch ({branch or 'detached HEAD'}); pass --story")
+    ctx = work.context(reg, st, key, env.coord, env.cfg, gitio.sha(env.coord_root, env.coord_ref))
+    written = None
+    if args.write:
+        work.exclude_context(env.repo)
+        written = work.write(env.repo, ctx, env.coord, snapshot=not env.same)
+    return emit({"ok": True, "context": ctx, "written": written})
+
+
 def cmd_report(args, env: Env):
     reg = env.registry()
     st = env.stories(reg)
@@ -394,6 +445,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("plan-check", parents=[common], help="plan validation: PASS / CONCERNS / FAIL over epics and registry")
 
+    nx = sub.add_parser("next", parents=[common], help="warnings, your open stories and the ready stories ranked by what they unblock")
+    nx.add_argument("--user", help="'Name <email>' whose open claims to list (default: git config)")
+    nx.add_argument("--no-host", action="store_true", help="do not ask gh/glab for open reviews")
+
+    wt = sub.add_parser("worktree", parents=[common], help="story/<N-M> worktree in the story's repo, with its node context; needs your claim")
+    wt.add_argument("--story", required=True)
+    wt.add_argument("--user", help="'Name <email>' holding the claim (default: git config)")
+    wt.add_argument("--path", help="worktree directory (default: <orch_worktrees_dir>/story-<N-M>)")
+
+    cx = sub.add_parser("context", parents=[common], help="node context of a story: boundaries, contracts, pins, how to finish")
+    cx.add_argument("--story", help="default: the story of the checked-out story/<N-M> branch")
+    cx.add_argument("--write", action="store_true", help=f"write it to {work.CONTEXT_DIR}/ in --repo (kept out of commits)")
+
     rp = sub.add_parser("report", parents=[common], help="self-contained HTML epic report (optionally PDF)")
     rp.add_argument("--epic", type=int, required=True)
     rp.add_argument("--pdf", action="store_true", help="also print it to PDF with headless Chromium/Chrome")
@@ -417,9 +481,9 @@ def build_parser() -> argparse.ArgumentParser:
 COMMANDS = {"config": cmd_config, "registry": cmd_registry, "stories": cmd_stories, "merged": cmd_merged,
             "deps": cmd_deps, "marker": cmd_marker, "claim": cmd_claim, "sprint-status": cmd_sprint_status,
             "epic": cmd_epic, "gate": cmd_gate, "status": cmd_status, "plan-check": cmd_plan_check,
-            "report": cmd_report}
+            "report": cmd_report, "next": cmd_next, "worktree": cmd_worktree, "context": cmd_context}
 # Commands that read what others pushed refresh origin first on local runs, as the gate does.
-REFRESHING = {"gate", "status", "report", "epic"}
+REFRESHING = {"gate", "status", "report", "epic", "next", "worktree", "context"}
 
 
 def main(argv=None) -> int:
