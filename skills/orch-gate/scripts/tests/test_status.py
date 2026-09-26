@@ -227,3 +227,153 @@ def test_polyrepo_close_pushes_the_archive_branch_to_the_code_repo(tmp_path):
     assert code == 0 and res["pass"] == "record" and res["published"][0]["status"] == "created-local", res
     code, res = run_cli("epic", "close", "--epic", "1", "--push", "--user", "Ann <a@x>", "--repo", str(coord.path))
     assert res["published"][0]["status"] == "exists"
+
+
+# --- regressions from the analyze report ---
+
+REVERSED = """## Epic 1: Payments
+### Story 1.1: First contract change
+**Subproject:** contracts
+**Depends on:** none
+**Contract change:** expand
+
+### Story 1.2: Second contract change
+**Subproject:** contracts
+**Depends on:** none
+**Contract change:** expand
+
+### Story 1.3: Payment adopts the contract
+**Subproject:** payment-service
+**Depends on:** 1.1, 1.2
+"""
+
+
+def test_contract_chain_follows_merge_order_not_plan_order(mono):
+    mono.write("_bmad-output/planning-artifacts/epics.md", REVERSED).commit("plan")
+    v1, v2 = "openapi: 3.0.0\npaths: {/a: {}}\n", "openapi: 3.0.0\npaths: {/a: {}, /b: {}}\n"
+    land(mono, "1-2", {OAS: v1})       # the later story in the plan merges first
+    land(mono, "1-1", {OAS: v2})       # the earlier one rebases on it and merges second
+    land(mono, "1-3", {COPY: v2})
+    _, res = cli(mono, "status", "--no-host")
+    assert "pin-drift" not in codes(res), res["anomalies"]
+    assert res["epics"][0]["state"] == "archive-needed"
+
+
+def _poly(tmp_path, extra_repo=None):
+    from conftest import R, Repo, registry_yaml
+    coord, code_repo = Repo(tmp_path / "coord"), Repo(tmp_path / "payment")
+    url = str(code_repo.path)
+    coord.write(f"{R}/payment-service.yaml", registry_yaml(
+        "payment-service", "src", repo=url, exports=[("openapi", OAS, "docs/openapi.yaml")]))
+    if extra_repo:
+        coord.write(f"{R}/user-service.yaml", registry_yaml("user-service", "src", repo=extra_repo, imports=["payment-service"]))
+    coord.write(OAS, "openapi: 3.0.0\n")
+    coord.write("_bmad-output/planning-artifacts/epics.md", "## Epic 1: P\n### Story 1.2: Impl\n**Subproject:** payment-service\n")
+    coord.write(STATUS, "development_status:\n  epic-1: in-progress\n  1-2-impl: backlog\n")
+    coord.commit()
+    code_repo.write("src/app.py", "x\n").write("docs/openapi.yaml", "openapi: 3.0.0\n").commit()
+    code_repo.branch("story/1-2").write("src/app.py", "y\n")
+    assert run_cli("marker", "write", "--story", "1.2", "--repo", url, "--coord", str(coord.path))[0] == 0
+    code_repo.commit()
+    return coord, code_repo, url
+
+
+def test_close_record_pass_waits_while_a_repo_is_unread(tmp_path):
+    coord, code_repo, url = _poly(tmp_path, extra_repo=str(tmp_path / "missing"))
+    code_repo.checkout("main").git("merge", "-q", "--no-ff", "story/1-2")
+    flags = ("--user", "Ann <a@x>", "--repo", str(coord.path))
+    code, res = run_cli("epic", "close", "--epic", "1", "--push", *flags)
+    assert res["pass"] == "archive", res
+    code_repo.git("merge", "-q", "--no-ff", "orch/close-epic-1")
+    code, res = run_cli("epic", "close", "--epic", "1", "--push", *flags)
+    assert code == 1 and res["pass"] == "blocked" and "published" not in res, res
+    assert [p["code"] for p in res["problems"]] == ["repos-unread"]
+    assert not coord.git("branch", "--list", "orch/close-epic-1-record")
+
+
+def test_unread_story_branches_never_offer_take_over(tmp_path, monkeypatch):
+    from orchlib import OrchError
+    coord, _, _ = _poly(tmp_path)
+    run_cli("claim", "create", "--story", "1-2", "--user", "Ann <a@x>", "--repo", str(coord.path), env={"GIT_COMMITTER_DATE": OLD})
+
+    def unreadable(*a, **k):
+        raise OrchError("no access")
+    monkeypatch.setattr(status_mod, "fetch_branches", unreadable)
+    _, res = run_cli("status", "--no-host", "--repo", str(coord.path))
+    assert by_key(res)["1-2"]["activity_source"] == "claim-only"
+    stale = next(a for a in res["anomalies"] if a["code"] == "stale-claim")
+    assert stale["actions"] == [] and "could not be read" in stale["message"]
+
+
+def test_story_branches_come_from_origin_not_this_clone(mono, tmp_path):
+    bare = tmp_path / "origin.git"
+    mono.git("init", "-q", "--bare", str(bare))
+    mono.git("remote", "add", "origin", str(bare))
+    mono.git("push", "-q", "origin", "main")
+    mono.branch("story/1-1").write(OAS, "openapi: 3.0.0\npaths: {/x: {}}\n").commit("local only")
+    mono.checkout("main")
+    _, res = cli(mono, "status", "--no-host")
+    assert by_key(res)["1-1"]["branch"] is None, res
+    mono.git("push", "-q", "origin", "story/1-1")
+    _, res = cli(mono, "status", "--no-host")
+    assert by_key(res)["1-1"]["branch"] == "story/1-1"
+
+
+def test_epic_filter_keeps_cross_epic_dependents_and_rejects_unknown_epics(mono):
+    text = EPICS + "\n## Epic 2: More\n### Story 2.1: Users again\n**Subproject:** user-service\n**Depends on:** 1.1\n"
+    mono.write("_bmad-output/planning-artifacts/epics.md", text).commit()
+    _, res = cli(mono, "status", "--no-host", "--epic", "1")
+    bottleneck = next(a for a in res["anomalies"] if a["code"] == "contract-bottleneck")
+    assert "2-1" in bottleneck["waiting"] and {s["epic"] for s in res["stories"]} == {1}
+    code, res = cli(mono, "status", "--no-host", "--epic", "9")
+    assert code == 2 and "epic 9" in res["error"], res
+    assert cli(mono, "report", "--epic", "9", "--no-host")[0] == 2
+
+
+def test_migration_draft_is_a_ready_story_with_a_free_id(mono):
+    _run_epic(mono, adopt=False)
+    _, res = cli(mono, "status", "--no-host")
+    draft = next(a for a in res["anomalies"] if a["code"] == "pin-drift")["migration_draft"]
+    assert draft["id"] == "1.5" and draft["markdown"].startswith("### Story 1.5: payment-service ")
+    assert "**Depends on:** 1.4" in draft["markdown"]
+    lag = next(a for a in res["anomalies"] if a["code"] == "sprint-status-lag")
+    assert lag["actions"][0]["args"] == ["sprint-status", "derive"]   # preview first; the skill adds --write
+
+
+def test_unrecorded_contract_change_gets_no_migration_draft(mono):
+    land(mono, "1-1", {OAS: "openapi: 3.0.0\npaths: {/pay: {}}\n"})
+    land(mono, "1-2", {COPY: "openapi: 3.0.0\npaths: {/pay: {}}\n"})
+    mono.write(OAS, "openapi: 3.0.0\npaths: {/pay: {}, /sneaky: {}}\n").commit("edit outside a story")
+    _, res = cli(mono, "status", "--no-host")
+    drift = [a for a in res["anomalies"] if a["code"] == "pin-drift"]
+    assert drift and all(a["reason"] == "unrecorded-change" and "migration_draft" not in a for a in drift), drift
+
+
+def test_close_push_refuses_a_pass_other_than_the_confirmed_one(mono):
+    _run_epic(mono, adopt=True)
+    code, res = cli(mono, "epic", "close", "--epic", "1", "--push", "--expect-pass", "record")
+    assert code == 1 and res["code"] == "pass-changed" and res["pass"] == "archive" and "published" not in res
+    assert not mono.git("branch", "--list", "orch/close-epic-1")
+
+
+def test_plan_check_flags_an_ambiguous_narrow_target(mono):
+    from conftest import R, registry_yaml
+    ledger = f"{C}/ledger-service/openapi.yaml"
+    mono.write(f"{R}/ledger-service.yaml", registry_yaml("ledger-service", "services/ledger", exports=[("openapi", ledger, None)]))
+    mono.write(ledger, "openapi: 3.0.0\npaths: {}\n")
+    mono.write(f"{R}/payment-service.yaml", registry_yaml("payment-service", "services/payment", imports=["ledger-service"],
+                                                         exports=[("openapi", OAS, COPY)]))
+    mono.write(f"{R}/user-service.yaml", registry_yaml("user-service", "services/user", imports=["payment-service", "ledger-service"]))
+    mono.commit()
+    code, res = cli(mono, "plan-check")
+    assert code == 0 and res["verdict"] == "CONCERNS", res
+    assert [f["code"] for f in res["findings"]] == ["ambiguous-narrow-target"]
+
+
+def test_truncated_review_list_adds_a_notice(tmp_path, monkeypatch):
+    rows = [{"headRefName": "story/1-2", "createdAt": OLD, "url": "u"}]
+    monkeypatch.setenv("PATH", fake_bin(tmp_path, "gh", f"print({json.dumps(json.dumps(rows))})\n"))
+    monkeypatch.setattr(status_mod, "GH_LIMIT", 1)
+    reg = {"pay": SimpleNamespace(repo="git@github.com:acme/pay.git")}
+    found, _, notices = status_mod.reviews(reg, tmp_path)
+    assert found and [n["code"] for n in notices] == ["review-list-truncated"]

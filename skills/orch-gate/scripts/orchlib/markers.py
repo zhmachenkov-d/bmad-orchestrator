@@ -10,7 +10,7 @@ import yaml
 
 from . import OrchError
 from .config import Config
-from .gitio import Tree, fetch_tree, normalize_repo, sha
+from .gitio import Tree, fetch_tree, normalize_repo, out, sha
 from .registry import CONTRACTS, Registry, pin_paths
 from .stories import KEY_RE, Story
 
@@ -171,7 +171,7 @@ def close_check(epic: int, stories, reg: Registry, merged_map: dict[str, dict], 
         if errs or marker is None:
             problems.append({"story": s.key, "message": f"marker {hit['path']}: {'; '.join(errs)}"})
             continue
-        index = index or PinIndex(stories, merged_map)
+        index = index or PinIndex(stories, merged_map, coord)
         for d in pin_drift(s, marker, stories, merged_map, coord, index):
             problems.append({"story": s.key, "code": "pin-drift", "message": d["message"]})
     return problems
@@ -182,20 +182,53 @@ def load_marker(hit: dict, key: str) -> dict | None:
     return None if errs else marker
 
 
-class PinIndex:
-    """What merged markers pinned: the contract chain and, per (subproject, canonical), the latest pinning story."""
+def merge_order(tree: Tree) -> dict[str, int]:
+    """Story key -> position at which its marker landed on the tree's first-parent history (0 = first).
 
-    def __init__(self, stories, merged_map: dict[str, dict]):
+    A merge commit counts as the moment its branch's marker landed, so a story rebased and merged later sorts
+    later, whatever its plan order. Empty when the history is not there (a shallow clone).
+    """
+    try:
+        raw = out(tree.repo, "log", "--first-parent", "-m", "--reverse", "--diff-filter=A", "--name-only",
+                  "--format=", tree.ref, "--", MARKER_DIR)
+    except subprocess.CalledProcessError:
+        return {}
+    order: dict[str, int] = {}
+    for line in raw.splitlines():
+        m = MARKER_RE.match(line.strip())
+        if m:
+            order.setdefault(m.group(1), len(order))
+    return order
+
+
+class PinIndex:
+    """What merged markers pinned: the contract chain and, per (subproject, canonical), the latest pinning story.
+
+    The chain is in merge order on coordination main, where every contract story lands. A subproject's latest
+    pinner is the one pinning the newest version in that chain: pins must equal main at merge, so a later merge
+    never pins an older version, and this needs no history of the subproject's own repo.
+    """
+
+    def __init__(self, stories, merged_map: dict[str, dict], coord: Tree):
+        order = merge_order(coord)
+        plan = {k: i for i, k in enumerate(stories)}
+        pins = {s.key: (s, (load_marker(merged_map[s.key], s.key) or {}).get("contract_pins") or {})
+                for s in stories.values() if s.key in merged_map}
         self.chain: dict[str, list[tuple[Story, str]]] = {}
+        contract = sorted((k for k, (s, _) in pins.items() if s.subproject == CONTRACTS),
+                          key=lambda k: (order.get(k, len(order) + plan[k]), plan[k]))
+        for k in contract:
+            s, p = pins[k]
+            for path, sha_ in p.items():
+                self.chain.setdefault(path, []).append((s, sha_))
         self.latest: dict[tuple[str, str], str] = {}
-        for s in stories.values():  # plan order
-            hit = merged_map.get(s.key)
-            if not hit:
-                continue
-            for path, sha_ in ((load_marker(hit, s.key) or {}).get("contract_pins") or {}).items():
-                self.latest[(s.subproject, path)] = s.key
-                if s.subproject == CONTRACTS:
-                    self.chain.setdefault(path, []).append((s, sha_))
+        rank: dict[tuple[str, str], tuple] = {}
+        for k, (s, p) in pins.items():
+            for path, sha_ in p.items():
+                pos = max((i for i, (_, v) in enumerate(self.chain.get(path, [])) if v == sha_), default=-1)
+                r = (pos, plan[k])
+                if rank.get((s.subproject, path), (-2,)) < r:
+                    rank[(s.subproject, path)], self.latest[(s.subproject, path)] = r, k
 
 
 def pin_drift(story: Story, marker: dict, stories, merged_map: dict[str, dict], coord: Tree,
@@ -208,7 +241,7 @@ def pin_drift(story: Story, marker: dict, stories, merged_map: dict[str, dict], 
     gate rejected breaking ones) or from a `narrow` story that depends on a story of this subproject, i.e. this
     subproject migrated. A contract story's own pins are converged while they sit in the chain.
     """
-    index = index or PinIndex(stories, merged_map)
+    index = index or PinIndex(stories, merged_map, coord)
     drift = []
     for path, pinned in (marker.get("contract_pins") or {}).items():
         current = coord.blob_sha(path)

@@ -9,11 +9,12 @@ their own --coord flags.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import time
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from . import OrchError
 from . import claims as claims_mod
@@ -25,6 +26,8 @@ from .stories import StorySet, id_to_key
 
 STORY_BRANCH = "story/"
 HOST_TIMEOUT = 30
+GH_LIMIT = 1000
+GLAB_PER_PAGE, GLAB_PAGES = 100, 10
 
 
 def story_branch(key: str) -> str:
@@ -41,23 +44,31 @@ def _repo_url(repo: str, coord_root: Path) -> str | None:
 
 
 def branch_activity(reg: Registry, coord_root: Path, cache_root: Path, offline: bool) -> tuple[dict, list[dict]]:
-    """(repo, key) -> (sha, unix time) of `story/<key>` tips per registry repo; plus repos whose branches were not read."""
+    """(repo, key) -> (sha, unix time) of `story/<key>` tips per registry repo; plus repos whose branches were not read.
+
+    Tips come from the remote, never from this clone's own branches, so every clone sees the same idle times.
+    Only a coordination repo without a remote falls back to its local branches.
+    """
     tips, unread, seen = {}, [], set()
     for sub in [*reg.values()]:
         ident = normalize_repo(sub.repo)
         if ident in seen:
             continue
         seen.add(ident)
-        if ident == ".":
-            found = branch_tips(coord_root, (f"refs/remotes/origin/{STORY_BRANCH}", f"refs/heads/{STORY_BRANCH}"))
-        elif offline:
-            continue
-        else:
-            try:
-                found = fetch_branches(sub.repo, STORY_BRANCH, cache_root / "repos")
-            except (OrchError, subprocess.SubprocessError, OSError) as exc:
-                unread.append({"code": "branches-unreadable", "repo": sub.repo, "message": f"cannot read story branches of {sub.repo}: {exc}"})
+        url = remote_url(coord_root) if ident == "." else sub.repo
+        try:
+            if ident == "." and not url:
+                found = branch_tips(coord_root, (f"refs/heads/{STORY_BRANCH}",))
+            elif ident == "." and offline:
+                found = branch_tips(coord_root, (f"refs/remotes/origin/{STORY_BRANCH}",))
+            elif offline:
+                unread.append({"code": "branches-offline", "repo": sub.repo, "message": f"offline: story branches of {sub.repo} not read"})
                 continue
+            else:
+                found = fetch_branches(url, STORY_BRANCH, cache_root / "repos")
+        except (OrchError, subprocess.SubprocessError, OSError) as exc:
+            unread.append({"code": "branches-unreadable", "repo": sub.repo, "message": f"cannot read story branches of {sub.repo}: {exc}"})
+            continue
         for key, tip in found.items():
             tips[(ident, key)] = tip
     return tips, unread
@@ -70,21 +81,32 @@ def _host_tool(url: str) -> str | None:
     return "glab" if "gitlab" in host else "gh"
 
 
-def _open_reviews(tool: str, url: str) -> list[dict]:
-    """[{branch, created_at, url}] of open PRs/MRs whose head is a story branch."""
-    if tool == "gh":
-        argv = ["gh", "pr", "list", "-R", normalize_repo(url), "--state", "open", "--limit", "500",
-                "--json", "headRefName,createdAt,url"]
-        keys = ("headRefName", "createdAt", "url")
-    else:
-        argv = ["glab", "mr", "list", "-R", url, "--output", "json", "--per-page", "100"]
-        keys = ("source_branch", "created_at", "web_url")
+def _run_host(argv: list[str]) -> list[dict]:
     proc = subprocess.run(argv, capture_output=True, text=True, timeout=HOST_TIMEOUT)
     if proc.returncode:
-        raise OrchError((proc.stderr or proc.stdout).strip().splitlines()[-1] if (proc.stderr or proc.stdout).strip() else f"{tool} failed")
-    rows = json.loads(proc.stdout or "[]")
-    return [{"branch": r.get(keys[0], ""), "created_at": r.get(keys[1]), "url": r.get(keys[2])}
-            for r in rows if str(r.get(keys[0], "")).startswith(STORY_BRANCH)]
+        text = (proc.stderr or proc.stdout).strip()
+        raise OrchError(text.splitlines()[-1] if text else f"{argv[0]} failed")
+    return json.loads(proc.stdout or "[]")
+
+
+def _open_reviews(tool: str, url: str) -> tuple[list[dict], bool]:
+    """[{branch, created_at, url}] of open PRs/MRs whose head is a story branch; True when the list was cut short."""
+    if tool == "gh":
+        rows = _run_host(["gh", "pr", "list", "-R", normalize_repo(url), "--state", "open", "--limit", str(GH_LIMIT),
+                          "--json", "headRefName,createdAt,url"])
+        keys, truncated = ("headRefName", "createdAt", "url"), len(rows) >= GH_LIMIT
+    else:
+        rows, truncated = [], True
+        for page in range(1, GLAB_PAGES + 1):
+            batch = _run_host(["glab", "mr", "list", "-R", url, "--output", "json", "--per-page", str(GLAB_PER_PAGE),
+                               "--page", str(page)])
+            rows += batch
+            if len(batch) < GLAB_PER_PAGE:
+                truncated = False
+                break
+        keys = ("source_branch", "created_at", "web_url")
+    return ([{"branch": r.get(keys[0], ""), "created_at": r.get(keys[1]), "url": r.get(keys[2])}
+             for r in rows if str(r.get(keys[0], "")).startswith(STORY_BRANCH)], truncated)
 
 
 def reviews(reg: Registry, coord_root: Path) -> tuple[dict, dict, list[dict]]:
@@ -100,13 +122,16 @@ def reviews(reg: Registry, coord_root: Path) -> tuple[dict, dict, list[dict]]:
                                 "message": f"{tool} not installed: review waits in {repo} fall back to branch age"})
             continue
         try:
-            rows = _open_reviews(tool, url)
+            rows, truncated = _open_reviews(tool, url)
         except (OrchError, subprocess.SubprocessError, OSError, json.JSONDecodeError) as exc:
             sources[ident] = "none"
             notices.append({"code": "review-host-unavailable", "repo": repo,
                             "message": f"{tool} could not list reviews of {repo} ({exc}); falling back to branch age"})
             continue
         sources[ident] = tool
+        if truncated:
+            notices.append({"code": "review-list-truncated", "repo": repo,
+                            "message": f"{tool} listed only the newest open reviews of {repo}; older story reviews may show as in-progress"})
         for r in rows:
             found[(ident, r["branch"][len(STORY_BRANCH):])] = r
     return found, sources, notices
@@ -165,14 +190,15 @@ def build(reg: Registry, stories: StorySet, coord_root: Path, coord: Tree, cfg: 
     sprint = (sprint_status.parsed(sprint_text) or {}) if sprint_text else {}
     done = set(merged_map)
     downstream = _downstream(stories)
-    epics = sorted({s.epic for s in stories.values()} if epic is None else {epic})
-    critical = {e: critical_path(stories, e, done) for e in epics}
+    # states and anomalies over every epic, so --epic filters the output without changing it
+    all_epics = sorted({s.epic for s in stories.values()})
+    epics = all_epics if epic is None else [epic]
+    critical = {e: critical_path(stories, e, done) for e in all_epics}
+    branch_blind = {normalize_repo(u["repo"]) for u in branch_unread}
     on_critical = {k for path in critical.values() for k in path}
 
     rows, anomalies = [], []
     for s in stories.values():
-        if s.epic not in epics:
-            continue
         sub = reg.get(s.subproject) if s.subproject else None
         ident = normalize_repo(sub.repo) if sub else "."
         claim = claimed.get(s.key)
@@ -199,6 +225,9 @@ def build(reg: Registry, stories: StorySet, coord_root: Path, coord: Tree, cfg: 
             "claimant": (claim or {}).get("user"), "claim_sha": (claim or {}).get("sha"),
             "claimed_at": iso((claim or {}).get("claimed_at")), "branch": story_branch(s.key) if tip else None,
             "last_activity": iso(activity), "idle_hours": round((now - activity) / 3600, 1) if activity else None,
+            # claim-only: the story branch could not be read, so the claim time is all that is known
+            "activity_source": "branch" if tip and tip[1] >= ((claim or {}).get("claimed_at") or 0) else (
+                "claim-only" if ident in branch_blind else "claim") if claim else ("branch" if tip else None),
             "review": {**review, "age_hours": round((now - (_parse_time(review["created_at"]) or now)) / 3600, 1)} if review else None,
             "blocked_by": [d for d in deps if d not in done],
             "dependents": stories.dependents(s.key), "downstream": len(downstream[s.key]),
@@ -218,18 +247,20 @@ def build(reg: Registry, stories: StorySet, coord_root: Path, coord: Tree, cfg: 
                                              f"{' and is on the critical path' if r['critical'] else ''}; {r['downstream']} downstream",
                                   "waiting": waiting, "downstream": r["downstream"], "actions": []})
 
-    index = markers.PinIndex(stories, merged_map)
+    index = markers.PinIndex(stories, merged_map, coord)
+    drafted: dict[int, int] = {}
     for key, hit in merged_map.items():
         s = stories.get(key)
-        if not s or s.epic in closed or s.epic not in epics or not (m := markers.load_marker(hit, key)):
+        if not s or s.epic in closed or not (m := markers.load_marker(hit, key)):
             continue
         for d in markers.pin_drift(s, m, stories, merged_map, coord, index):
-            latest = index.chain.get(d["path"], [])
-            anomalies.append({"code": "pin-drift", "story": key, "severity": "warn", "message": f"story {s.id}: {d['message']}",
-                              "path": d["path"], "reason": d["reason"], "actions": [],
-                              "migration_draft": {"subproject": s.subproject, "epic": s.epic,
-                                                  "depends_on": [latest[-1][0].id] if latest else [],
-                                                  "contract_change": "none", "contract": d["path"]}})
+            a = {"code": "pin-drift", "story": key, "severity": "warn", "message": f"story {s.id}: {d['message']}",
+                 "path": d["path"], "reason": d["reason"], "actions": []}
+            # a new story of this subproject converges only a not-migrated pin; an unrecorded change needs a
+            # contract story, and a contract story's own drift is the contract owner's call
+            if d["reason"] == "not-migrated" and s.subproject != CONTRACTS:
+                a["migration_draft"] = migration_draft(stories, s, d, index, drafted)
+            anomalies.append(a)
 
     for key, c in claimed.items():
         if key in done:
@@ -245,7 +276,12 @@ def build(reg: Registry, stories: StorySet, coord_root: Path, coord: Tree, cfg: 
     if lag and not unread:
         anomalies.append({"code": "sprint-status-lag", "story": None, "severity": "info",
                           "message": f"{len(lag)} merged stories are not done in sprint-status.yaml",
-                          "keys": lag, "actions": [{"label": "rebuild sprint status", "args": ["sprint-status", "derive", "--write"]}]})
+                          "keys": lag, "actions": [{"label": "rebuild sprint status", "args": ["sprint-status", "derive"]}]})
+
+    if epic is not None:
+        rows = [r for r in rows if r["epic"] == epic]
+        shown = {r["key"] for r in rows}
+        anomalies = [a for a in anomalies if a.get("story") is None or a["story"] in shown]
 
     epic_rows = []
     for e in epics:
@@ -268,13 +304,29 @@ def build(reg: Registry, stories: StorySet, coord_root: Path, coord: Tree, cfg: 
             "review_source": review_source, "claims": claim_list}
 
 
+def migration_draft(stories: StorySet, s, drift: dict, index, drafted: dict[int, int]) -> dict:
+    """A story that makes `s`'s subproject build against the current contract, as a ready-to-paste plan block."""
+    taken = [int(m.group(1)) for x in stories.values() if x.epic == s.epic and (m := re.match(r"^\d+\.(\d+)", x.id))]
+    drafted[s.epic] = max([*taken, drafted.get(s.epic, 0)], default=0) + 1
+    story_id = f"{s.epic}.{drafted[s.epic]}"
+    chain = index.chain.get(drift["path"], [])
+    depends = [chain[-1][0].id] if chain else []
+    title = f"{s.subproject} builds against the current {PurePosixPath(drift['path']).name}"
+    block = (f"### Story {story_id}: {title}\n**Subproject:** {s.subproject}\n"
+             f"**Depends on:** {', '.join(depends) or 'none'}\n**Contract change:** none\n")
+    return {"id": story_id, "title": title, "subproject": s.subproject, "epic": s.epic, "depends_on": depends,
+            "contract_change": "none", "contract": drift["path"], "markdown": block}
+
+
 def _story_anomalies(row: dict, s, cfg: Config, sprint: dict, source: str, now: float) -> list[dict]:
     found = []
     key, idle = row["key"], row["idle_hours"]
     if row["state"] == "in-progress" and idle is not None and idle > cfg.stale_claim_hours:
-        found.append({"code": "stale-claim", "story": key, "severity": "warn",
-                      "message": f"story {s.id} claimed by {row['claimant']}: no activity for {idle:.0f}h (> {cfg.stale_claim_hours:g}h)",
-                      "actions": [{"label": "take over", "args": ["claim", "take-over", "--story", key, "--expect", row["claim_sha"]]},
+        blind = row["activity_source"] == "claim-only"
+        found.append({"code": "stale-claim", "story": key, "severity": "info" if blind else "warn",
+                      "message": f"story {s.id} claimed by {row['claimant']}: no activity for {idle:.0f}h (> {cfg.stale_claim_hours:g}h)"
+                                 + (", counting from the claim only: its story branch could not be read" if blind else ""),
+                      "actions": [] if blind else [{"label": "take over", "args": ["claim", "take-over", "--story", key, "--expect", row["claim_sha"]]},
                                   {"label": "release", "args": ["claim", "release", "--story", key, "--expect", row["claim_sha"]]}]})
     if row["review"] and row["review"]["age_hours"] > cfg.review_wait_hours:
         found.append({"code": "stuck-review", "story": key, "severity": "warn", "source": source,

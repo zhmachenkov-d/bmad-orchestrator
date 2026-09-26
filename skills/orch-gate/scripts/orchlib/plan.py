@@ -2,7 +2,8 @@
 
 FAIL: story-structure issues (the same ones the gate enforces per PR), and a `narrow` contract story that does not
 depend on a story of every registry consumer of the contract it narrows. CONCERNS: a dependency between two
-subprojects that the registry `imports` do not connect, and a `narrow` with no earlier `expand` story.
+subprojects that the registry `imports` do not connect, a `narrow` with no earlier `expand` story, and a `narrow` whose
+target exporter the plan leaves ambiguous.
 """
 
 from __future__ import annotations
@@ -38,12 +39,22 @@ def check(stories: StorySet, reg: Registry) -> dict:
 
 
 def _narrow(s, deps, reg: Registry) -> list[dict]:
-    """A narrow story passes when, for some exporter its dependencies point at, it depends on every consumer."""
+    """A narrow story passes when it depends on every consumer of each exporter its dependencies point at.
+
+    The plan does not say which contract a narrow changes, so when its dependencies cover the consumers of one
+    such exporter but not of another, the target is ambiguous: the gate decides on the real diff.
+    """
     dep_subs = {d.subproject for d in deps}
     candidates = {e.name: reg.consumers(e.name) for e in reg.values() if e.exports and e.name != CONTRACTS}
     related = {name: cons for name, cons in candidates.items() if set(cons) & dep_subs}
-    if any(set(cons) <= dep_subs for cons in related.values()):
+    covered = sorted(n for n, cons in related.items() if set(cons) <= dep_subs)
+    if related and len(covered) == len(related):
         return []
+    if covered:
+        gaps = "; ".join(f"{n}: {', '.join(sorted(set(c) - dep_subs))}" for n, c in sorted(related.items()) if n not in covered)
+        return [{"severity": "concern", "code": "ambiguous-narrow-target", "story": s.id,
+                 "message": f"story {s.id} covers every consumer of {', '.join(covered)} but not of other exporters its "
+                            f"dependencies point at ({gaps}); if it narrows one of those, the gate will fail it"}]
     if not related:
         missing = "; ".join(f"{n}: {', '.join(c)}" for n, c in sorted(candidates.items()) if c) or "none"
         return [{"severity": "fail", "code": "narrow-without-migration", "story": s.id,

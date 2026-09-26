@@ -2,7 +2,7 @@
 
 archive: every repo holding live markers of the epic gets branch `orch/close-epic-N`, moving each marker
          unchanged to `.orch/archive/epic-N/`. The gate accepts exactly that move.
-record:  once those are merged and the close check passes, the coordination repo gets branch
+record:  once those are merged, the close check passes and every registry repo was read, the coordination repo gets branch
          `orch/close-epic-N-record` adding `<orch dir>/closed/epic-N.yaml`, sprint status with `epic-N: done`,
          and the retro data file `{implementation_artifacts}/orch/reports/orch-epic-N.json`.
 
@@ -58,6 +58,10 @@ def plan(epic: int, stories, reg: Registry, coord: Tree, cfg: Config, merged_map
     problems = markers.close_check(epic, stories, reg, merged_map, coord, unknown)
     if problems:
         return {**base, "pass": "blocked", "problems": problems}
+    if unread:
+        # the record pass rewrites sprint status, which would demote the stories of repos it could not read
+        return {**base, "pass": "blocked", "unread_repos": unread,
+                "problems": [{"story": None, "code": "repos-unread", "message": u["message"]} for u in unread]}
     return {**base, "pass": "record", "repo": ".", "branch": branch_for(epic, record=True),
             "files": [record_path(cfg, epic), cfg.sprint_status, retro_path(cfg, epic)]}
 
@@ -99,7 +103,8 @@ def retro_data(epic: int, stories, status: dict, coord_root: Path) -> dict:
         "epic": epic, "generated_at": status["now"],
         "planned_critical_path": critical_path(stories, epic, set()),
         "stories": out_rows,
-        "contract_bottlenecks": [{"story": r["key"], "downstream": r["downstream"], "dependents": r["dependents"]} for r in contract],
+        "contract_stories_by_downstream": [{"story": r["key"], "downstream": r["downstream"], "dependents": r["dependents"]}
+                                           for r in contract],
         "anomalies_at_close": [a for a in status["anomalies"] if a.get("story") in {r["key"] for r in rows}],
         "notes": "claims of released stories are gone, so claim history covers only claims still present; "
                  "review waits come from the review host at close time",

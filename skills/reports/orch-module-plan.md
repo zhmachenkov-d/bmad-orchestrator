@@ -181,7 +181,7 @@ Shared context for every brief: module `orch` expands BMad Method (`bmm`). Harde
 
 **Tool Dependencies:** git; git host CLI optional (`gh`/`glab` for review waits); headless Chromium/Chrome optional for PDF (`ORCH_CHROME` overrides), otherwise the HTML is printed from a browser.
 
-**Design Notes:** Pull-only notification model — no bots or push. Stock BMad never sets `epic-N: done`, so orch owns that transition. Close epic runs as two gated PR passes: `orch/close-epic-N` archives markers in every repo, then `orch/close-epic-N-record` adds the close record, `epic-N: done` and the retro data file `orch-epic-N.json` that `bmad-retrospective` can consume. Pins converge when, per subproject and canonical, the latest merged story's pin equals main or every later contract version is compatible or a `narrow` that depends on a story of that subproject; `pin-drift` offers a drafted migration story.
+**Design Notes:** Pull-only notification model — no bots or push. Stock BMad never sets `epic-N: done`, so orch owns that transition. Close epic runs as two gated PR passes: `orch/close-epic-N` archives markers in every repo, then `orch/close-epic-N-record` adds the close record, `epic-N: done` and the retro data file `orch-epic-N.json` that `bmad-retrospective` can consume. Pins converge when, per subproject and canonical, the story pinning the newest version equals main or every later contract version (in merge order on coordination main) is compatible or a `narrow` that depends on a story of that subproject; `pin-drift` offers a drafted migration story when a new story can converge it. The record pass waits until every registry repo was read.
 
 **Relationships:** anytime; close epic precedes `bmad-retrospective`.
 

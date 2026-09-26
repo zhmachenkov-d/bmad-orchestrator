@@ -220,6 +220,9 @@ def cmd_epic(args, env: Env):
     if args.action == "close":
         p = close.plan(args.epic, st, reg, env.coord, env.cfg, m, unread)
         res = {"ok": p["pass"] not in ("blocked",), **close.public(p)}
+        if args.push and args.expect_pass and p["pass"] != args.expect_pass:
+            # state moved since the user confirmed the plan: show the new one instead of pushing it
+            return emit({**res, "ok": False, "code": "pass-changed", "expected_pass": args.expect_pass}, 1)
         if args.push and p["pass"] in ("archive", "record"):
             snap = _status(args, env, reg, st, args.epic) if p["pass"] == "record" else None
             res["published"] = close.execute(p, env.coord_root, env.coord, env.cfg, m, st,
@@ -235,6 +238,9 @@ def _claims_remote(env: Env) -> str | None:
 
 
 def _status(args, env: Env, reg, st, epic: int | None = None) -> dict:
+    if epic is not None and not any(s.epic == epic for s in st.values()):
+        epics = ", ".join(str(e) for e in sorted({s.epic for s in st.values()})) or "none"
+        raise OrchError(f"epic {epic} has no stories in the epics on {env.coord_ref} (epics: {epics})")
     return status_mod.build(reg, st, env.coord_root, env.coord, env.cfg, env.cache_root, remote=_claims_remote(env),
                             offline=args.offline, host=not getattr(args, "no_host", False),
                             local_run=not gate.ci_source(), epic=epic)
@@ -375,6 +381,8 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--epic", type=int, required=True)
     e.add_argument("--push", action="store_true", help="close: build and push the pass's branches (default: plan only)")
     e.add_argument("--user", help="close: 'Name <email>' for the commits (default: git config)")
+    e.add_argument("--expect-pass", choices=["archive", "record"],
+                   help="close --push: the pass the user confirmed; push nothing if the plan now differs")
 
     st = sub.add_parser("status", parents=[common], help="epics and stories across subprojects, with anomalies and actions")
     st.add_argument("--epic", type=int)
