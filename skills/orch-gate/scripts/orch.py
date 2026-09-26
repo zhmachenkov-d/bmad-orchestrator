@@ -28,7 +28,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from orchlib import OrchError, SCHEMA_VERSION  # noqa: E402
-from orchlib import claims, config, detectors, gate, gitio, markers, registry, sprint_status, stories  # noqa: E402
+from orchlib import claims, close, config, detectors, gate, gitio, markers, plan, registry, report, sprint_status, stories  # noqa: E402
+from orchlib import status as status_mod  # noqa: E402
 from orchlib.stories import key_from_any  # noqa: E402
 
 
@@ -38,7 +39,8 @@ class Env:
         # A local gate refreshes origin/* before reading anything, so it sees the main CI will see.
         # CI checkouts are fresh already, and --offline means no network.
         self.refs_fetched = []
-        refresh = args.cmd == "gate" and not (args.ci or gate.ci_source()) and not args.offline
+        refresh = (args.cmd in REFRESHING and not getattr(args, "ci", False) and not gate.ci_source()
+                   and not args.offline)
         if refresh and (r := gitio.refresh(self.repo)):
             self.refs_fetched.append(r)
         coord = args.coord or os.environ.get("ORCH_COORD") or _configured_coord(self.repo)
@@ -215,9 +217,58 @@ def cmd_epic(args, env: Env):
     reg = env.registry()
     st = env.stories(reg)
     m, unread = markers.merged(reg, env.coord, env.cache_root, offline=args.offline)
+    if args.action == "close":
+        p = close.plan(args.epic, st, reg, env.coord, env.cfg, m, unread)
+        res = {"ok": p["pass"] not in ("blocked",), **close.public(p)}
+        if args.push and p["pass"] in ("archive", "record"):
+            snap = _status(args, env, reg, st, args.epic) if p["pass"] == "record" else None
+            res["published"] = close.execute(p, env.coord_root, env.coord, env.cfg, m, st,
+                                             args.user or _git_user(env.coord_root), snap)
+        return emit(res, 0 if res["ok"] else 1)
     problems = markers.close_check(args.epic, st, reg, m, env.coord, markers.unknown_keys(st, unread))
     return emit({"ok": not problems, "epic": args.epic, "problems": problems, "unread_repos": unread},
                 1 if problems else 0)
+
+
+def _claims_remote(env: Env) -> str | None:
+    return "origin" if gitio.remote_url(env.coord_root, "origin") else None
+
+
+def _status(args, env: Env, reg, st, epic: int | None = None) -> dict:
+    return status_mod.build(reg, st, env.coord_root, env.coord, env.cfg, env.cache_root, remote=_claims_remote(env),
+                            offline=args.offline, host=not getattr(args, "no_host", False),
+                            local_run=not gate.ci_source(), epic=epic)
+
+
+def cmd_status(args, env: Env):
+    reg = env.registry()
+    st = env.stories(reg)
+    res = _status(args, env, reg, st, args.epic)
+    return emit({"ok": True, "coord_ref": env.coord_ref, "config": {"stale_claim_hours": env.cfg.stale_claim_hours,
+                 "review_wait_hours": env.cfg.review_wait_hours}, "plan_issues": st.issues, **res})
+
+
+def cmd_plan_check(args, env: Env):
+    reg = env.registry()
+    res = plan.check(env.stories(reg), reg)
+    return emit({"ok": res["verdict"] != "FAIL", "registry_issues": reg.issues, **res}, 1 if res["verdict"] == "FAIL" else 0)
+
+
+def cmd_report(args, env: Env):
+    reg = env.registry()
+    st = env.stories(reg)
+    res = _status(args, env, reg, st, args.epic)
+    text = report.render(args.epic, res, st, env.cfg.project_name)
+    stamp = res["now"][:16].replace(":", "").replace("-", "").replace("T", "-")
+    path = Path(args.output) if args.output else (
+        env.coord_root / env.cfg.implementation_artifacts / "orch" / "reports" / f"epic-{args.epic}-{stamp}.html")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    out = {"ok": True, "html": str(path)}
+    if args.pdf:
+        pdf, why = report.to_pdf(path)
+        out.update({"pdf": str(pdf) if pdf else None, "pdf_error": why})
+    return emit(out)
 
 
 def _gate_base(args, env: Env, reg, repo_id: str) -> tuple[str, str]:
@@ -320,8 +371,22 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--ref", help="check/derive: read sprint-status at this ref instead of the working tree")
 
     e = sub.add_parser("epic", parents=[common], help="epic close check: all stories merged, markers archived, pins converged")
-    e.add_argument("action", choices=["close-check"])
+    e.add_argument("action", choices=["close-check", "close"])
     e.add_argument("--epic", type=int, required=True)
+    e.add_argument("--push", action="store_true", help="close: build and push the pass's branches (default: plan only)")
+    e.add_argument("--user", help="close: 'Name <email>' for the commits (default: git config)")
+
+    st = sub.add_parser("status", parents=[common], help="epics and stories across subprojects, with anomalies and actions")
+    st.add_argument("--epic", type=int)
+    st.add_argument("--no-host", action="store_true", help="do not ask gh/glab for open reviews")
+
+    sub.add_parser("plan-check", parents=[common], help="plan validation: PASS / CONCERNS / FAIL over epics and registry")
+
+    rp = sub.add_parser("report", parents=[common], help="self-contained HTML epic report (optionally PDF)")
+    rp.add_argument("--epic", type=int, required=True)
+    rp.add_argument("--pdf", action="store_true", help="also print it to PDF with headless Chromium/Chrome")
+    rp.add_argument("--no-host", action="store_true", help="do not ask gh/glab for open reviews")
+    rp.add_argument("-o", "--output", help="HTML path (default: {implementation_artifacts}/orch/reports/epic-N-<stamp>.html)")
 
     g = sub.add_parser("gate", parents=[common], help="pre-merge verdict for the current branch/PR")
     g.add_argument("--base", help="target branch ref (default: origin/main or main)")
@@ -339,7 +404,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 COMMANDS = {"config": cmd_config, "registry": cmd_registry, "stories": cmd_stories, "merged": cmd_merged,
             "deps": cmd_deps, "marker": cmd_marker, "claim": cmd_claim, "sprint-status": cmd_sprint_status,
-            "epic": cmd_epic, "gate": cmd_gate}
+            "epic": cmd_epic, "gate": cmd_gate, "status": cmd_status, "plan-check": cmd_plan_check,
+            "report": cmd_report}
+# Commands that read what others pushed refresh origin first on local runs, as the gate does.
+REFRESHING = {"gate", "status", "report", "epic"}
 
 
 def main(argv=None) -> int:

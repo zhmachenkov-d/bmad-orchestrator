@@ -154,7 +154,7 @@ def public(merged_map: dict[str, dict]) -> dict[str, dict]:
 def close_check(epic: int, stories, reg: Registry, merged_map: dict[str, dict], coord: Tree,
                 unknown: set[str] = frozenset()) -> list[dict]:
     """An epic may close only when every story is merged, every marker is archived, and every pin matches main."""
-    problems = []
+    problems, index = [], None
     for s in [s for s in stories.values() if s.epic == epic]:
         hit = merged_map.get(s.key)
         if not hit and s.key in unknown:
@@ -171,11 +171,68 @@ def close_check(epic: int, stories, reg: Registry, merged_map: dict[str, dict], 
         if errs or marker is None:
             problems.append({"story": s.key, "message": f"marker {hit['path']}: {'; '.join(errs)}"})
             continue
-        for path, pinned in marker.get("contract_pins", {}).items():
-            current = coord.blob_sha(path)
-            if current != pinned:
-                problems.append({"story": s.key, "message": f"pin {path} = {pinned[:10]} but main has {(current or 'nothing')[:10]} (pins not converged)"})
+        index = index or PinIndex(stories, merged_map)
+        for d in pin_drift(s, marker, stories, merged_map, coord, index):
+            problems.append({"story": s.key, "code": "pin-drift", "message": d["message"]})
     return problems
+
+
+def load_marker(hit: dict, key: str) -> dict | None:
+    marker, errs = parse(hit["tree"].read(hit["path"]) or b"", key)
+    return None if errs else marker
+
+
+class PinIndex:
+    """What merged markers pinned: the contract chain and, per (subproject, canonical), the latest pinning story."""
+
+    def __init__(self, stories, merged_map: dict[str, dict]):
+        self.chain: dict[str, list[tuple[Story, str]]] = {}
+        self.latest: dict[tuple[str, str], str] = {}
+        for s in stories.values():  # plan order
+            hit = merged_map.get(s.key)
+            if not hit:
+                continue
+            for path, sha_ in ((load_marker(hit, s.key) or {}).get("contract_pins") or {}).items():
+                self.latest[(s.subproject, path)] = s.key
+                if s.subproject == CONTRACTS:
+                    self.chain.setdefault(path, []).append((s, sha_))
+
+
+def pin_drift(story: Story, marker: dict, stories, merged_map: dict[str, dict], coord: Tree,
+              index: PinIndex | None = None) -> list[dict]:
+    """Pins of a merged marker that have not converged on coordination main.
+
+    Pins freeze at merge, so a later change must not strand them. Only the latest merged story of a subproject
+    that pins a canonical speaks for it; earlier ones are superseded. That pin is converged when it equals main,
+    or when every later version in the contract chain came from a compatible story (anything but `narrow`; the
+    gate rejected breaking ones) or from a `narrow` story that depends on a story of this subproject, i.e. this
+    subproject migrated. A contract story's own pins are converged while they sit in the chain.
+    """
+    index = index or PinIndex(stories, merged_map)
+    drift = []
+    for path, pinned in (marker.get("contract_pins") or {}).items():
+        current = coord.blob_sha(path)
+        if pinned == current or index.latest.get((story.subproject, path), story.key) != story.key:
+            continue
+        versions = index.chain.get(path, [])
+        where = [i for i, (_, v) in enumerate(versions) if v == pinned]
+        later = versions[where[-1] + 1:] if where else versions
+        base = {"path": path, "pinned": pinned, "current": current}
+        if not versions or versions[-1][1] != current:
+            drift.append({**base, "reason": "unrecorded-change",
+                          "message": f"pin {path} = {pinned[:10]} but main has {(current or 'nothing')[:10]}, "
+                                     "and no merged contract story produced main's version"})
+            continue
+        if story.subproject == CONTRACTS and where:
+            continue
+        unmigrated = [cs for cs, _ in later if cs.contract_change == "narrow"
+                      and not any((d := stories.by_id(dep)) and d.subproject == story.subproject for dep in cs.depends_on)]
+        if unmigrated:
+            ids = ", ".join(cs.id for cs in unmigrated)
+            drift.append({**base, "reason": "not-migrated", "narrowed_by": [cs.key for cs in unmigrated],
+                          "message": f"pin {path} = {pinned[:10]}: narrowed by story {ids} without depending on a "
+                                     f"{story.subproject} story, and no later {story.subproject} story pins it (pins not converged)"})
+    return drift
 
 
 def is_archive_move(changes: list[dict], tree_head: Tree, tree_base: Tree) -> tuple[set[str], list[tuple[str, str]]]:
