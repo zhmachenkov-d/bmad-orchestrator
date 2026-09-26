@@ -36,6 +36,9 @@ from orchlib.stories import key_from_any  # noqa: E402
 class Env:
     def __init__(self, args):
         self.working_tree = getattr(args, "working_tree", False)
+        # Only plan-check may read the working tree: a gate reading it would let a PR rewrite its own rules.
+        if self.working_tree and args.cmd != "plan-check":
+            raise OrchError(f"--working-tree is only for plan-check, not {args.cmd}", "bad-args")
         if self.working_tree and args.coord_ref:
             raise OrchError("--working-tree reads the coordination repo's working tree; it cannot be combined with "
                             "--coord-ref", "bad-args")

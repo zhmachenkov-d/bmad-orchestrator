@@ -1,5 +1,6 @@
 import os
 
+import pytest
 import yaml
 from conftest import C, EPICS, R, SPRINT, Repo, check, fake_bin, registry_yaml, run_cli
 
@@ -1081,6 +1082,27 @@ def test_plan_check_working_tree_respects_gitignore(mono):
 def test_plan_check_working_tree_refuses_coord_ref(mono):
     code, res = run_cli("plan-check", "--working-tree", "--coord-ref", "main", "--repo", str(mono.path))
     assert code == 2 and res["code"] == "bad-args", res
+
+
+def test_only_plan_check_accepts_working_tree():
+    import argparse
+
+    import orch
+    sub = next(a for a in orch.build_parser()._actions if isinstance(a, argparse._SubParsersAction))
+    takers = sorted(name for name, p in sub.choices.items()
+                    if any("--working-tree" in a.option_strings for a in p._actions))
+    assert takers == ["plan-check"]
+
+
+def test_env_refuses_working_tree_outside_plan_check(mono):
+    """Guard behind the parser: a gate reading the working tree would let a PR rewrite its own rules."""
+    import orch
+    from orchlib import OrchError
+    args = orch.build_parser().parse_args(["gate", "--repo", str(mono.path), "--offline"])
+    args.working_tree = True
+    with pytest.raises(OrchError) as exc:
+        orch.Env(args)
+    assert exc.value.code == "bad-args"
 
 
 def test_plan_check_working_tree_skips_a_nested_repo_with_no_commits(mono):
