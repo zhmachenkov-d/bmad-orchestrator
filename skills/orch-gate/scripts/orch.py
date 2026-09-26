@@ -13,7 +13,7 @@ Exit codes: 0 = ok/pass, 1 = failing verdict / lost race / validation issues, 2 
 Repositories: --repo is the repo being acted on (default: current directory). --coord is the coordination
 repo holding the registry, epics, contracts, claims and sprint status (default: $ORCH_COORD, else the local path
 in this repo's committed orch_coordination_repo, else --repo, i.e. a monorepo). Reads always go through git refs,
-never the working tree.
+never the working tree, except `plan-check --working-tree`, which checks planning files not yet committed.
 """
 
 from __future__ import annotations
@@ -35,6 +35,13 @@ from orchlib.stories import key_from_any  # noqa: E402
 
 class Env:
     def __init__(self, args):
+        self.working_tree = getattr(args, "working_tree", False)
+        # Only plan-check may read the working tree: a gate reading it would let a PR rewrite its own rules.
+        if self.working_tree and args.cmd != "plan-check":
+            raise OrchError(f"--working-tree is only for plan-check, not {args.cmd}", "bad-args")
+        if self.working_tree and args.coord_ref:
+            raise OrchError("--working-tree reads the coordination repo's working tree; it cannot be combined with "
+                            "--coord-ref", "bad-args")
         self.repo = gitio.toplevel(args.repo or os.getcwd())
         # A local gate refreshes origin/* before reading anything, so it sees the main CI will see.
         # CI checkouts are fresh already, and --offline means no network.
@@ -48,6 +55,21 @@ class Env:
         self.same = self.coord_root.resolve() == self.repo.resolve()
         if refresh and not self.same and (r := gitio.refresh(self.coord_root)):
             self.refs_fetched.append(r)
+        self.cache_root = gitio.cache_dir(self.repo)
+        if self.working_tree:
+            # Planning checks of uncommitted files: config, registry and epics all come from one working-tree snapshot.
+            self.coord_ref, self.snapshot_skipped = gitio.worktree_tree(self.coord_root)
+            self.coord_ref_source = "working tree"
+            self.coord = gitio.Tree(self.coord_root, self.coord_ref)
+            self.cfg = config.load(self.coord)
+            # A verdict over missing or stale planning input misleads; a skip elsewhere (a nested repo) only warns.
+            inputs = ["_bmad", self.cfg.planning_artifacts, self.cfg.registry_dir]
+            if bad := [p for p in self.snapshot_skipped
+                       if any(p == d or p.startswith(d + "/") or d.startswith(p + "/") for d in inputs)]:
+                raise OrchError(f"the working-tree snapshot could not read planning input: {', '.join(bad)}; "
+                                "fix its permissions (or commit a nested repo), then re-run", "snapshot-incomplete",
+                                paths=bad)
+            return
         # Config, registry and epics are read at one trusted ref; in a monorepo that is the gate's --base.
         explicit = args.coord_ref or (getattr(args, "base", None) if self.same else None)
         try:
@@ -59,7 +81,6 @@ class Env:
             self.coord_ref, self.coord_ref_source = "HEAD", "checked-out HEAD (no main ref found)"
             self.cfg = config.load(gitio.Tree(self.coord_root, self.coord_ref))
         self.coord = gitio.Tree(self.coord_root, self.coord_ref)
-        self.cache_root = gitio.cache_dir(self.repo)
 
     def registry(self):
         return registry.load(self.coord, self.cfg)
@@ -263,7 +284,11 @@ def cmd_plan_check(args, env: Env):
     reg = env.registry()
     issues = registry.validate(reg, env.coord, env.cfg)
     res = plan.check(env.stories(reg), reg, issues)
-    return emit({"ok": res["verdict"] != "FAIL", "registry_issues": issues, **res}, 1 if res["verdict"] == "FAIL" else 0)
+    read_from = {"read_from": "working-tree", "snapshot_skipped": env.snapshot_skipped} if env.working_tree \
+        else {"read_from": "ref"}
+    return emit({"ok": res["verdict"] != "FAIL", **read_from, "coord_ref": env.coord_ref,
+                 "registry_issues": issues, **res},
+                1 if res["verdict"] == "FAIL" else 0)
 
 
 def cmd_next(args, env: Env):
@@ -448,7 +473,10 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("--epic", type=int)
     st.add_argument("--no-host", action="store_true", help="do not ask gh/glab for open reviews")
 
-    sub.add_parser("plan-check", parents=[common], help="plan validation: PASS / CONCERNS / FAIL over epics and registry")
+    pc = sub.add_parser("plan-check", parents=[common], help="plan validation: PASS / CONCERNS / FAIL over epics and registry")
+    pc.add_argument("--working-tree", action="store_true",
+                    help="read config, registry and epics from the coordination repo's working tree (tracked and "
+                         "untracked, .gitignore respected) instead of a ref; not with --coord-ref")
 
     nx = sub.add_parser("next", parents=[common], help="warnings, your open stories and the ready stories ranked by what they unblock")
     nx.add_argument("--user", help="'Name <email>' whose open claims to list (default: git config)")

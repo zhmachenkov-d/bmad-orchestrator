@@ -13,3 +13,15 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-orch-bmad-build-override.md`
   summary: orch-setup must merge the bmad-build override safely — combine an existing team `on_complete`, define ordering of appended `activation_steps_prepend` entries, and warn when a `bmad-build.user.toml` `on_complete` would drop the orch marker and gate steps; cover the merge with tests.
   evidence: Code review of the override template; merge behavior is documented only in the template header and orch-setup does not exist yet.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-orch-planning-overrides.md`
+  summary: Test `plan-check --working-tree` with a separate coordination repo (`--coord` / `ORCH_COORD` pointing away from `--repo`) to prove the snapshot is taken of the coordination repo, not the acting repo.
+  evidence: Every working-tree test uses a single repo where `coord_root == repo`, so snapshotting `Env.repo` instead would pass; the shipped planning templates never pass `--coord`, so only direct CLI use is exposed.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-orch-planning-overrides.md`
+  summary: Make plan validation deterministic in orch-gate — a coordination PR that changes epics or the registry fails when it introduces new `plan-check` FAIL findings compared with its base, so a broken plan never reaches main and the planning-template prompts become a convenience, not the guarantee.
+  evidence: Walkthrough of PR #14: the sprint-planning override enforces the plan-check verdict only through an activation step and a persistent fact (LLM-executed); today the gate fails plan defects only in a PR's own story and warns on other stories, so a defect in a later story is found only when that story's PR runs.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-orch-planning-overrides.md`
+  summary: orch-setup must verify, at install and on every re-run (for example after a BMad update), that the stock anchors the orch override templates name still exist in the installed stock skills — epics step 3 `STORY FORMAT` and `So that`, step 4 `[C] Complete`, the sprint-planning intents and its append-after-intent activation order — and warn the user when one is gone.
+  evidence: Walkthrough of PR #14: the BMad installer overwrites stock skills but never `_bmad/custom/`, and `test_stock_anchors_named_by_the_planning_facts_still_exist` runs only in this repo, so an installed project drifts silently; the templates now carry fallbacks by meaning, which soften but do not detect the drift.

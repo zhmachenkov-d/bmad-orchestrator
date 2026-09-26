@@ -1,11 +1,16 @@
-"""Thin git plumbing. Every read goes through a ref so verdicts never depend on the working tree."""
+"""Thin git plumbing. Every read goes through a ref so verdicts never depend on the working tree.
+
+The one exception is `worktree_tree`, a snapshot of the working tree for `plan-check --working-tree`.
+"""
 
 from __future__ import annotations
 
 import hashlib
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -103,6 +108,34 @@ def dirty_paths(repo: Path, ignore_prefix: str = "") -> list[str]:
         if not (ignore_prefix and path.startswith(ignore_prefix)):
             paths.append(path)
     return paths
+
+
+SKIPPED_RE = re.compile(r"unable to index file '(.+)'|'(.+?)/?' does not have a commit checked out")
+
+
+def worktree_tree(repo: Path) -> tuple[str, list[str]]:
+    """Tree id of `repo`'s working tree (tracked and untracked files, `.gitignore` respected), and the paths git
+    could not add (an unreadable file, a nested repo with no commit), which the snapshot lacks or holds stale.
+
+    Built in a throwaway index seeded from a copy of the real one (for its stat cache), or empty when the repo has
+    none yet, so the real index and HEAD are never touched. The id works as a `Tree` ref. Planning checks only: the
+    gate still reads refs.
+    """
+    real = Path(out(repo, "rev-parse", "--git-path", "index"))
+    real = real if real.is_absolute() else Path(repo) / real
+    with tempfile.TemporaryDirectory(prefix="orch-index-") as tmp:
+        env = {"GIT_INDEX_FILE": str(Path(tmp) / "index")}
+        if real.is_file():
+            shutil.copyfile(real, env["GIT_INDEX_FILE"])
+        else:
+            git(repo, "read-tree", "--empty", env=env)
+        # --ignore-errors: an unreadable path (e.g. a nested repo with no commit) is skipped, not fatal (rc 1)
+        proc = git(repo, "add", "-A", "--ignore-errors", env=env, check=False)
+        stderr = proc.stderr.decode(errors="replace").strip()
+        skipped = sorted({m.group(1) or m.group(2) for m in SKIPPED_RE.finditer(stderr)})
+        if proc.returncode not in (0, 1) or (proc.returncode == 1 and not skipped):
+            raise OrchError(f"git add -A failed in {repo} while snapshotting the working tree: {stderr}")
+        return out(repo, "write-tree", env=env), skipped
 
 
 def is_ancestor(repo: Path, a: str, b: str) -> bool:

@@ -1,5 +1,6 @@
 import os
 
+import pytest
 import yaml
 from conftest import C, EPICS, R, SPRINT, Repo, check, fake_bin, registry_yaml, run_cli
 
@@ -1026,3 +1027,125 @@ def test_marker_fix_says_to_check_out_the_gated_head(mono):
     code, res = gate(mono, "--head", "orch/1-2")
     pre = next(f for f in check(res, "marker")["findings"] if f.get("fix"))["fix"]["precondition"]
     assert code == 1 and pre.startswith("check out orch/1-2, then "), pre
+
+
+# ---- plan-check --working-tree ----
+
+def _index_and_head(r):
+    index = r.path / r.git("rev-parse", "--git-path", "index")
+    return (index.read_bytes() if index.exists() else None), r.git("rev-parse", "--verify", "--quiet", "HEAD", check=False)
+
+
+def test_plan_check_working_tree_sees_uncommitted_and_untracked_planning(mono):
+    # an edited (tracked) epics file adds a story on an untracked registry entry
+    mono.write(f"{R}/billing.yaml", registry_yaml("billing", "services/billing"))
+    mono.write("services/billing/app.py", "print('bill')\n")
+    mono.write("_bmad-output/planning-artifacts/epics.md",
+               EPICS + "\n### Story 1.5: Billing\n**Subproject:** billing\n**Depends on:** 1.2\n**Contract change:** none\n")
+    before = _index_and_head(mono)
+    code, res = run_cli("plan-check", "--repo", str(mono.path))
+    assert code == 0 and res["verdict"] == "PASS" and res["read_from"] == "ref", res  # the ref has no story 1.5
+    code, res = run_cli("plan-check", "--working-tree", "--repo", str(mono.path))
+    assert res["read_from"] == "working-tree", res
+    assert mono.git("cat-file", "-t", res["coord_ref"]) == "tree", res  # the snapshot tree id
+    assert not {"unknown-subproject", "missing-subproject"} & {f["code"] for f in res["findings"]}, res
+    assert res["verdict"] == "CONCERNS", res
+    assert [(f["code"], f["story"]) for f in res["findings"]] == [("dependency-not-imported", "1.5")], res
+    assert _index_and_head(mono) == before
+    assert "?? " + f"{R}/billing.yaml" in mono.git("status", "--porcelain", "--untracked-files=all").splitlines()
+
+
+def test_plan_check_working_tree_works_in_a_repo_with_no_commits(tmp_path):
+    r = Repo(tmp_path / "fresh")
+    r.write(f"{R}/payment-service.yaml", registry_yaml(
+        "payment-service", "services/payment", exports=[("openapi", f"{C}/payment-service/openapi.yaml", None)]))
+    r.write(f"{R}/user-service.yaml", registry_yaml("user-service", "services/user", imports=["payment-service"]))
+    r.write(f"{C}/payment-service/openapi.yaml", "openapi: 3.0.0\npaths: {}\n")
+    r.write("services/payment/app.py", "x\n").write("services/user/app.py", "x\n")
+    r.write("_bmad-output/planning-artifacts/epics.md", EPICS)
+    before = _index_and_head(r)
+    assert before == (None, "")
+    code, res = run_cli("plan-check", "--working-tree", "--repo", str(r.path))
+    assert code == 0 and res["verdict"] == "PASS" and res["read_from"] == "working-tree", res
+    assert _index_and_head(r) == before
+
+
+def test_plan_check_working_tree_respects_gitignore(mono):
+    mono.write(".gitignore", "_bmad-output/planning-artifacts/\n")
+    mono.rm("_bmad-output/planning-artifacts/epics.md")
+    mono.git("rm", "-q", "_bmad-output/planning-artifacts/prd.md")
+    mono.write("_bmad-output/planning-artifacts/epics.md", EPICS)  # on disk, but ignored
+    code, res = run_cli("plan-check", "--working-tree", "--repo", str(mono.path))
+    assert code == 1 and "no-epics" in {f["code"] for f in res["findings"]}, res
+
+
+def test_plan_check_working_tree_refuses_coord_ref(mono):
+    code, res = run_cli("plan-check", "--working-tree", "--coord-ref", "main", "--repo", str(mono.path))
+    assert code == 2 and res["code"] == "bad-args", res
+
+
+def test_only_plan_check_accepts_working_tree():
+    import argparse
+
+    import orch
+    sub = next(a for a in orch.build_parser()._actions if isinstance(a, argparse._SubParsersAction))
+    takers = sorted(name for name, p in sub.choices.items()
+                    if any("--working-tree" in a.option_strings for a in p._actions))
+    assert takers == ["plan-check"]
+
+
+def test_env_refuses_working_tree_outside_plan_check(mono):
+    """Guard behind the parser: a gate reading the working tree would let a PR rewrite its own rules."""
+    import orch
+    from orchlib import OrchError
+    args = orch.build_parser().parse_args(["gate", "--repo", str(mono.path), "--offline"])
+    args.working_tree = True
+    with pytest.raises(OrchError) as exc:
+        orch.Env(args)
+    assert exc.value.code == "bad-args"
+
+
+def test_plan_check_working_tree_skips_a_nested_repo_with_no_commits(mono):
+    Repo(mono.path / "scratch")  # untracked `git init`-ed subdir: git add -A cannot add it
+    mono.write("scratch/notes.txt", "x\n")
+    code, res = run_cli("plan-check", "--working-tree", "--repo", str(mono.path))
+    assert code == 0 and res["verdict"] == "PASS" and res["read_from"] == "working-tree", res
+    assert res["snapshot_skipped"] == ["scratch"], res  # outside planning input: a warning, not an error
+
+
+@pytest.mark.skipif(os.name != "posix" or os.geteuid() == 0, reason="needs an unreadable file (not root)")
+def test_plan_check_working_tree_refuses_unreadable_planning_input(mono):
+    """An epics file git cannot read would leave the snapshot without it (or stale): no verdict, an error."""
+    extra = mono.path / "_bmad-output/planning-artifacts/epics-2.md"
+    extra.write_text("## Epic 2: Later\n", encoding="utf-8")
+    extra.chmod(0)
+    try:
+        code, res = run_cli("plan-check", "--working-tree", "--repo", str(mono.path))
+    finally:
+        extra.chmod(0o644)
+    assert code == 2 and res["code"] == "snapshot-incomplete", res
+    assert res["paths"] == ["_bmad-output/planning-artifacts/epics-2.md"], res
+
+
+def test_plan_check_working_tree_reads_config_from_the_working_tree(mono):
+    moved = "_bmad-output/orch/registry"
+    mono.git("mv", R, moved)
+    mono.commit("move registry")  # the ref's config still names the default dir, which is now empty
+    mono.write("_bmad/custom/config.toml", f'[modules.orch]\norch_registry_dir = "{moved}"\n')  # uncommitted
+    code, res = run_cli("plan-check", "--repo", str(mono.path))
+    assert code == 1 and "unknown-subproject" in {f["code"] for f in res["findings"]}, res
+    code, res = run_cli("plan-check", "--working-tree", "--repo", str(mono.path))
+    assert code == 0 and res["verdict"] == "PASS", res
+    assert "?? _bmad/" in mono.git("status", "--porcelain")
+
+
+def test_plan_check_working_tree_drops_a_tracked_epics_file_deleted_on_disk(mono):
+    mono.write("_bmad-output/planning-artifacts/epics-old.md", "## Epic 1: Old\n\n### Story 1.1: Old copy\n"
+               "**Subproject:** contracts\n**Depends on:** none\n**Contract change:** none\n")
+    mono.commit("stale epics copy")
+    code, res = run_cli("plan-check", "--repo", str(mono.path))
+    assert code == 1 and "duplicate-story" in {f["code"] for f in res["findings"]}, res
+    (mono.path / "_bmad-output/planning-artifacts/epics-old.md").unlink()  # not git rm
+    code, res = run_cli("plan-check", "--working-tree", "--repo", str(mono.path))
+    assert code == 0 and res["verdict"] == "PASS", res
+    assert "duplicate-story" not in {f["code"] for f in res["findings"]}
