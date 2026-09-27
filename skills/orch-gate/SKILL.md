@@ -23,6 +23,8 @@ The script resolves the base, the coordination repo and its ref itself, and reco
 
 Explain each failing or warning finding in `{communication_language}`, and mention any `notices`. Every finding has a stable `code`. When a finding carries `fix.mechanical`, offer to run `fix.command` as given, from the repo root, once `fix.precondition` (if any) is met. After a fix, commit what it changed, re-run the gate and report the new verdict. The fix is done only when the gate passes or only non-mechanical failures remain.
 
+CI templates live in `assets/ci/`: `github-actions.yml` (installed as `.github/workflows/orch-gate.yml`), `gitlab-ci.yml` (installed as `.gitlab/orch-gate.gitlab-ci.yml`) and suggested `CODEOWNERS` lines, for a monorepo registry (`repo: .` only). orch-setup substitutes their `@…@` placeholders. The job runs the CLI extracted from the base commit, not the PR, and writes `orch-gate.md` and the `orch-gate.json` artifact, with fix commands naming the committed CLI path. It passes with a notice when orch is not installed at the base. The base-CLI guarantee holds only when the job is required and the CI files are code-owned. Each file's header has the details.
+
 Findings without a `fix` are a judgment for the user. That covers a breaking contract change, which has to be split into expand → migrate → contract, and a scope violation, which means the change belongs in another subproject's story.
 
 ## The checks

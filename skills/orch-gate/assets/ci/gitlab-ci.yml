@@ -1,0 +1,110 @@
+# orch-gate GitLab CI job — TEMPLATE shipped with orch-gate.
+#
+# What it does: runs the deterministic orch gate (`orch.py gate`) in every merge
+# request pipeline, fails the job on a failing verdict (exit 1) or an
+# environment error (exit 2), prints the markdown verdict to the job log, and
+# keeps `orch-gate.json` and `orch-gate.md` as job artifacts (exposed on the MR
+# as "orch-gate") even when the gate fails. It never comments on the MR and
+# uses no secret or variable beyond GitLab's predefined ones. The gate's code
+# always comes from the MR's target branch: the job extracts `@ORCH_CLI_DIR@`
+# from it with `git archive` into a temp dir and runs it from there, so an MR
+# that edits the CLI cannot change its own verdict. An MR that updates orch is
+# therefore gated by the old version; the new version gates the MRs after it
+# merges.
+#
+# Installation (done by orch-setup, not by hand):
+# - For a repo whose registry lists only `repo: .` (monorepo). A registry with a
+#   repo other than `.` needs the polyrepo follow-up (coordination clone and
+#   read access to every registry repo); do not install this file for it yet.
+# - Substitute every placeholder with a path relative to the repo root: never an
+#   absolute path or a project-root / skill-root variable.
+#   `@ORCH_CLI_DIR@`      committed orch-gate skill dir, default
+#                         `.claude/skills/orch-gate` (a real directory, not a
+#                         symlink: `git archive` would extract only the link).
+#   `@ORCH_CLI_PATH@`     orch.py under that dir, default
+#                         `.claude/skills/orch-gate/scripts/orch.py` (the
+#                         override templates' CLI path without its
+#                         project-root prefix).
+#   `@ORCH_REGISTRY_DIR@` the orch registry dir, default
+#                         `_bmad-output/orch/subprojects`.
+# - Install the result as `.gitlab/orch-gate.gitlab-ci.yml` and add it to
+#   `.gitlab-ci.yml` with `include: - local: .gitlab/orch-gate.gitlab-ci.yml`.
+#   Merge into an existing `.gitlab-ci.yml` (add the include, keep everything
+#   else); if `.gitlab/orch-gate.gitlab-ci.yml` already exists, leave it alone
+#   and show the difference. Never clobber either file. The job uses the default
+#   `test` stage; set `stage:` if the pipeline defines its own stages.
+# - Require it: turn on "Pipelines must succeed" for merge requests. An MR runs
+#   its own copy of this file and of `.gitlab-ci.yml`, so the base-CLI rule holds
+#   only when the job is required AND both files are code-owned: install the
+#   suggested CODEOWNERS lines (`CODEOWNERS` template) and require code-owner
+#   approval on the protected main branch (code-owner approval needs GitLab
+#   Premium or higher).
+# - A local include can redefine this job's keys, and an MR runs its own copy
+#   of every included file: code-own every CI file that `.gitlab-ci.yml`
+#   includes (or the dirs holding them), not only these two.
+# - Merge request pipelines must be enabled: `workflow:rules` that allow only
+#   branch pipelines hide this job. Changing an MR's target branch keeps the old
+#   pipeline's result, so re-run the pipeline after a target change.
+# - MRs from forks: by default their pipeline runs in the fork, where the author
+#   controls both the target branch and the CLI, so the job refuses to run there
+#   (exit 2). Run fork MR pipelines in the parent project instead.
+# - Merge trains are out of scope: this job gates each MR against its target
+#   branch, not against the train ahead of it. Do not rely on it as a required
+#   check under merge trains. (For queues generally: with squash merges the
+#   `contract-moved-on-main` check is vacuous in a queue run and only the
+#   per-MR run covers it, and an MR queued ahead that changes a pinned contract
+#   or merges the same story would dequeue this one. The GitHub template
+#   handles its merge queue that way; nothing here runs in a queue.)
+# - Contract detectors (openapi, asyncapi, protobuf, atlas) must be installed in
+#   this job for the registry's contract types, at the same versions as locally;
+#   a missing detector fails `breaking`. Add them in `before_script` and check
+#   them with `orch.py deps --probe`.
+# - When orch is not yet installed at the target (neither the CLI nor the
+#   registry dir is there), the job prints a notice and passes. When the target
+#   has the registry but not the CLI, it exits 2 naming the missing path.
+
+orch-gate:
+  image: ghcr.io/astral-sh/uv:python3.12-bookworm  # needs git; the slim images lack it
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  variables:
+    GIT_DEPTH: 0  # the gate needs full history
+  # before_script: install the contract detectors the registry needs (see the header).
+  script:
+    - |
+      if [ "$CI_PROJECT_ID" != "$CI_MERGE_REQUEST_PROJECT_ID" ]; then
+        echo "orch-gate: this MR pipeline runs in project $CI_PROJECT_ID, not the MR's target project $CI_MERGE_REQUEST_PROJECT_ID (a fork); run fork MR pipelines in the parent project" >&2
+        exit 2
+      fi
+      T="$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
+      git fetch --no-tags origin "+refs/heads/$T:refs/remotes/origin/$T"
+      BASE="origin/$T"
+      CLI_REF="$BASE"
+      if ! git rev-parse --verify -q "$CLI_REF^{commit}" > /dev/null; then
+        echo "orch-gate: the target '$CLI_REF' does not resolve to a commit" >&2
+        exit 2
+      fi
+      if ! git cat-file -e "$CLI_REF:@ORCH_CLI_PATH@" 2>/dev/null; then
+        if git cat-file -e "$CLI_REF:@ORCH_REGISTRY_DIR@" 2>/dev/null; then
+          echo "orch-gate: @ORCH_REGISTRY_DIR@ exists at $CLI_REF but the gate CLI @ORCH_CLI_PATH@ is missing there; restore it on the target branch" >&2
+          exit 2
+        fi
+        echo "orch-gate: orch is not installed at $CLI_REF (no @ORCH_CLI_PATH@, no @ORCH_REGISTRY_DIR@); gate skipped"
+        exit 0
+      fi
+      WT=$(cd "$(mktemp -d)" && pwd -P)
+      git archive "$CLI_REF" -- "@ORCH_CLI_DIR@" | tar -x -C "$WT"
+      uv run --script "$WT/@ORCH_CLI_PATH@" gate --ci --base "$BASE" --format markdown -o orch-gate.json > orch-gate.md || code=$?
+      for f in orch-gate.md orch-gate.json; do
+        if [ -f "$f" ]; then
+          sed -i "s|$WT/||g" "$f"
+        fi
+      done
+      cat orch-gate.md
+      exit ${code:-0}
+  artifacts:
+    when: always
+    expose_as: orch-gate
+    paths:
+      - orch-gate.json
+      - orch-gate.md
