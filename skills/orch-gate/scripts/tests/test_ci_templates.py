@@ -120,10 +120,11 @@ def test_headers_cover_the_install_contract(name):
     header = "\n".join(ln for ln in (CI / name).read_text(encoding="utf-8").splitlines() if ln.startswith("#"))
     flat = " ".join(header.replace("#", " ").split()).lower()
     for phrase in ("never clobber", "require", "code-owned", "gated by the old version", "contract-moved-on-main",
-                   "deps --probe", "polyrepo"):
+                   "deps --probe", "polyrepo", "registry-empty", "same change as the registry"):
         assert phrase in flat, phrase
     if name == GITLAB:
         assert "premium" in flat and "merge trains" in flat and "include:" in flat
+        assert "parent project's ci/cd variables" in flat and "maintainer" in flat
 
 
 def test_github_workflow_shape():

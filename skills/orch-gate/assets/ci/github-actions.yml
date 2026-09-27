@@ -50,7 +50,10 @@
 #   below and check them with `orch.py deps --probe`.
 # - When orch is not yet installed at the base (neither the CLI nor the
 #   registry dir is there), the job prints a notice and passes. When the base
-#   has the registry but not the CLI, it exits 2 naming the missing path.
+#   has the registry but not the CLI, it exits 2 naming the missing path. When
+#   the base has the CLI but no registered subprojects, the gate fails
+#   `registry-empty` on purpose (an empty registry would pass every change), so
+#   install this file in the same change as the registry, not before it.
 
 name: orch-gate
 

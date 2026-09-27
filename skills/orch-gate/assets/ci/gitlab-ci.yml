@@ -47,7 +47,11 @@
 #   pipeline's result, so re-run the pipeline after a target change.
 # - MRs from forks: by default their pipeline runs in the fork, where the author
 #   controls both the target branch and the CLI, so the job refuses to run there
-#   (exit 2). Run fork MR pipelines in the parent project instead.
+#   (exit 2). Run fork MR pipelines in the parent project instead. That pipeline
+#   runs the fork's code with the parent project's CI/CD variables and runner
+#   access: GitLab asks a maintainer to start it, and they should read the MR's
+#   changes to CI files and scripts first. Keep credentials in protected
+#   variables, which MR pipelines do not receive.
 # - Merge trains are out of scope: this job gates each MR against its target
 #   branch, not against the train ahead of it. Do not rely on it as a required
 #   check under merge trains. (For queues generally: with squash merges the
@@ -61,7 +65,10 @@
 #   them with `orch.py deps --probe`.
 # - When orch is not yet installed at the target (neither the CLI nor the
 #   registry dir is there), the job prints a notice and passes. When the target
-#   has the registry but not the CLI, it exits 2 naming the missing path.
+#   has the registry but not the CLI, it exits 2 naming the missing path. When
+#   the target has the CLI but no registered subprojects, the gate fails
+#   `registry-empty` on purpose (an empty registry would pass every change), so
+#   install this file in the same change as the registry, not before it.
 
 orch-gate:
   image: ghcr.io/astral-sh/uv:python3.12-bookworm  # needs git; the slim images lack it
