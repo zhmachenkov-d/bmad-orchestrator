@@ -1,0 +1,51 @@
+# orch CODEOWNERS lines — TEMPLATE shipped with orch-gate.
+#
+# What it does: makes the orch boundaries reviewable only by their owners. The
+# registry, contracts, planning artifacts and the orch-gate CLI decide what a
+# PR may touch, and the CI files decide which CLI judges it. A PR runs its own
+# copy of the CI file (`.github/workflows/orch-gate.yml`, or
+# `.gitlab/orch-gate.gitlab-ci.yml` and `.gitlab-ci.yml`), so the gate's
+# "CLI comes from the base" rule holds only when those files are code-owned and
+# the `orch-gate` job is required. A PR that updates orch is gated by the old
+# version, and these owners review it.
+#
+# Installation: orch-setup SUGGESTS these lines and never writes them. The
+# user adds them to the CODEOWNERS file the platform actually reads, merging
+# with any existing entries; never clobber that file. Each platform uses the
+# first file it finds: GitHub `.github/CODEOWNERS`, then `CODEOWNERS`, then
+# `docs/CODEOWNERS`; GitLab `CODEOWNERS`, then `docs/CODEOWNERS`, then
+# `.gitlab/CODEOWNERS`. Every location is owned below, so a PR cannot add a
+# higher-priority file that shadows these lines without the orch owners.
+# - Substitute every placeholder with a path relative to the repo root (never
+#   an absolute path or a project-root / skill-root variable):
+#   `@ORCH_REGISTRY_DIR@` (default `_bmad-output/orch/subprojects`),
+#   `@ORCH_CONTRACTS_DIR@` (default `_bmad-output/orch/contracts`),
+#   `@PLANNING_ARTIFACTS@` (default `_bmad-output/planning-artifacts`),
+#   `@ORCH_CLI_DIR@` (default `.claude/skills/orch-gate`), and `@ORCH_OWNERS@`
+#   with the owning users or teams (e.g. `@org/orch-owners`).
+# - `_bmad/config.toml` and `_bmad/custom/config.toml` set the registry,
+#   contracts and planning paths the gate reads, so they are owned too.
+# - Required checks match by name and GitLab local includes can redefine job
+#   keys: also own all of `/.github/workflows/` and every CI file that
+#   `.gitlab-ci.yml` includes, or a PR can add a look-alike passing job.
+# - Lines for the platform not in use are harmless and may be dropped. Later
+#   CODEOWNERS lines win, so put these after broader patterns.
+# - Turn on required code-owner review for the main branch (GitHub: "Require
+#   review from Code Owners"; GitLab: code-owner approval on the protected
+#   branch, which needs GitLab Premium or higher) and require the `orch-gate`
+#   job (GitHub: also in the merge queue; GitLab: not under merge trains).
+# - This protects a monorepo whose registry lists only `repo: .`; a registry
+#   with other repos needs the polyrepo follow-up.
+/@ORCH_REGISTRY_DIR@/ @ORCH_OWNERS@
+/@ORCH_CONTRACTS_DIR@/ @ORCH_OWNERS@
+/@PLANNING_ARTIFACTS@/ @ORCH_OWNERS@
+/@ORCH_CLI_DIR@/ @ORCH_OWNERS@
+/.github/workflows/orch-gate.yml @ORCH_OWNERS@
+/.gitlab/orch-gate.gitlab-ci.yml @ORCH_OWNERS@
+/.gitlab-ci.yml @ORCH_OWNERS@
+/_bmad/config.toml @ORCH_OWNERS@
+/_bmad/custom/config.toml @ORCH_OWNERS@
+/.github/CODEOWNERS @ORCH_OWNERS@
+/CODEOWNERS @ORCH_OWNERS@
+/docs/CODEOWNERS @ORCH_OWNERS@
+/.gitlab/CODEOWNERS @ORCH_OWNERS@

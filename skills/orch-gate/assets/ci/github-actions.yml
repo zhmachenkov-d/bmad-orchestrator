@@ -1,0 +1,139 @@
+# orch-gate GitHub Actions workflow — TEMPLATE shipped with orch-gate.
+#
+# What it does: runs the deterministic orch gate (`orch.py gate`) on every pull
+# request and merge-queue group, fails the check on a failing verdict (exit 1)
+# or an environment error (exit 2), appends the markdown verdict to the job
+# summary, and uploads `orch-gate.json` and `orch-gate.md` as the `orch-gate`
+# artifact even when the gate fails. It never comments on the PR and uses no
+# secret. The gate's code always comes from the base (or, in a merge queue, the
+# group's base): the step extracts `@ORCH_CLI_DIR@` from that commit with
+# `git archive` into a temp dir and runs it from there, so a PR that edits the
+# CLI cannot change its own verdict. A PR that updates orch is therefore gated
+# by the old version; the new version gates the PRs after it merges.
+#
+# Installation (done by orch-setup, not by hand):
+# - For a repo whose registry lists only `repo: .` (monorepo). A registry with a
+#   repo other than `.` needs the polyrepo follow-up (coordination clone and
+#   read access to every registry repo); do not install this file for it yet.
+# - Substitute every placeholder with a path relative to the repo root: never an
+#   absolute path or a project-root / skill-root variable.
+#   `@ORCH_CLI_DIR@`      committed orch-gate skill dir, default
+#                         `.claude/skills/orch-gate` (a real directory, not a
+#                         symlink: `git archive` would extract only the link).
+#   `@ORCH_CLI_PATH@`     orch.py under that dir, default
+#                         `.claude/skills/orch-gate/scripts/orch.py` (the
+#                         override templates' CLI path without its
+#                         project-root prefix).
+#   `@ORCH_REGISTRY_DIR@` the orch registry dir, default
+#                         `_bmad-output/orch/subprojects`.
+# - Install the result as `.github/workflows/orch-gate.yml`. If that file
+#   already exists, leave it alone and show the difference; never clobber it.
+# - Require it: add the `orch-gate` check to the branch protection (or ruleset)
+#   of the main branch, and to the merge queue if one is used. A PR runs its own
+#   copy of this file, so the base-CLI rule holds only when the check is
+#   required AND this file is code-owned: install the suggested CODEOWNERS lines
+#   (`CODEOWNERS` template) and turn on "Require review from Code Owners".
+# - Required checks match by name, so a PR can add another workflow with an
+#   `orch-gate` job that passes. Own all of `/.github/workflows/` in CODEOWNERS
+#   (not only this file), so such a PR needs the orch owners' review.
+# - The check runs on `opened`, `synchronize`, `reopened` and `edited`, so
+#   changing the PR's base branch re-runs it against the new base.
+# - Merge queue: the group is gated against its base (`merge_group.base_sha`),
+#   which is right for the merge, squash and rebase methods, and runs the CLI
+#   from that base. The queued-ahead PRs in it were each reviewed and gated. In a
+#   squash queue `contract-moved-on-main` is vacuous here; the `pull_request` run
+#   covers it. A queued-ahead PR that changes a contract this PR pins, or merges
+#   the same story, makes this group fail and dequeues this PR.
+# - Contract detectors (openapi, asyncapi, protobuf, atlas) must be installed in
+#   this job for the registry's contract types, at the same versions as locally;
+#   a missing detector fails `breaking`. Add their install steps where marked
+#   below and check them with `orch.py deps --probe`.
+# - When orch is not yet installed at the base (neither the CLI nor the
+#   registry dir is there), the job prints a notice and passes. When the base
+#   has the registry but not the CLI, it exits 2 naming the missing path.
+
+name: orch-gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: orch-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  orch-gate:
+    name: orch-gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # the gate needs full history
+
+      - uses: astral-sh/setup-uv@v6
+
+      # Install the contract detectors the registry needs here (see the header).
+
+      - name: orch gate
+        id: gate
+        shell: bash
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          MG_BASE: ${{ github.event.merge_group.base_sha }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = merge_group ]; then
+            BASE="$MG_BASE"
+          else
+            BASE="origin/$BASE_REF"
+          fi
+          CLI_REF="$BASE"
+          if ! git rev-parse --verify -q "$CLI_REF^{commit}" > /dev/null; then
+            echo "::error::orch-gate: the base '$CLI_REF' does not resolve to a commit; check the event payload and fetch-depth: 0"
+            exit 2
+          fi
+          if ! git cat-file -e "$CLI_REF:@ORCH_CLI_PATH@" 2>/dev/null; then
+            if git cat-file -e "$CLI_REF:@ORCH_REGISTRY_DIR@" 2>/dev/null; then
+              echo "::error::orch-gate: @ORCH_REGISTRY_DIR@ exists at $CLI_REF but the gate CLI @ORCH_CLI_PATH@ is missing there; restore it on the base branch"
+              exit 2
+            fi
+            echo "::notice::orch-gate: orch is not installed at $CLI_REF (no @ORCH_CLI_PATH@, no @ORCH_REGISTRY_DIR@); gate skipped"
+            echo "orch-gate skipped: orch is not installed at the base." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          WT=$(cd "$(mktemp -d "$RUNNER_TEMP/orch-gate.XXXXXX")" && pwd -P)
+          git archive "$CLI_REF" -- "@ORCH_CLI_DIR@" | tar -x -C "$WT"
+          uv run --script "$WT/@ORCH_CLI_PATH@" gate --ci --base "$BASE" --format markdown -o orch-gate.json > orch-gate.md || code=$?
+          for f in orch-gate.md orch-gate.json; do
+            if [ -f "$f" ]; then
+              sed -i "s|$WT/||g" "$f"
+            fi
+          done
+          cat orch-gate.md
+          limit=900000
+          size=$(wc -c < orch-gate.md)
+          body=$(head -c "$limit" orch-gate.md)
+          {
+            if [ "${code:-0}" = 2 ] || [ "$size" -gt "$limit" ]; then
+              printf '%s\n%s\n%s\n' '````text' "$body" '````'
+            else
+              printf '%s\n' "$body"
+            fi
+            if [ "$size" -gt "$limit" ]; then
+              printf '\n%s\n' "_orch-gate output truncated at $limit of $size bytes, see the orch-gate artifact._"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit ${code:-0}
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: orch-gate
+          path: |
+            orch-gate.json
+            orch-gate.md
+          if-no-files-found: warn
