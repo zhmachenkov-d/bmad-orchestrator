@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import difflib
 import os
+import re
 import shlex
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import OrchError, markers, registry, sprint_status, stories
+from . import OrchError, markers, plan, registry, sprint_status, stories
 from .config import Config
 from .detectors import run as run_detector
 from .detectors import version as detector_version
@@ -23,6 +25,9 @@ from .registry import CONTRACTS, Registry, pin_paths
 from .stories import KEY_RE, StorySet, id_to_key
 
 DETAIL_LINES = 60
+# Story-set issues that mean the epics could not be read at all: setup failures, not plan defects of a story.
+SETUP_STORY_ISSUES = ("no-epics", "epics-unreadable")
+_LOCATION_RE = re.compile(r" \((?:[^()]|\([^()]*\))*:\d+\)$")  # one level of parentheses in the path
 
 
 @dataclass
@@ -153,6 +158,33 @@ def setup_problems(reg: Registry, story_set: StorySet, coord: Tree, cfg: Config,
     return fails, warns
 
 
+def _plan_identity(f: dict) -> tuple:
+    """A plan finding without its trailing ` (<path>:<line>)`, so lines shifted by an edit above it are the same finding."""
+    return f["severity"], f["code"], f["story"], _LOCATION_RE.sub("", f["message"])
+
+
+def _plan_findings(story_set: StorySet, reg: Registry) -> list[dict]:
+    # No registry_issues: registry validity is judged by setup_problems.
+    return [f for f in plan.check(story_set, reg)["findings"] if f["code"] not in SETUP_STORY_ISSUES]
+
+
+def introduced_plan_findings(baselines: list[tuple[StorySet, Registry]], head_stories: StorySet, head_reg: Registry) -> list[dict]:
+    """`plan-check` findings of the head that no baseline has, compared as multisets of identities.
+
+    For each identity the head reports only `head_count - max(baseline counts)` findings, so a defect a baseline
+    already has is never labelled introduced and a second defect of the same kind still is.
+    """
+    known = [Counter(_plan_identity(f) for f in _plan_findings(s, r)) for s, r in baselines]
+    seen: Counter = Counter()
+    out = []
+    for f in _plan_findings(head_stories, head_reg):
+        key = _plan_identity(f)
+        seen[key] += 1
+        if seen[key] > max((c[key] for c in known), default=0):
+            out.append(f)
+    return out
+
+
 def run(ctx: Context) -> dict:
     head_sha, head_note = resolve_head(ctx.repo, ctx.base, ctx.head)
     if sha(ctx.repo, ctx.head) != sha(ctx.repo, "HEAD"):
@@ -196,7 +228,8 @@ def run(ctx: Context) -> dict:
     if is_coord and any(matches(c["path"], setup_dirs) for c in changes):
         # The setup this PR produces is what every later PR is judged by, so it is checked here too.
         head_reg = registry.load(head, ctx.cfg)
-        head_fails, _ = setup_problems(head_reg, stories.load(head, ctx.cfg, head_reg), head, ctx.cfg, ctx.repo_id)
+        head_stories = stories.load(head, ctx.cfg, head_reg)
+        head_fails, _ = setup_problems(head_reg, head_stories, head, ctx.cfg, ctx.repo_id)
         if fails and not head_fails and not live and all(matches(c["path"], setup_dirs) for c in changes):
             # A PR that repairs the setup is judged by the state it produces, or a broken main could never be fixed.
             checks["setup"].warn("setup-repair", "the coordination main has setup problems and this PR resolves them: "
@@ -207,6 +240,15 @@ def run(ctx: Context) -> dict:
             if (code, message.replace(f" at {head.ref}", "")) not in known:
                 checks["setup"].fail(code, f"introduced by this PR: {message}",
                                      hint="fix it in this PR; once merged it would fail every PR's setup check")
+        # The plan this PR produces must not add plan-check defects: a new FAIL blocks, a new CONCERN warns.
+        # A defect main or the merge-base already has stays a warning, so a branch behind main is not blocked.
+        mb_reg = registry.load(mb_tree, ctx.cfg)
+        baselines = [(ctx.stories, ctx.reg), (stories.load(mb_tree, ctx.cfg, mb_reg), mb_reg)]
+        plan_hint = ("fix it in this PR; " + shlex.join([*ctx.fix_prefix, "plan-check", "--working-tree"])
+                     + " on this branch lists the plan's findings")
+        for f in introduced_plan_findings(baselines, head_stories, head_reg):
+            report = checks["setup"].fail if f["severity"] == "fail" else checks["setup"].warn
+            report(f["code"], f"introduced by this PR: {f['message']}", story=f["story"], hint=plan_hint)
     for code, message, hint in fails:
         checks["setup"].fail(code, message, **({"hint": hint} if hint else {}))
     for code, message, hint in warns:
@@ -261,7 +303,7 @@ def run(ctx: Context) -> dict:
     # --- plan issues: the PR's own story must be well-formed; others' defects are surfaced, not blocking ---
     own = ctx.stories.get(result["story"]) if result["story"] else None
     for i in ctx.stories.issues:
-        if i["code"] in ("no-epics", "epics-unreadable"):
+        if i["code"] in SETUP_STORY_ISSUES:
             continue  # setup failures
         if own and i["story"] == own.id:
             if i["code"] not in ("missing-subproject", "unknown-subproject"):  # already no-subproject

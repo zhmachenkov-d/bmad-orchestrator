@@ -910,6 +910,122 @@ def test_a_coordination_pr_cannot_break_a_healthy_setup(mono):
     assert gate(mono)[0] == 0
 
 
+EPICS_PATH = "_bmad-output/planning-artifacts/epics.md"
+REFUNDS = "\n### Story 1.5: Refunds\n**Subproject:** payment-service\n**Depends on:** {}\n"
+
+
+def introduced(res, level=None):
+    return [f for f in check(res, "setup")["findings"]
+            if f["message"].startswith("introduced by this PR") and level in (None, f["level"])]
+
+
+def test_a_planning_pr_fails_on_a_plan_defect_it_introduces(mono):
+    mono.branch("plan").write(EPICS_PATH, EPICS + REFUNDS.format("1.9")).commit()
+    code, res = gate(mono)
+    fails = introduced(res, "fail")
+    assert code == 1 and [(f["code"], f["story"]) for f in fails] == [("unknown-dependency", "1.5")], res
+    assert "orch.py plan-check" in fails[0]["hint"], res
+
+
+def test_a_planning_pr_fails_on_a_plan_only_defect(mono):
+    mono.branch("plan").write(EPICS_PATH, EPICS + (
+        "\n### Story 1.5: Drop field\n**Subproject:** contracts\n**Depends on:** 1.1\n**Contract change:** narrow\n")).commit()
+    code, res = gate(mono)
+    assert code == 1 and [f["code"] for f in introduced(res, "fail")] == ["narrow-without-migration"], res
+
+
+def test_a_registry_pr_that_breaks_the_plan_fails(mono):
+    mono.branch("reg").rm(f"{R}/user-service.yaml")
+    mono.write(f"{R}/user-svc.yaml", registry_yaml("user-svc", "services/user", imports=["payment-service"])).commit()
+    code, res = gate(mono)
+    assert code == 1 and ("unknown-subproject", "1.3") in {(f["code"], f["story"]) for f in introduced(res, "fail")}, res
+
+
+@pytest.mark.parametrize("path", [EPICS_PATH, "_bmad-output/planning-artifacts/epics (v2).md"])
+def test_a_pre_existing_plan_defect_stays_a_warning_when_its_line_shifts(mono, path):
+    if path != EPICS_PATH:
+        mono.rm(EPICS_PATH)
+    mono.write(path, EPICS + REFUNDS.format("1.2") + "**Contract change:** maybe\n").commit("plan")
+    shifted = EPICS.replace("As a dev, I want a contract.", "As a dev,\n\nI want a contract.\n")
+    mono.branch("plan").write(path, shifted + REFUNDS.format("1.2") + "**Contract change:** maybe\n" + (
+        "\n### Story 1.6: Receipts\n**Subproject:** payment-service\n**Depends on:** 1.2\n")).commit()
+    code, res = gate(mono)
+    warns = [f for f in check(res, "setup")["findings"] if f["code"] == "bad-contract-change"]
+    assert code == 0 and not introduced(res) and [f["level"] for f in warns] == ["warn"], res
+
+
+def test_a_planning_pr_warns_on_a_plan_concern_it_introduces(mono):
+    mono.branch("plan").write(EPICS_PATH, EPICS + REFUNDS.format("1.3")).commit()
+    code, res = gate(mono)
+    assert code == 0 and [(f["code"], f["level"]) for f in introduced(res)] == [("dependency-not-imported", "warn")], res
+
+
+def test_a_planning_pr_that_fixes_plan_defects_introduces_none(mono):
+    mono.write(EPICS_PATH, EPICS + REFUNDS.format("1.9")).commit("plan")
+    mono.branch("fix").write(EPICS_PATH, EPICS + REFUNDS.format("1.2")).commit()
+    code, res = gate(mono)
+    assert code == 0 and not introduced(res), res
+
+
+def test_a_swapped_plan_defect_is_introduced(mono):
+    mono.write(EPICS_PATH, EPICS + REFUNDS.format("1.9")).commit("plan")
+    mono.branch("swap").write(EPICS_PATH, EPICS + REFUNDS.format("1.8")).commit()
+    code, res = gate(mono)
+    fails = introduced(res, "fail")
+    assert code == 1 and [f["message"] for f in fails] == ["introduced by this PR: story 1.5 depends on unknown story 1.8"], res
+
+
+def test_only_the_new_defect_of_a_kind_is_introduced(mono):
+    mono.write(EPICS_PATH, EPICS + REFUNDS.format("1.9")).commit("plan")
+    mono.branch("more").write(EPICS_PATH, EPICS + REFUNDS.format("1.9, 1.8")).commit()
+    code, res = gate(mono)
+    assert code == 1 and [f["message"] for f in introduced(res, "fail")] == [
+        "introduced by this PR: story 1.5 depends on unknown story 1.8"], res
+    mono.checkout("main").branch("twice").write(EPICS_PATH, EPICS + REFUNDS.format("1.9, 1.9")).commit()
+    code, res = gate(mono)
+    assert code == 1 and [f["message"] for f in introduced(res, "fail")] == [
+        "introduced by this PR: story 1.5 depends on unknown story 1.9"], res
+
+
+def test_a_branch_behind_main_is_not_blamed_for_a_defect_main_fixed(mono):
+    mono.write(EPICS_PATH, EPICS + REFUNDS.format("1.9")).commit("plan")
+    mono.branch("behind").write(EPICS_PATH, EPICS + REFUNDS.format("1.9") + (
+        "\n### Story 1.6: Receipts\n**Subproject:** payment-service\n**Depends on:** 1.2\n")).commit()
+    mono.checkout("main").write(EPICS_PATH, EPICS + REFUNDS.format("1.2")).commit("fix plan")
+    mono.checkout("behind")
+    code, res = gate(mono)
+    assert code == 0 and not introduced(res), res
+
+
+def test_a_setup_repair_pr_is_still_judged_on_its_plan(mono):
+    good = (mono.path / f"{R}/user-service.yaml").read_text()
+    mono.write(f"{R}/user-service.yaml", good.replace("contracts:\n  exports: []\n  imports: [payment-service]\n",
+                                                      "contracts: [payment-service]\n")).commit("broken shape")
+    mono.branch("repair").write(f"{R}/user-service.yaml", good).write(EPICS_PATH, EPICS + REFUNDS.format("1.9")).commit()
+    code, res = gate(mono)
+    assert code == 1 and "setup-repair" in {f["code"] for f in check(res, "setup")["findings"]}, res
+    assert [(f["code"], f["story"]) for f in introduced(res, "fail")] == [("unknown-dependency", "1.5")], res
+
+
+def test_a_non_planning_coordination_pr_skips_the_plan_comparison(mono, monkeypatch):
+    from orchlib import gate as gate_mod
+
+    def boom(*args):
+        raise AssertionError("plan comparison ran")
+    monkeypatch.setattr(gate_mod, "introduced_plan_findings", boom)
+    mono.branch("docs").write("README.md", "more\n").commit()
+    code, res = gate(mono)
+    assert code == 0, res
+
+
+def test_a_planning_pr_that_corrupts_the_epics_reports_it_once(mono):
+    mono.branch("plan")
+    (mono.path / EPICS_PATH).write_bytes(EPICS.encode() + b"\xff\n")
+    mono.commit()
+    code, res = gate(mono)
+    assert code == 1 and [f["code"] for f in check(res, "setup")["findings"]] == ["epics-unreadable"], res
+
+
 def test_dot_slash_repo_is_the_coordination_repo(mono):
     text = registry_yaml("user-service", "services/user", imports=["payment-service"], repo="./").replace(
         'allowed_write: ["services/user/**"]', f'allowed_write: ["services/user/**", "{C}/**"]')
