@@ -1,0 +1,27 @@
+{
+  "name": "bmad-orchestrator",
+  "owner": {
+    "name": "Denys Zhmachenkov"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/zhmachenkov-d/bmad-orchestrator",
+  "repository": "https://github.com/zhmachenkov-d/bmad-orchestrator",
+  "keywords": ["bmad", "orchestration", "monorepo", "polyrepo", "contracts", "merge-gate"],
+  "plugins": [
+    {
+      "name": "bmad-orchestrator",
+      "source": "./",
+      "description": "Deterministic multi-project (monorepo + polyrepo) delivery for BMad teams: parallel stories per subproject, contract-first, git-gated merges.",
+      "version": "0.1.0",
+      "author": {
+        "name": "Denys Zhmachenkov"
+      },
+      "skills": [
+        "./skills/orch-setup",
+        "./skills/orch-gate",
+        "./skills/orch-next",
+        "./skills/orch-status"
+      ]
+    }
+  ]
+}

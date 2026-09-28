@@ -1,0 +1,60 @@
+code: orch
+name: "BMad Orchestrator"
+header: "BMad Orchestrator (orch) Module"
+subheader: "Parallel, contract-first, git-gated delivery across monorepos and polyrepos"
+description: "Deterministic multi-project (monorepo + polyrepo) delivery for BMad teams: parallel stories per subproject, contract-first, git-gated merges."
+module_version: 0.1.0
+default_selected: false
+module_greeting: >
+  orch is ready. Next: run orch-setup to draft the subproject registry and install the
+  merge driver, stock-skill overrides and CI gate, then plan with bmad-prd, bmad-architecture
+  and bmad-create-epics-and-stories. Day to day: orch-next picks and claims a story,
+  bmad-build builds it, orch-gate checks the PR, orch-status tracks and closes epics.
+
+# Paths are relative to the coordination repo. Every orch skill falls back to these
+# defaults when a value is missing.
+
+orch_coordination_repo:
+  prompt: "Where is the coordination repo? '.' for a monorepo, or a git URL / local path for a polyrepo"
+  default: "."
+  result: "{value}"
+
+orch_registry_dir:
+  prompt: "Folder for the subproject registry (one YAML file per subproject)"
+  default: "_bmad-output/orch/subprojects"
+  result: "{project-root}/{value}"
+
+orch_contracts_dir:
+  prompt: "Folder for canonical contracts (<dir>/<subproject>/...)"
+  default: "_bmad-output/orch/contracts"
+  result: "{project-root}/{value}"
+
+orch_worktrees_dir:
+  prompt: "Where should per-story git worktrees be created?"
+  default: "../{project_name}-worktrees"
+  result: "{value}"
+  user_setting: true
+
+orch_stale_claim_hours:
+  prompt: "Hours without branch activity before a story claim counts as stale"
+  default: 48
+  result: "{value}"
+  regex: "^[0-9]+(\\.[0-9]+)?$"
+
+orch_review_wait_hours:
+  prompt: "Hours a PR may wait in review before orch flags it"
+  default: 24
+  result: "{value}"
+  regex: "^[0-9]+(\\.[0-9]+)?$"
+
+orch_main_branch:
+  prompt: "Integration branch of every repo (the gate's default base; a registry entry's branch overrides it)"
+  default: "main"
+  result: "{value}"
+  required: true
+
+# Variables from Core Config inserted:
+## user_name
+## communication_language
+## document_output_language
+## output_folder
