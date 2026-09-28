@@ -26,7 +26,7 @@ orch is registered only by the BMad installer (`npx bmad-method install --custom
 - `installer_config` true: installed.
 - False: orch was copied in by hand and `bmad-help` does not list its skills. Recommend the installer. If the user continues without it, step 3 writes the full config into the custom layers.
 
-Then run `setup.py status`. When it shows registry entries or installed overrides, this is a re-run. Skip the intro and say in two lines what is in place: config values, registry names, and the state of the overrides, merge driver, CI files and hook. Ask which parts to revisit: config (3), subprojects (4), wiring (5), CI (6). Check (7) always runs. "reconfigure orch" goes straight to step 3. On a first setup, run every step.
+Then run `setup.py status`. When it shows registry entries, a `registry_draft` or installed overrides, this is a re-run. Skip the intro and say in two lines what is in place: config values, registry names, and the state of the overrides, merge driver, CI files and hook. Ask which parts to revisit: config (3), subprojects (4), wiring (5), CI (6). Check (7) always runs. "reconfigure orch" goes straight to step 3. On a first setup, run every step.
 
 ## 2. Intro
 
@@ -38,9 +38,9 @@ Present every variable from `--show` at once, with its prompt and value in effec
 
 ## 4. Draft the registry
 
-Run `setup.py scan`. In a polyrepo, first ask for local clones of the code repos and pass each with `--checkout <path>`. Show the `proposals` as a short table: name, repo, path, detected contracts. Then let the user rename, merge, drop or add entries and widen `allowed_read`. The scan never guesses `imports`, so ask which subprojects consume each exported contract. Nothing is written until the user confirms. Then write the confirmed entries (same shape as the proposals) to a temp JSON file and run `setup.py write-registry --plan <file>`. It never overwrites an existing entry.
+Run `setup.py scan --draft`. In a polyrepo, first ask for local clones of the code repos and pass each with `--checkout <path>`. The proposals go to a draft file in the git dir (`draft.path`). When the draft already `exists`, offer to resume it or start over (delete it and scan again). Show the draft as a short table: name, repo, path, detected contracts. Then let the user rename, merge, drop or add entries and widen `allowed_read`. The scan never guesses `imports`, so ask which subprojects consume each exported contract. Save each decision to the draft as it is made. Nothing is written to the registry until the user confirms. Then run `setup.py write-registry --plan <draft>`.
 
-Validate with `uv run {orch} registry --working-tree --repo <project root>`. Fix each issue with the user. `canonical-missing` is expected until a contract story adds the canonical. The entry format is in orch-gate's SKILL.md.
+Validate with `uv run {orch} registry --working-tree --repo <project root>`. Fix each issue with the user in the draft and write again: a corrected draft replaces the files it wrote, while they are unchanged. `canonical-missing` is expected until a contract story adds the canonical. When nothing else is left, delete the draft. The entry format is in `{skill-root}/../orch-gate/SKILL.md`.
 
 ## 5. Wire it in
 
@@ -50,7 +50,7 @@ Validate with `uv run {orch} registry --working-tree --repo <project root>`. Fix
 
 ## 6. CI gate
 
-Ask for GitHub Actions, GitLab CI or both, and the CODEOWNERS owners (e.g. `@org/orch-owners`). Run `setup.py ci --platform github --platform gitlab --owners <owners>` with the chosen platforms. On `differs`, show the diff and leave the file. On `manual`, show where the snippet goes. On `polyrepo`, say the CI job for a polyrepo is a later orch release and skip this step. Suggest `codeowners_lines` for `codeowners_file` (or the platform's default location), and never write CODEOWNERS yourself. Then give the protection checklist, because the gate cannot see repository settings: require the `orch-gate` check on the main branch (and in the GitHub merge queue), require code-owner review, and make sure CODEOWNERS owns the CI files.
+Ask for GitHub Actions, GitLab CI or both, and the CODEOWNERS owners (e.g. `@org/orch-owners`), offering `ci_defaults` from `status` so the user only confirms. Run `setup.py ci --platform github --platform gitlab --owners <owners>` with the chosen platforms. On `differs`, show the diff and leave the file. On `manual`, show where the snippet goes. On `registry-invalid`, fix the registry as in step 4 first. On `polyrepo`, say the CI job for a polyrepo is a later orch release and skip this step. Suggest `codeowners_lines` for `codeowners_file` (or the platform's default location), and never write CODEOWNERS yourself. Then give the protection checklist, because the gate cannot see repository settings: require the `orch-gate` check on the main branch (and in the GitHub merge queue), require code-owner review, and make sure CODEOWNERS owns the CI files.
 
 ## 7. Check
 
@@ -62,11 +62,12 @@ List what to commit: config, registry, overrides, CI files and the orch skills t
 
 ## Headless
 
-With `-H`, skip the questions, the intro and the registry, which is never written headless.
+With `-H`, skip the questions, the intro and the registry scan.
 
 - Step 3: pass only the inline values (all defaults when orch is not installed). Skip write-config when there are none.
+- Step 4 only for an inline `registry=<plan file>` of confirmed entries: run write-registry with it, then validate.
 - Steps 5 and 7: install the merge driver and the overrides, then run the checks. Run overrides without `--update`, so drift is reported and never replaced.
 - Install the hook only for an inline `hook`, with `--coord` for an inline `coord=<path>`.
 - Install CI only for an inline `ci=<platforms>`.
 
-A missing uv or git, or any exit 2, stops the run there. Exit 1 is recorded, and the run continues. The only output is one JSON object: `{"ok": <true when every step exited 0>, "steps": {"config": …, "merge_driver": …, "overrides": …, "hook": …, "ci": …, "check": …, "deps": …}}`. Each step holds its script's JSON, or `"skipped"`.
+A missing uv or git, or any exit 2, stops the run there. Exit 1 is recorded, and the run continues. The only output is one JSON object: `{"ok": <true when every step exited 0>, "steps": {"config": …, "registry": …, "merge_driver": …, "overrides": …, "hook": …, "ci": …, "check": …, "deps": …}}`. Each step holds its script's JSON, or `"skipped"`.
