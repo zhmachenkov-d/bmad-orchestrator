@@ -13,7 +13,10 @@ removed from the custom layer instead, so the install answer applies and later i
 Comments and other tables in the custom files are kept.
 
 Answers are raw values keyed by module.yaml variable names; each variable's `result` template is applied
-here, so the literal `{project-root}` token stays in the written values. Numeric defaults stay numbers.
+here, so the literal `{project-root}` token stays in the written values. An answer already in stored form
+(e.g. `{project-root}/x` for a `{project-root}/{value}` template) is not templated again. Numeric defaults stay
+numbers. Variables left out of the answers keep their value in effect. `--show` prints each variable's value in
+effect as a raw answer, with the layer it comes from.
 
 Output is JSON on stdout. Exit codes: 0 = ok, 1 = invalid answers, 2 = usage or environment error.
 """
@@ -51,9 +54,18 @@ def variables(module_yaml: Path) -> dict[str, dict]:
     return {k: v for k, v in data.items() if isinstance(v, dict) and "prompt" in v}
 
 
+def unrender(spec: dict, value) -> str:
+    """The raw answer behind a stored value: the `result` template's text around `{value}` stripped off."""
+    text = "" if value is None else str(value)
+    pre, _, post = str(spec.get("result", "{value}")).partition("{value}")
+    if (pre or post) and text.startswith(pre) and text.endswith(post) and len(text) >= len(pre) + len(post):
+        return text[len(pre):len(text) - len(post)]
+    return text
+
+
 def render(spec: dict, raw) -> tuple[object, str | None]:
-    """The value to store for one answer, or an error message."""
-    text = "" if raw is None else str(raw).strip()
+    """The value to store for one answer, or an error message. An answer already in stored form is taken as is."""
+    text = unrender(spec, "" if raw is None else str(raw).strip())
     if spec.get("required") and not text:
         return None, "a value is required"
     if spec.get("regex") and not re.fullmatch(spec["regex"], text):
@@ -119,11 +131,31 @@ def apply(root: Path, rel: str, set_values: dict, remove: list[str], dry_run: bo
     return changed
 
 
+def show(root: Path, module_yaml: Path) -> dict:
+    """Each variable's value in effect as a raw answer, and the layer it comes from.
+
+    Layers as orch's config loader reads them: team keys from the team files, custom over installer; user
+    settings from all four, later over earlier: config.toml, config.user.toml, custom/config.toml, custom/config.user.toml.
+    """
+    specs = variables(module_yaml)
+    layers = {rel: orch_section(root / rel) for rel in (TEAM_BASE, USER_BASE, TEAM_CUSTOM, USER_CUSTOM)}
+    out = {}
+    for key, spec in specs.items():
+        order = (TEAM_BASE, USER_BASE, TEAM_CUSTOM, USER_CUSTOM) if spec.get("user_setting") else (TEAM_BASE, TEAM_CUSTOM)
+        source = next((rel for rel in reversed(order) if key in layers[rel]), None)
+        value = layers[source][key] if source else spec.get("default")
+        value = unrender(spec, value) if isinstance(value, str) else value
+        out[key] = {"prompt": spec["prompt"], "default": spec.get("default"), "value": value, "source": source or "default"}
+    installed = bool(layers[TEAM_BASE]) or bool(layers[USER_BASE])
+    return {"ok": True, "installer_config": installed, "variables": out}
+
+
 def run(root: Path, module_yaml: Path, answers: dict, dry_run: bool) -> tuple[int, dict]:
     specs = variables(module_yaml)
     errors = {k: "not a variable of the orch module" for k in answers if k not in specs}
     team_base = orch_section(root / TEAM_BASE)
-    user_base = {**team_base, **orch_section(root / USER_BASE)}
+    # a user setting's baseline is every layer below the personal custom file, the team custom layer included
+    user_base = {**team_base, **orch_section(root / USER_BASE), **orch_section(root / TEAM_CUSTOM)}
     plan = {TEAM_CUSTOM: ({}, []), USER_CUSTOM: ({}, [])}
     for key, raw in answers.items():
         if key not in specs:
@@ -153,16 +185,21 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--project-root", required=True, help="project root (a real path, not the {project-root} token)")
     parser.add_argument("--module-yaml", required=True, help="orch-setup's assets/module.yaml")
-    parser.add_argument("--answers", required=True, help="JSON file: {variable name: raw answer}")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--answers", help="JSON file: {variable name: raw answer}, only for the variables that change")
+    mode.add_argument("--show", action="store_true", help="print each variable's value in effect and its layer")
     parser.add_argument("--dry-run", action="store_true", help="report the changes without writing")
     args = parser.parse_args(argv)
     try:
         for name in ("project_root", "module_yaml", "answers"):
-            if "{project-root}" in getattr(args, name):
+            if "{project-root}" in (getattr(args, name) or ""):
                 raise UsageError(f"--{name.replace('_', '-')} still holds the literal {{project-root}} token; pass the real path")
         root = Path(args.project_root).resolve()
         if not (root / "_bmad").is_dir():
             raise UsageError(f"{root} has no _bmad/ directory; install BMad first")
+        if args.show:
+            print(json.dumps(show(root, Path(args.module_yaml)), indent=2))
+            return 0
         try:
             answers = json.loads(Path(args.answers).read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:

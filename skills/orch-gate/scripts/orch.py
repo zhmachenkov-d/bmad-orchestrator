@@ -36,9 +36,9 @@ from orchlib.stories import key_from_any  # noqa: E402
 class Env:
     def __init__(self, args):
         self.working_tree = getattr(args, "working_tree", False)
-        # Only plan-check may read the working tree: a gate reading it would let a PR rewrite its own rules.
-        if self.working_tree and args.cmd != "plan-check":
-            raise OrchError(f"--working-tree is only for plan-check, not {args.cmd}", "bad-args")
+        # Only planning and setup reads may see the working tree: a gate reading it would let a PR rewrite its own rules.
+        if self.working_tree and args.cmd not in WORKING_TREE:
+            raise OrchError(f"--working-tree is only for {', '.join(sorted(WORKING_TREE))}, not {args.cmd}", "bad-args")
         if self.working_tree and args.coord_ref:
             raise OrchError("--working-tree reads the coordination repo's working tree; it cannot be combined with "
                             "--coord-ref", "bad-args")
@@ -124,17 +124,24 @@ def need_key(value: str) -> str:
 
 # ---- commands ----
 
+def _read_from(env: Env) -> dict:
+    if env.working_tree:
+        return {"read_from": "working-tree", "snapshot_skipped": env.snapshot_skipped}
+    return {"read_from": "ref"}
+
+
 def cmd_config(args, env: Env):
     # User settings resolve from this checkout's working tree (personal layers included); the gate never reads them.
     cfg = {**env.cfg.to_dict(), **config.user_settings(env.coord_root, env.cfg)}
-    return emit({"ok": True, "repo": str(env.repo), "coord": str(env.coord_root), "coord_ref": env.coord_ref,
-                 "coord_ref_source": env.coord_ref_source, "config": cfg})
+    return emit({"ok": True, **_read_from(env), "repo": str(env.repo), "coord": str(env.coord_root),
+                 "coord_ref": env.coord_ref, "coord_ref_source": env.coord_ref_source, "config": cfg})
 
 
 def cmd_registry(args, env: Env):
     reg = env.registry()
     issues = registry.validate(reg, env.coord, env.cfg)
-    return emit({"ok": not issues, "subprojects": reg.to_dict(), "issues": issues}, 1 if issues else 0)
+    return emit({"ok": not issues, **_read_from(env), "subprojects": reg.to_dict(), "issues": issues},
+                1 if issues else 0)
 
 
 def cmd_stories(args, env: Env):
@@ -153,7 +160,7 @@ def cmd_deps(args, env: Env):
     types = {e.type for s in reg.values() for e in s.exports}
     report = detectors.deps(types, probe=args.probe)
     bad = [d for d in report if not d["available"] or d.get("probe", {}).get("status") == "fail"]
-    return emit({"ok": not bad, "detectors": report}, 1 if bad else 0)
+    return emit({"ok": not bad, **_read_from(env), "detectors": report}, 1 if bad else 0)
 
 
 def cmd_marker(args, env: Env):
@@ -284,9 +291,7 @@ def cmd_plan_check(args, env: Env):
     reg = env.registry()
     issues = registry.validate(reg, env.coord, env.cfg)
     res = plan.check(env.stories(reg), reg, issues)
-    read_from = {"read_from": "working-tree", "snapshot_skipped": env.snapshot_skipped} if env.working_tree \
-        else {"read_from": "ref"}
-    return emit({"ok": res["verdict"] != "FAIL", **read_from, "coord_ref": env.coord_ref,
+    return emit({"ok": res["verdict"] != "FAIL", **_read_from(env), "coord_ref": env.coord_ref,
                  "registry_issues": issues, **res},
                 1 if res["verdict"] == "FAIL" else 0)
 
@@ -433,11 +438,16 @@ def build_parser() -> argparse.ArgumentParser:
     p = JsonParser(prog="orch.py", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True, parser_class=JsonParser)
 
-    sub.add_parser("config", parents=[common], help="resolved orch config")
-    sub.add_parser("registry", parents=[common], help="load + validate the subproject registry")
+    working_tree = argparse.ArgumentParser(add_help=False)
+    working_tree.add_argument("--working-tree", action="store_true",
+                              help="read config, registry and epics from the coordination repo's working tree (tracked "
+                                   "and untracked, .gitignore respected) instead of a ref; not with --coord-ref")
+
+    sub.add_parser("config", parents=[common, working_tree], help="resolved orch config")
+    sub.add_parser("registry", parents=[common, working_tree], help="load + validate the subproject registry")
     sub.add_parser("stories", parents=[common], help="parse epics into stories (subproject, depends_on, contract change) + plan issues")
     sub.add_parser("merged", parents=[common], help="merged story markers across all registry repos (pull-based, cached under the git dir)")
-    d = sub.add_parser("deps", parents=[common], help="contract detector availability and versions for types used in the registry")
+    d = sub.add_parser("deps", parents=[common, working_tree], help="contract detector availability and versions for types used in the registry")
     d.add_argument("--probe", action="store_true",
                    help="also run each installed detector on built-in compatible/breaking fixtures and check its verdicts")
 
@@ -473,10 +483,8 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("--epic", type=int)
     st.add_argument("--no-host", action="store_true", help="do not ask gh/glab for open reviews")
 
-    pc = sub.add_parser("plan-check", parents=[common], help="plan validation: PASS / CONCERNS / FAIL over epics and registry")
-    pc.add_argument("--working-tree", action="store_true",
-                    help="read config, registry and epics from the coordination repo's working tree (tracked and "
-                         "untracked, .gitignore respected) instead of a ref; not with --coord-ref")
+    sub.add_parser("plan-check", parents=[common, working_tree],
+                   help="plan validation: PASS / CONCERNS / FAIL over epics and registry")
 
     nx = sub.add_parser("next", parents=[common], help="warnings, your open stories and the ready stories ranked by what they unblock")
     nx.add_argument("--user", help="'Name <email>' whose open claims to list (default: git config)")
@@ -515,6 +523,8 @@ COMMANDS = {"config": cmd_config, "registry": cmd_registry, "stories": cmd_stori
             "deps": cmd_deps, "marker": cmd_marker, "claim": cmd_claim, "sprint-status": cmd_sprint_status,
             "epic": cmd_epic, "gate": cmd_gate, "status": cmd_status, "plan-check": cmd_plan_check,
             "report": cmd_report, "next": cmd_next, "worktree": cmd_worktree, "context": cmd_context}
+# Planning and setup reads of files not yet committed; never the gate.
+WORKING_TREE = {"plan-check", "registry", "deps", "config"}
 # Commands that read what others pushed refresh origin first on local runs, as the gate does.
 REFRESHING = {"gate", "status", "report", "epic", "next", "worktree", "context"}
 

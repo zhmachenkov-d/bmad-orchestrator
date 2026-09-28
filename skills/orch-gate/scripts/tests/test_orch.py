@@ -1084,14 +1084,28 @@ def test_plan_check_working_tree_refuses_coord_ref(mono):
     assert code == 2 and res["code"] == "bad-args", res
 
 
-def test_only_plan_check_accepts_working_tree():
+def test_only_planning_and_setup_reads_accept_working_tree():
     import argparse
 
     import orch
     sub = next(a for a in orch.build_parser()._actions if isinstance(a, argparse._SubParsersAction))
     takers = sorted(name for name, p in sub.choices.items()
                     if any("--working-tree" in a.option_strings for a in p._actions))
-    assert takers == ["plan-check"]
+    assert takers == sorted(orch.WORKING_TREE) == ["config", "deps", "plan-check", "registry"]
+
+
+def test_registry_and_config_working_tree_see_an_uncommitted_draft(mono):
+    """orch-setup validates a drafted registry, and the config it just wrote, before anything is committed."""
+    moved = "_bmad-output/orch/registry"
+    mono.write("_bmad/custom/config.toml", f'[modules.orch]\norch_registry_dir = "{moved}"\n')
+    mono.write(f"{moved}/billing.yaml", registry_yaml("billing", "services/billing"))
+    code, res = run_cli("config", "--working-tree", "--repo", str(mono.path))
+    assert code == 0 and res["read_from"] == "working-tree" and res["config"]["registry_dir"] == moved, res
+    code, res = run_cli("registry", "--working-tree", "--repo", str(mono.path))
+    assert res["read_from"] == "working-tree" and set(res["subprojects"]) == {"billing", "contracts"}, res
+    assert [i["code"] for i in res["issues"]] == ["path-missing"], res
+    code, res = run_cli("registry", "--repo", str(mono.path))
+    assert code == 0 and res["read_from"] == "ref" and "billing" not in res["subprojects"], res
 
 
 def test_env_refuses_working_tree_outside_plan_check(mono):
