@@ -90,7 +90,7 @@ Shared context for every brief: module `orch` expands BMad Method (`bmm`). Harde
 
 **Tool Dependencies:** git, uv; contract detectors checked per registry types.
 
-**Design Notes:** Create Module generates the base setup skill (`assets/module.yaml`, `module-help.csv`); orch-specific steps are added after scaffolding. The merge driver is per-clone `git config`, so setup must be cheap to re-run and `orch-gate` must detect clones without it (decision 11). Registry draft is a proposal, never written without confirmation.
+**Design Notes:** Create Module generates the base setup skill (`assets/module.yaml`, `module-help.csv`); orch-specific steps are added after scaffolding. BMad 6.12 registers the module itself: `npx bmad-method install --custom-source` finds `orch-setup/assets/` through `.claude-plugin/marketplace.json`, writes the answers to `[modules.orch]` in `_bmad/config.toml` / `config.user.toml` and merges the help catalog. So the scaffold's YAML config writer and legacy cleanup were replaced by `scripts/write-config.py`, which only reconfigures, through `_bmad/custom/config.toml` / `config.user.toml`. The merge driver is per-clone `git config`, so setup must be cheap to re-run and `orch-gate` must detect clones without it (decision 11). Registry draft is a proposal, never written without confirmation.
 
 **Relationships:** first; before stock planning. Re-run when subprojects are added.
 
