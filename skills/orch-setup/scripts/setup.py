@@ -11,16 +11,18 @@ Orch paths come from `orch.py config --working-tree` of orch-gate, which install
 uncommitted config change is already in effect here.
 
 Commands:
-  state           what is already in place (registry, draft, merge driver, overrides, hook, CI), for a re-run
+  state           what is already in place (registry, draft, merge driver, overrides, hook, CI), for a re-run,
+                  and the CI platforms and owners the repo already suggests
   scan            propose registry entries from the repo layout (and from --checkout code repos in a polyrepo)
                   and keep them as a registry draft in this clone's git dir until they are written
   write-registry  write confirmed entries (the draft, or --plan JSON) as <registry_dir>/<name>.yaml; never
-                  overwrites; the draft is removed once every entry is written
+                  overwrites; the draft is removed once every entry is written; --dry-run validates the plan
+                  with orch-gate as if written and leaves no file
   overrides       install or merge the orch overrides into _bmad/custom/{bmad-build,bmad-create-epics-and-stories,
                   bmad-sprint-planning}.toml; missing orch entries are added, everything else is kept; an orch
                   entry that differs from the template is reported as drift and replaced only with --update
-  ci              install the orch-gate CI job (--platform github|gitlab) for a monorepo registry; CODEOWNERS
-                  lines are only suggested
+  ci              install the orch-gate CI job (--platform github|gitlab) for a monorepo registry, read through
+                  `orch.py registry --working-tree`; CODEOWNERS lines are only suggested
   hook            install a pre-push hook that runs the gate on pushed story/* branches
   check           git/uv/host CLIs, stock anchors the overrides rely on, ignored orch dirs
 
@@ -90,33 +92,42 @@ def git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProce
     return res
 
 
-def orch_config(root: Path, orch_gate: Path) -> dict:
-    """Resolved orch config of the coordination repo's working tree, from orch-gate's CLI."""
+def orch_cli(root: Path, orch_gate: Path, cmd: str) -> tuple[int, dict]:
+    """One orch-gate CLI read of the coordination repo's working tree; exit 2 raises."""
     cli = orch_gate / "scripts" / "orch.py"
     if not cli.is_file():
         raise SetupError(f"orch-gate not found at {orch_gate}; orch skills install side by side", "no-orch-gate")
-    res = subprocess.run(["uv", "run", str(cli), "config", "--working-tree", "--offline", "--repo", str(root)],
+    res = subprocess.run(["uv", "run", str(cli), cmd, "--working-tree", "--offline", "--repo", str(root)],
                          capture_output=True, text=True)
     try:
         out = json.loads(res.stdout)
     except json.JSONDecodeError:
-        raise SetupError(f"orch.py config failed: {(res.stderr or res.stdout).strip()[-500:]}", "orch-config")
-    if res.returncode != 0:
+        raise SetupError(f"orch.py {cmd} failed: {(res.stderr or res.stdout).strip()[-500:]}", f"orch-{cmd}")
+    if res.returncode not in (0, 1):
+        raise SetupError(f"orch.py {cmd}: {out.get('error')}", out.get("code") or f"orch-{cmd}")
+    return res.returncode, out
+
+
+def orch_config(root: Path, orch_gate: Path) -> dict:
+    """Resolved orch config of the coordination repo's working tree, from orch-gate's CLI."""
+    code, out = orch_cli(root, orch_gate, "config")
+    if code != 0:
         raise SetupError(f"orch.py config: {out.get('error')}", out.get("code") or "orch-config")
     return out["config"]
 
 
 def cli_location(root: Path, orch_gate: Path) -> dict:
-    """Where the committed files point: orch-gate relative to the project root, with its caveats."""
+    """Where the committed files point: orch-gate relative to the project root, with its caveats.
+
+    The path is resolved, so committed files name the real directory even when orch-gate was reached through a
+    symlink; one that leads out of the project is outside."""
     try:
         rel = orch_gate.resolve().relative_to(root.resolve()).as_posix()
     except ValueError:
-        raise SetupError(f"orch-gate ({orch_gate}) is outside the project; committed team files must name a path "
-                         "every clone has — install orch into the project", "orch-gate-outside")
+        raise SetupError(f"orch-gate ({orch_gate.resolve()}) is outside the project (or reached through a symlink "
+                         "that leads out of it); committed team files must name a path every clone has — install "
+                         "orch into the project", "orch-gate-outside")
     warnings = []
-    if any((root / p).is_symlink() for p in [rel, *[str(q) for q in PurePosixPath(rel).parents if str(q) != "."]]):
-        warnings.append(f"{rel} is (under) a symlink: CI extracts it with `git archive`, which keeps only the link; "
-                        "commit a real directory")
     if git(root, "ls-files", "--error-unmatch", f"{rel}/scripts/orch.py", check=False).returncode != 0:
         warnings.append(f"{rel} is not committed yet: overrides, hook commands and CI all run it from the repo, "
                         "so commit it with the setup PR")
@@ -354,15 +365,33 @@ def cmd_write_registry(args) -> int:
             errors.append(f"{name}: needs non-empty 'repo', 'path' and 'allowed_write'")
     if errors:
         return emit({"ok": False, "plan": str(source), "errors": errors}, 1)
-    for e in entries:
-        path = root / registry_dir / f"{e['name']}.yaml"
-        rel = path.relative_to(root).as_posix()
-        if path.exists() or path.with_suffix(".yml").exists():
-            kept.append(rel)
-            continue
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(_entry_yaml(e), encoding="utf-8")
-        written.append(rel)
+    reg_dir = root / registry_dir
+    # a dry run removes what it wrote, down to the first directory it had to create
+    new_dir = next((d for d in [*reversed(Path(registry_dir).parents), Path(registry_dir)]
+                    if str(d) != "." and not (root / d).exists()), None)
+    try:
+        for e in entries:
+            path = reg_dir / f"{e['name']}.yaml"
+            rel = path.relative_to(root).as_posix()
+            if path.exists() or path.with_suffix(".yml").exists():
+                kept.append(rel)
+                continue
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(_entry_yaml(e), encoding="utf-8")
+            written.append(rel)
+        if args.dry_run:
+            _, out = orch_cli(root, Path(args.orch_gate), "registry")
+    finally:
+        if args.dry_run:
+            for rel in written:
+                (root / rel).unlink(missing_ok=True)
+            if new_dir is not None:
+                shutil.rmtree(root / new_dir, ignore_errors=True)
+    if args.dry_run:
+        # canonical-missing is expected until a contract story adds the canonical
+        blocking = [i for i in out["issues"] if i["code"] != "canonical-missing"]
+        return emit({"ok": not kept and not blocking, "dry_run": True, "plan": str(source), "would_write": written,
+                     "kept_existing": kept, "issues": out["issues"]}, 1 if kept or blocking else 0)
     removed = source == draft and not kept
     if removed:
         draft.unlink()
@@ -591,8 +620,15 @@ def cmd_ci(args) -> int:
     root = Path(args.project_root).resolve()
     cfg = orch_config(root, Path(args.orch_gate))
     cli = cli_location(root, Path(args.orch_gate))
-    registry = _existing(root, cfg["registry_dir"])
-    foreign = sorted(n for n, d in registry.items() if str(d.get("repo", "")).strip() not in (".", "./"))
+    # Read the registry as the gate will: orch-gate drops an entry it cannot load, and normalizes `repo`.
+    _, out = orch_cli(root, Path(args.orch_gate), "registry")
+    registry = {n: s for n, s in out["subprojects"].items() if n != "contracts"}
+    invalid = [i for i in out["issues"] if i.get("subproject") not in registry]
+    if invalid:
+        return emit({"ok": False, "code": "registry-invalid", "issues": invalid,
+                     "error": "orch-gate cannot load these registry entries; fix them before installing CI: "
+                              + "; ".join(i["message"] for i in invalid)}, 1)
+    foreign = sorted(n for n, s in registry.items() if s["repo"] != ".")
     if foreign:
         return emit({"ok": False, "code": "polyrepo",
                      "error": "the CI templates cover a monorepo registry (repo: . only); these entries name other "
@@ -715,7 +751,23 @@ def cmd_state(args) -> int:
                     or any(s != "missing" for s in overrides.values()))
     return emit({"ok": True, "in_place": in_place, "registry": registry,
                  "draft": str(draft) if draft.exists() else None, "merge_driver": driver, "overrides": overrides,
-                 "hook": hook_state, "ci": ci})
+                 "hook": hook_state, "ci": ci, "ci_defaults": ci_defaults(root)})
+
+
+def ci_defaults(root: Path) -> dict:
+    """What the repo already says about the CI question: platforms in use and the owners of `*` in CODEOWNERS."""
+    origin = git(root, "remote", "get-url", "origin", check=False).stdout.lower()
+    platforms = [p for p, used in (("github", (root / ".github" / "workflows").is_dir() or "github" in origin),
+                                   ("gitlab", (root / GITLAB_ROOT).exists() or "gitlab" in origin)) if used]
+    owners = None
+    for f in dict.fromkeys(f for files in CODEOWNERS_FILES.values() for f in files):
+        if (root / f).is_file():
+            for line in _read(root / f, 65536).splitlines():
+                parts = line.split("#", 1)[0].split()
+                if len(parts) > 1 and parts[0] == "*":
+                    owners = " ".join(parts[1:])  # the last matching line wins, as in CODEOWNERS
+            break
+    return {"platforms": platforms, "owners": owners}
 
 
 # ---- check ----
@@ -787,6 +839,7 @@ def build_parser() -> argparse.ArgumentParser:
     sc.add_argument("--fresh", action="store_true", help="replace an earlier registry draft with this scan")
     wr = sub.add_parser("write-registry", parents=[common, root], help="write confirmed registry entries")
     wr.add_argument("--plan", help="JSON file: the confirmed entries (default: the registry draft scan wrote)")
+    wr.add_argument("--dry-run", action="store_true", help="validate the plan with orch-gate as if written, write nothing")
     ov = sub.add_parser("overrides", parents=[common, root], help="install or merge the stock-skill overrides")
     ov.add_argument("--dry-run", action="store_true")
     ov.add_argument("--update", action="store_true",

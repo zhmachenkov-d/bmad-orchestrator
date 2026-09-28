@@ -319,6 +319,23 @@ def test_registry_draft_survives_until_written_and_resumes(capsys, project):
     assert code == 2 and res["code"] == "no-plan", res
 
 
+def test_write_registry_dry_run_validates_with_orch_gate_and_leaves_no_file(capsys, project):
+    _layout(project)
+    _, res = run(capsys, project, "scan")
+    draft = Path(res["draft"]["path"])
+    code, res = run(capsys, project, "write-registry", "--dry-run")
+    assert code == 0 and res["dry_run"] and len(res["would_write"]) == 3, res
+    assert {i["code"] for i in res["issues"]} == {"canonical-missing"}, res  # expected before contract stories
+    assert not (project / "_bmad-output").exists() and draft.exists()
+    # an issue the gate would raise shows up before anything is written
+    plan = json.loads(draft.read_text(encoding="utf-8"))
+    plan["subprojects"][0]["path"] = "nowhere"
+    draft.write_text(json.dumps(plan), encoding="utf-8")
+    code, res = run(capsys, project, "write-registry", "--dry-run")
+    assert code == 1 and "path-missing" in {i["code"] for i in res["issues"]}, res
+    assert not (project / "_bmad-output").exists() and draft.exists()
+
+
 def test_write_registry_rejects_a_name_used_twice_in_the_plan(capsys, project):
     plan = project.parent / "plan.json"
     plan.write_text(json.dumps([{"name": "pay", "repo": ".", "path": "a", "allowed_write": ["a/**"]},
@@ -401,6 +418,15 @@ def test_ci_refuses_a_polyrepo_registry(capsys, project):
     _register(project, "pay", repo="https://git.example.com/acme/pay.git")
     code, res = run(capsys, project, "ci", "--platform", "github")
     assert code == 1 and res["code"] == "polyrepo", res
+    assert not (project / ".github").exists()
+
+
+@pytest.mark.parametrize("text", ["name: pay\nrepo: [unclosed\n", "name: pay\npath: services/pay\nallowed_write: ['x/**']\n"])
+def test_ci_reports_an_entry_the_gate_cannot_load_instead_of_polyrepo(capsys, project, text):
+    _register(project, "web")
+    (project / "_bmad-output/orch/subprojects/pay.yaml").write_text(text, encoding="utf-8")
+    code, res = run(capsys, project, "ci", "--platform", "github")
+    assert code == 1 and res["code"] == "registry-invalid" and res["issues"][0]["subproject"] == "pay", res
     assert not (project / ".github").exists()
 
 
@@ -490,6 +516,16 @@ def test_state_tells_a_first_install_from_a_rerun_and_finds_drift(capsys, projec
     assert code == 0 and res["in_place"] and res["merge_driver"] and res["registry"] == ["pay"], res
     assert res["overrides"] == {"bmad-build": "drift", "bmad-create-epics-and-stories": "current",
                                 "bmad-sprint-planning": "current"}, res
+
+
+def test_state_preselects_ci_platforms_and_owners_from_the_repo(capsys, project):
+    _, res = run(capsys, project, "state")
+    assert res["ci_defaults"] == {"platforms": [], "owners": None}, res
+    git(project, "remote", "add", "origin", "git@gitlab.example.com:acme/shop.git")
+    (project / ".github/workflows").mkdir(parents=True)
+    (project / ".github/CODEOWNERS").write_text("* @acme/old\n/docs/ @acme/docs\n* @acme/core @lead # owners\n")
+    _, res = run(capsys, project, "state")
+    assert res["ci_defaults"] == {"platforms": ["github", "gitlab"], "owners": "@acme/core @lead"}, res
 
 
 def test_stock_anchors_hold_in_this_repos_installed_skills(capsys):
