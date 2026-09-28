@@ -11,8 +11,11 @@ Orch paths come from `orch.py config --working-tree` of orch-gate, which install
 uncommitted config change is already in effect here.
 
 Commands:
+  state           what is already in place (registry, draft, merge driver, overrides, hook, CI), for a re-run
   scan            propose registry entries from the repo layout (and from --checkout code repos in a polyrepo)
-  write-registry  write confirmed entries (--plan JSON) as <registry_dir>/<name>.yaml; never overwrites
+                  and keep them as a registry draft in this clone's git dir until they are written
+  write-registry  write confirmed entries (the draft, or --plan JSON) as <registry_dir>/<name>.yaml; never
+                  overwrites; the draft is removed once every entry is written
   overrides       install or merge the orch overrides into _bmad/custom/{bmad-build,bmad-create-epics-and-stories,
                   bmad-sprint-planning}.toml; missing orch entries are added, everything else is kept; an orch
                   entry that differs from the template is reported as drift and replaced only with --update
@@ -29,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import glob
 import json
 import os
 import re
@@ -129,15 +133,33 @@ def _read(path: Path, limit: int = 4096) -> str:
         return ""
 
 
-def _globs(root: Path, patterns: list) -> list[Path]:
-    found = []
+def _globs(root: Path, patterns: list, notes: list[str]) -> list[Path]:
+    """Workspace member dirs inside the checkout. A `**` pattern matches every nested dir, so it keeps only dirs
+    that hold a manifest, never the glob base; a member outside the checkout is skipped with a note."""
+    found, top = [], root.resolve()
     for pat in patterns:
-        if isinstance(pat, str) and not pat.startswith("!"):
-            found += [p for p in sorted(root.glob(pat.strip("/"))) if p.is_dir()]
+        if not isinstance(pat, str) or not pat.strip() or pat.startswith("!"):
+            continue
+        rel = pat.strip()
+        if PurePosixPath(rel).is_absolute() or ".." in PurePosixPath(rel).parts:
+            notes.append(f"{root}: workspace member '{pat}' is outside this checkout; scan it with --checkout")
+            continue
+        rel = rel.removeprefix("./").strip("/")
+        if not rel or rel == ".":
+            continue
+        base = root / rel.split("**", 1)[0].rstrip("/") if "**" in rel else None
+        for p in sorted(root.glob(rel)):
+            parts = p.relative_to(root).parts
+            if not p.is_dir() or any(x in SKIP_DIRS or x.startswith(".") for x in parts):
+                continue
+            if not p.resolve().is_relative_to(top):
+                notes.append(f"{p.relative_to(root)} links outside the checkout; skipped")
+            elif base is None or (p != base and any((p / m).is_file() for m in MANIFESTS)):
+                found.append(p)
     return found
 
 
-def _workspace_members(root: Path) -> list[Path]:
+def _workspace_members(root: Path, notes: list[str]) -> list[Path]:
     members = []
     pkg = root / "package.json"
     if pkg.is_file():
@@ -145,17 +167,17 @@ def _workspace_members(root: Path) -> list[Path]:
             ws = json.loads(pkg.read_text(encoding="utf-8")).get("workspaces")
         except (json.JSONDecodeError, AttributeError, OSError):
             ws = None
-        members += _globs(root, ws.get("packages", []) if isinstance(ws, dict) else ws or [])
+        members += _globs(root, ws.get("packages", []) if isinstance(ws, dict) else ws or [], notes)
     pnpm = root / "pnpm-workspace.yaml"
     if pnpm.is_file():
         try:
-            members += _globs(root, (yaml.safe_load(pnpm.read_text(encoding="utf-8")) or {}).get("packages", []))
+            members += _globs(root, (yaml.safe_load(pnpm.read_text(encoding="utf-8")) or {}).get("packages", []), notes)
         except (yaml.YAMLError, AttributeError, OSError):
             pass
     gowork = root / "go.work"
     if gowork.is_file():
         uses = re.findall(r"^\s*(?:use\s+)?(\./[^\s()]+)\s*$", gowork.read_text(encoding="utf-8"), re.M)
-        members += [root / u for u in uses if (root / u).is_dir()]
+        members += _globs(root, [glob.escape(u) for u in uses], notes)
     for toml_file, keys in (("Cargo.toml", ("workspace",)), ("pyproject.toml", ("tool", "uv", "workspace"))):
         path = root / toml_file
         if path.is_file():
@@ -163,14 +185,14 @@ def _workspace_members(root: Path) -> list[Path]:
                 table = tomllib.loads(path.read_text(encoding="utf-8"))
                 for k in keys:
                     table = table.get(k, {})
-                members += _globs(root, table.get("members", []))
+                members += _globs(root, table.get("members", []), notes)
             except (tomllib.TOMLDecodeError, AttributeError, OSError):
                 pass
     return members
 
 
-def _candidates(root: Path, exclude: list[str]) -> list[Path]:
-    dirs = set(_workspace_members(root))
+def _candidates(root: Path, exclude: list[str], notes: list[str]) -> list[Path]:
+    dirs = set(_workspace_members(root, notes))
     for conv in CONVENTIONAL:
         if (root / conv).is_dir():
             dirs |= {d for d in (root / conv).iterdir() if d.is_dir() and not d.name.startswith(".")}
@@ -237,6 +259,13 @@ def _existing(root: Path, registry_dir: str) -> dict:
     return out
 
 
+def draft_path(root: Path) -> Path:
+    """The registry draft under negotiation. It lives in this clone's git dir, so it survives an interrupted
+    conversation but is never committed."""
+    common = Path(git(root, "rev-parse", "--git-common-dir").stdout.strip())
+    return (common if common.is_absolute() else root / common) / "orch-setup" / "registry-draft.json"
+
+
 def cmd_scan(args) -> int:
     root = Path(args.project_root).resolve()
     cfg = orch_config(root, Path(args.orch_gate))
@@ -254,7 +283,7 @@ def cmd_scan(args) -> int:
             repo = origin.stdout.strip() if origin.returncode == 0 else ""
             if not repo:
                 notes.append(f"{checkout}: no origin remote; its entries need 'repo' set to the clone URL by hand")
-        for sub in _candidates(checkout, exclude if checkout == root else []):
+        for sub in _candidates(checkout, exclude if checkout == root else [], notes):
             path = "." if sub == checkout else sub.relative_to(checkout).as_posix()
             if (repo, path) in taken:
                 continue
@@ -272,8 +301,19 @@ def cmd_scan(args) -> int:
                 "contracts": {"exports": _contracts(checkout, sub, name, contracts_dir), "imports": []},
                 "evidence": manifests or ["directory convention"],
             })
+    draft = draft_path(root)
+    if draft.exists() and not args.fresh:
+        status = "kept"  # an earlier negotiation: the user resumes it or rescans with --fresh
+    elif proposals:
+        draft.parent.mkdir(parents=True, exist_ok=True)
+        draft.write_text(json.dumps({"subprojects": proposals}, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        status = "written"
+    else:
+        draft.unlink(missing_ok=True)
+        status = "none"
     return emit({"ok": True, "registry_dir": registry_dir, "contracts_dir": contracts_dir,
-                 "existing": sorted(existing), "proposals": proposals, "notes": notes})
+                 "existing": sorted(existing), "proposals": proposals, "notes": notes,
+                 "draft": {"path": str(draft), "status": status}})
 
 
 def _entry_yaml(e: dict) -> str:
@@ -290,23 +330,30 @@ def _entry_yaml(e: dict) -> str:
 def cmd_write_registry(args) -> int:
     root = Path(args.project_root).resolve()
     registry_dir = orch_config(root, Path(args.orch_gate))["registry_dir"]
+    draft = draft_path(root)
+    source = Path(args.plan) if args.plan else draft
+    if not args.plan and not draft.exists():
+        raise SetupError("no --plan and no registry draft; run scan first", "no-plan")
     try:
-        plan = json.loads(Path(args.plan).read_text(encoding="utf-8"))
+        plan = json.loads(source.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise SetupError(f"cannot read --plan: {exc}", "bad-plan")
+        raise SetupError(f"cannot read {source}: {exc}", "bad-plan")
     entries = plan.get("subprojects") if isinstance(plan, dict) else plan
     if not isinstance(entries, list):
-        raise SetupError("--plan must be a list of entries or {\"subprojects\": [...]}", "bad-plan")
-    errors, written, kept = [], [], []
+        raise SetupError("the plan must be a list of entries or {\"subprojects\": [...]}", "bad-plan")
+    errors, written, kept, seen = [], [], [], set()
     for i, e in enumerate(entries):
         name = e.get("name") if isinstance(e, dict) else None
         if not isinstance(name, str) or not NAME.match(name) or name == "contracts":
             errors.append(f"entry {i}: name {name!r} must be lowercase kebab-case and not 'contracts'")
             continue
+        if name in seen:
+            errors.append(f"entry {i}: name '{name}' is used by an earlier entry of the plan")
+        seen.add(name)
         if not all(isinstance(e.get(k), str) and e[k].strip() for k in ("repo", "path")) or not e.get("allowed_write"):
             errors.append(f"{name}: needs non-empty 'repo', 'path' and 'allowed_write'")
     if errors:
-        return emit({"ok": False, "errors": errors}, 1)
+        return emit({"ok": False, "plan": str(source), "errors": errors}, 1)
     for e in entries:
         path = root / registry_dir / f"{e['name']}.yaml"
         rel = path.relative_to(root).as_posix()
@@ -316,7 +363,11 @@ def cmd_write_registry(args) -> int:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(_entry_yaml(e), encoding="utf-8")
         written.append(rel)
-    return emit({"ok": not kept, "written": written, "kept_existing": kept}, 1 if kept else 0)
+    removed = source == draft and not kept
+    if removed:
+        draft.unlink()
+    return emit({"ok": not kept, "plan": str(source), "written": written, "kept_existing": kept,
+                 "draft_removed": removed}, 1 if kept else 0)
 
 
 # ---- overrides ----
@@ -448,11 +499,15 @@ def merge_override(current: str | None, rendered: str, update: bool = False) -> 
     return text, notes, drift
 
 
+def _override_values(cfg: dict, cli: dict) -> dict:
+    return {"@ORCH_CLI@": "{project-root}/" + cli["path"], "@ORCH_REGISTRY_DIR@": cfg["registry_dir"]}
+
+
 def cmd_overrides(args) -> int:
     root = Path(args.project_root).resolve()
     cfg = orch_config(root, Path(args.orch_gate))
     cli = cli_location(root, Path(args.orch_gate))
-    values = {"@ORCH_CLI@": "{project-root}/" + cli["path"], "@ORCH_REGISTRY_DIR@": cfg["registry_dir"]}
+    values = _override_values(cfg, cli)
     files, warnings = [], list(cli["warnings"])
     templates = Path(args.orch_gate) / "assets" / "custom"
     for name in OVERRIDES:
@@ -589,11 +644,15 @@ exit $status
 """
 
 
-def cmd_hook(args) -> int:
-    repo = Path(git(Path(args.repo), "rev-parse", "--show-toplevel").stdout.strip())
+def hook_path(clone: Path) -> Path:
+    """This clone's pre-push hook, honouring core.hooksPath."""
+    repo = Path(git(clone, "rev-parse", "--show-toplevel").stdout.strip())
     hooks = Path(git(repo, "rev-parse", "--git-path", "hooks").stdout.strip())
-    hooks = hooks if hooks.is_absolute() else repo / hooks
-    path = hooks / "pre-push"
+    return (hooks if hooks.is_absolute() else repo / hooks) / "pre-push"
+
+
+def cmd_hook(args) -> int:
+    path = hook_path(Path(args.repo))
     orch_py = (Path(args.orch_gate) / "scripts" / "orch.py").resolve()
     text = hook_text(orch_py, str(Path(args.coord).resolve()) if args.coord else None)
     if path.exists():
@@ -612,6 +671,51 @@ def cmd_hook(args) -> int:
         path.write_text(text, encoding="utf-8")
         path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     return emit({"ok": True, "status": status, "hook": str(path), "dry_run": args.dry_run})
+
+
+# ---- state ----
+
+def cmd_state(args) -> int:
+    """What orch-setup already put in place, so a re-run offers only what is missing or what the user asks for."""
+    root = Path(args.project_root).resolve()
+    orch_gate = Path(args.orch_gate)
+    cfg = orch_config(root, orch_gate)
+    registry = sorted(_existing(root, cfg["registry_dir"]))
+    draft = draft_path(root)
+    try:
+        values = _override_values(cfg, cli_location(root, orch_gate))
+    except SetupError:
+        values = None  # `overrides` reports why; here the files are only found, not compared
+    overrides = {}
+    for name in OVERRIDES:
+        target = root / "_bmad" / "custom" / f"{name}.toml"
+        if not target.exists():
+            overrides[name] = "missing"
+            continue
+        if values is None:
+            overrides[name] = "present"
+            continue
+        current = target.read_text(encoding="utf-8")
+        try:
+            text, _, drift = merge_override(current, _render(orch_gate / "assets" / "custom" / f"{name}.toml", values))
+            overrides[name] = "drift" if drift else ("current" if text == current else "incomplete")
+        except (tomlkit.exceptions.ParseError, tomllib.TOMLDecodeError):
+            overrides[name] = "unparsable"
+        except SetupError as exc:
+            if exc.code != "manual":
+                raise
+            overrides[name] = "manual"
+    hook = hook_path(root)
+    hook_state = "absent" if not hook.exists() else (
+        "orch" if HOOK_TAG in hook.read_text(encoding="utf-8", errors="replace") else "foreign")
+    # merge.<name>.driver as orch-gate's `sprint-status install-driver` registers it (sprint_status.DRIVER)
+    driver = git(root, "config", "--get", "merge.orch-sprint-status.driver", check=False).returncode == 0
+    ci = {p: (root / t).exists() for p, t in CI_TARGETS.items()}
+    in_place = bool(registry or driver or ci["github"] or ci["gitlab"]
+                    or any(s != "missing" for s in overrides.values()))
+    return emit({"ok": True, "in_place": in_place, "registry": registry,
+                 "draft": str(draft) if draft.exists() else None, "merge_driver": driver, "overrides": overrides,
+                 "hook": hook_state, "ci": ci})
 
 
 # ---- check ----
@@ -680,8 +784,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True, parser_class=JsonParser)
     sc = sub.add_parser("scan", parents=[common, root], help="propose registry entries")
     sc.add_argument("--checkout", action="append", default=[], help="local clone of a polyrepo code repo (repeatable)")
+    sc.add_argument("--fresh", action="store_true", help="replace an earlier registry draft with this scan")
     wr = sub.add_parser("write-registry", parents=[common, root], help="write confirmed registry entries")
-    wr.add_argument("--plan", required=True, help="JSON file: the confirmed entries")
+    wr.add_argument("--plan", help="JSON file: the confirmed entries (default: the registry draft scan wrote)")
     ov = sub.add_parser("overrides", parents=[common, root], help="install or merge the stock-skill overrides")
     ov.add_argument("--dry-run", action="store_true")
     ov.add_argument("--update", action="store_true",
@@ -695,11 +800,12 @@ def build_parser() -> argparse.ArgumentParser:
     hk.add_argument("--coord", help="coordination repo checkout, for a polyrepo code repo")
     hk.add_argument("--dry-run", action="store_true")
     sub.add_parser("check", parents=[common, root], help="tools, stock anchors, ignored orch dirs")
+    sub.add_parser("state", parents=[common, root], help="what setup already put in place")
     return p
 
 
 COMMANDS = {"scan": cmd_scan, "write-registry": cmd_write_registry, "overrides": cmd_overrides, "ci": cmd_ci,
-            "hook": cmd_hook, "check": cmd_check}
+            "hook": cmd_hook, "check": cmd_check, "state": cmd_state}
 
 
 def main(argv=None) -> int:

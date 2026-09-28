@@ -277,6 +277,57 @@ def test_write_registry_validates_with_orch_gate_and_never_overwrites(capsys, pr
     assert edited.read_text(encoding="utf-8").endswith("# edited\n")
 
 
+def test_scan_expands_a_double_star_workspace_by_manifest_and_skips_members_outside(capsys, project):
+    files = {
+        "pnpm-workspace.yaml": "packages:\n  - 'components/**'\n  - '../shared'\n  - '/opt/libs/*'\n",
+        "components/README.md": "",
+        "components/ui/button/package.json": "{}",
+        "components/ui/button/node_modules/dep/package.json": "{}",  # never a member
+        "components/forms/package.json": "{}",
+        "components/forms/src/index.ts": "",
+        "go.work": "go 1.22\nuse (\n  ./tools/gen\n  ./../outside\n)\n",
+        "tools/gen/go.mod": "module gen\n",
+    }
+    for rel, text in files.items():
+        (project / rel).parent.mkdir(parents=True, exist_ok=True)
+        (project / rel).write_text(text, encoding="utf-8")
+    code, res = run(capsys, project, "scan")
+    assert code == 0, res
+    assert sorted(p["path"] for p in res["proposals"]) == ["components/forms", "components/ui/button", "tools/gen"], res
+    outside = [n for n in res["notes"] if "outside this checkout" in n]
+    assert len(outside) == 3 and any("../shared" in n for n in outside), res
+
+
+def test_registry_draft_survives_until_written_and_resumes(capsys, project):
+    _layout(project)
+    code, res = run(capsys, project, "scan")
+    draft = Path(res["draft"]["path"])
+    assert res["draft"]["status"] == "written" and draft.is_relative_to(project / ".git"), res  # never committed
+    plan = json.loads(draft.read_text(encoding="utf-8"))
+    assert [p["name"] for p in plan["subprojects"]] == [p["name"] for p in res["proposals"]]
+    # the user's decisions go into the draft; a plain re-scan keeps them, --fresh replaces them
+    plan["subprojects"] = [dict(p, name="payments") if p["name"] == "pay" else p for p in plan["subprojects"]]
+    draft.write_text(json.dumps(plan), encoding="utf-8")
+    _, res = run(capsys, project, "scan")
+    assert res["draft"]["status"] == "kept" and "payments" in draft.read_text(encoding="utf-8")
+    _, res = run(capsys, project, "state")
+    assert res["draft"] == str(draft) and res["in_place"] is False, res
+    code, res = run(capsys, project, "write-registry")
+    assert code == 0 and res["draft_removed"] and not draft.exists(), res
+    assert (project / "_bmad-output/orch/subprojects/payments.yaml").is_file()
+    code, res = run(capsys, project, "write-registry")
+    assert code == 2 and res["code"] == "no-plan", res
+
+
+def test_write_registry_rejects_a_name_used_twice_in_the_plan(capsys, project):
+    plan = project.parent / "plan.json"
+    plan.write_text(json.dumps([{"name": "pay", "repo": ".", "path": "a", "allowed_write": ["a/**"]},
+                                {"name": "pay", "repo": ".", "path": "b", "allowed_write": ["b/**"]}]))
+    code, res = run(capsys, project, "write-registry", "--plan", str(plan))
+    assert code == 1 and res["errors"] == ["entry 1: name 'pay' is used by an earlier entry of the plan"], res
+    assert not (project / "_bmad-output").exists()
+
+
 def test_write_registry_rejects_bad_names(capsys, project):
     plan = project.parent / "plan.json"
     plan.write_text(json.dumps([{"name": "contracts", "repo": ".", "path": "x", "allowed_write": ["x/**"]},
@@ -420,6 +471,25 @@ def test_check_flags_a_missing_stock_anchor_and_an_ignored_orch_dir(capsys, proj
     anchors = res["stock_anchors"][".claude/skills/bmad-create-epics-and-stories"]
     assert anchors == {"status": "missing", "missing": ["steps/step-04-final-validation.md: [C] Complete"]}
     assert res["stock_anchors"]["bmad-sprint-planning"] == {"status": "not-installed"}
+
+
+# ---- state ----
+
+def test_state_tells_a_first_install_from_a_rerun_and_finds_drift(capsys, project):
+    code, res = run(capsys, project, "state")
+    assert code == 0 and res["in_place"] is False, res
+    assert set(res["overrides"].values()) == {"missing"} and res["hook"] == "absent" and not res["merge_driver"]
+    run(capsys, project, "overrides")
+    _register(project, "pay")
+    subprocess.run(["uv", "run", str(project / CLI_DIR / "scripts" / "orch.py"), "sprint-status", "install-driver",
+                    "--repo", str(project)], check=True, capture_output=True)
+    target = project / "_bmad" / "custom" / "bmad-build.toml"
+    target.write_text(target.read_text(encoding="utf-8").replace("orch completion", "orch completion (team)", 1),
+                      encoding="utf-8")
+    code, res = run(capsys, project, "state")
+    assert code == 0 and res["in_place"] and res["merge_driver"] and res["registry"] == ["pay"], res
+    assert res["overrides"] == {"bmad-build": "drift", "bmad-create-epics-and-stories": "current",
+                                "bmad-sprint-planning": "current"}, res
 
 
 def test_stock_anchors_hold_in_this_repos_installed_skills(capsys):
