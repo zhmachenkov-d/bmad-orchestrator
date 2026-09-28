@@ -405,6 +405,34 @@ def test_hook_honours_core_hooks_path_and_leaves_a_foreign_hook_alone(capsys, pr
     assert foreign.read_text(encoding="utf-8") == "#!/bin/sh\nnpm test\n"
 
 
+# ---- status ----
+
+def test_status_reports_what_setup_put_in_place(capsys, project):
+    code, res = run(capsys, project, "status")
+    assert code == 0, res
+    assert res["registry"] == [] and res["merge_driver"] is False and res["hook"] == "none"
+    assert res["overrides"] == {n: "missing" for n in setup.OVERRIDES}
+    assert res["ci"] == {"github": False, "gitlab": False}
+    run(capsys, project, "overrides")
+    run(capsys, project, "ci", "--platform", "github")
+    run(capsys, project, "hook", "--repo", str(project))
+    subprocess.run(["uv", "run", str(project / CLI_DIR / "scripts" / "orch.py"), "sprint-status", "install-driver",
+                    "--repo", str(project)], check=True, capture_output=True)
+    (project / "_bmad-output" / "orch" / "subprojects").mkdir(parents=True)
+    (project / "_bmad-output" / "orch" / "subprojects" / "pay.yaml").write_text("repo: .\npath: pay\n", encoding="utf-8")
+    code, res = run(capsys, project, "status")
+    assert res["registry"] == ["pay"] and res["merge_driver"] is True and res["hook"] == "orch", res
+    assert res["overrides"] == {n: "installed" for n in setup.OVERRIDES}
+    assert res["ci"] == {"github": True, "gitlab": False}
+    _older_orch_revision(project / "_bmad" / "custom" / "bmad-build.toml")
+    assert run(capsys, project, "status")[1]["overrides"]["bmad-build"] == "drift"
+
+
+def test_status_merge_driver_name_matches_orch_gate():
+    text = (ORCH_GATE_SRC / "scripts" / "orchlib" / "sprint_status.py").read_text(encoding="utf-8")
+    assert f'DRIVER = "{setup.MERGE_DRIVER}"' in text
+
+
 # ---- check ----
 
 def test_check_flags_a_missing_stock_anchor_and_an_ignored_orch_dir(capsys, project):

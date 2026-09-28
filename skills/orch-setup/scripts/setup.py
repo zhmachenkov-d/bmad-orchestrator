@@ -20,6 +20,7 @@ Commands:
                   lines are only suggested
   hook            install a pre-push hook that runs the gate on pushed story/* branches
   check           git/uv/host CLIs, stock anchors the overrides rely on, ignored orch dirs
+  status          what is already in place: registry entries, overrides, merge driver, CI files, pre-push hook
 
 Output is JSON on stdout. Exit codes: 0 = ok, 1 = something needs the user (invalid plan, a check failed,
 a file left alone), 2 = usage or environment error.
@@ -448,12 +449,16 @@ def merge_override(current: str | None, rendered: str, update: bool = False) -> 
     return text, notes, drift
 
 
+def _override_values(root: Path, orch_gate: Path, cfg: dict) -> tuple[dict, list[str]]:
+    cli = cli_location(root, orch_gate)
+    return {"@ORCH_CLI@": "{project-root}/" + cli["path"], "@ORCH_REGISTRY_DIR@": cfg["registry_dir"]}, cli["warnings"]
+
+
 def cmd_overrides(args) -> int:
     root = Path(args.project_root).resolve()
     cfg = orch_config(root, Path(args.orch_gate))
-    cli = cli_location(root, Path(args.orch_gate))
-    values = {"@ORCH_CLI@": "{project-root}/" + cli["path"], "@ORCH_REGISTRY_DIR@": cfg["registry_dir"]}
-    files, warnings = [], list(cli["warnings"])
+    values, cli_warnings = _override_values(root, Path(args.orch_gate), cfg)
+    files, warnings = [], list(cli_warnings)
     templates = Path(args.orch_gate) / "assets" / "custom"
     for name in OVERRIDES:
         rendered = _render(templates / f"{name}.toml", values)
@@ -589,11 +594,15 @@ exit $status
 """
 
 
+def _hook_path(repo: Path) -> Path:
+    """This clone's pre-push hook file, honouring core.hooksPath."""
+    hooks = Path(git(repo, "rev-parse", "--git-path", "hooks").stdout.strip())
+    return (hooks if hooks.is_absolute() else repo / hooks) / "pre-push"
+
+
 def cmd_hook(args) -> int:
     repo = Path(git(Path(args.repo), "rev-parse", "--show-toplevel").stdout.strip())
-    hooks = Path(git(repo, "rev-parse", "--git-path", "hooks").stdout.strip())
-    hooks = hooks if hooks.is_absolute() else repo / hooks
-    path = hooks / "pre-push"
+    path = _hook_path(repo)
     orch_py = (Path(args.orch_gate) / "scripts" / "orch.py").resolve()
     text = hook_text(orch_py, str(Path(args.coord).resolve()) if args.coord else None)
     if path.exists():
@@ -612,6 +621,40 @@ def cmd_hook(args) -> int:
         path.write_text(text, encoding="utf-8")
         path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     return emit({"ok": True, "status": status, "hook": str(path), "dry_run": args.dry_run})
+
+
+# ---- status ----
+
+MERGE_DRIVER = "orch-sprint-status"  # orch-gate's sprint_status.DRIVER
+
+
+def cmd_status(args) -> int:
+    """What setup already put in place, so a re-run can offer only the parts the user wants to revisit."""
+    root = Path(args.project_root).resolve()
+    cfg = orch_config(root, Path(args.orch_gate))
+    values, _ = _override_values(root, Path(args.orch_gate), cfg)
+    overrides = {}
+    for name in OVERRIDES:
+        target = root / "_bmad" / "custom" / f"{name}.toml"
+        if not target.exists():
+            overrides[name] = "missing"
+            continue
+        rendered = _render(Path(args.orch_gate) / "assets" / "custom" / f"{name}.toml", values)
+        try:
+            text, notes, drift = merge_override(target.read_text(encoding="utf-8"), rendered)
+        except (tomlkit.exceptions.ParseError, tomllib.TOMLDecodeError):
+            overrides[name] = "unparsable"
+        except SetupError:
+            overrides[name] = "manual"
+        else:
+            overrides[name] = "drift" if drift else ("incomplete" if [n for n in notes if "earlier" not in n] else "installed")
+    hook = _hook_path(root)
+    hook_state = "none" if not hook.exists() else (
+        "orch" if HOOK_TAG in hook.read_text(encoding="utf-8", errors="replace") else "foreign")
+    driver = git(root, "config", "--get", f"merge.{MERGE_DRIVER}.driver", check=False).returncode == 0
+    registry = sorted(_existing(root, cfg["registry_dir"]))
+    return emit({"ok": True, "registry": registry, "overrides": overrides, "merge_driver": driver,
+                 "ci": {p: (root / t).exists() for p, t in CI_TARGETS.items()}, "hook": hook_state})
 
 
 # ---- check ----
@@ -695,11 +738,12 @@ def build_parser() -> argparse.ArgumentParser:
     hk.add_argument("--coord", help="coordination repo checkout, for a polyrepo code repo")
     hk.add_argument("--dry-run", action="store_true")
     sub.add_parser("check", parents=[common, root], help="tools, stock anchors, ignored orch dirs")
+    sub.add_parser("status", parents=[common, root], help="what setup already put in place in this clone")
     return p
 
 
 COMMANDS = {"scan": cmd_scan, "write-registry": cmd_write_registry, "overrides": cmd_overrides, "ci": cmd_ci,
-            "hook": cmd_hook, "check": cmd_check}
+            "hook": cmd_hook, "check": cmd_check, "status": cmd_status}
 
 
 def main(argv=None) -> int:

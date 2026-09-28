@@ -17,18 +17,20 @@ Never clobber a user file, and keep every step safe to re-run: the scripts merge
 
 Every script prints JSON. Exit 1 means something needs the user, and exit 2 is an environment error: report its `error`. Run `scripts/setup.py` as `uv run scripts/setup.py <command>`, with `--project-root <project root>` on every command except `hook`. It reads orch paths from `uv run {orch} config --working-tree`, so config written in step 3 applies before it is committed.
 
-## 1. Intro
+## 1. Check the install
 
-Open with orch in a few lines. It lets several people and agents deliver one epic across many subprojects in parallel. Each story belongs to one subproject, contracts come first, and a deterministic gate checks every merge. The daily flow: plan with stock BMad, `orch-next` claims a story into its own worktree, `bmad-build` builds it, the PR passes `orch-gate`, and `orch-status` tracks progress and closes epics.
+First run `uv --version` and `git --version`. Every step needs both, so if one is missing, stop before asking anything and give its install hint: uv from docs.astral.sh/uv, git 2.25 or newer.
 
-## 2. Check the install
-
-orch is registered by the BMad installer, never by this skill. `npx bmad-method install --custom-source <orch git URL or local path>` reads `.claude-plugin/marketplace.json`, asks the questions in `assets/module.yaml`, writes the answers to `[modules.orch]` in `{project-root}/_bmad/config.toml` (and `orch_worktrees_dir` to `{project-root}/_bmad/config.user.toml`), and installs the orch skills.
-
-Run `uv run scripts/write-config.py --project-root <project root> --module-yaml assets/module.yaml --show`. It gives each variable's value in effect as a raw answer, and the layer it comes from.
+orch is registered only by the BMad installer (`npx bmad-method install --custom-source <orch git URL or local path>`). It writes `[modules.orch]` to `{project-root}/_bmad/config.toml` (`orch_worktrees_dir` to `config.user.toml`) and installs the skills. Run `uv run scripts/write-config.py --project-root <project root> --module-yaml assets/module.yaml --show`. It gives each variable's value in effect as a raw answer, and the layer it comes from.
 
 - `installer_config` true: installed.
 - False: orch was copied in by hand and `bmad-help` does not list its skills. Recommend the installer. If the user continues without it, step 3 writes the full config into the custom layers.
+
+Then run `setup.py status`. When it shows registry entries or installed overrides, this is a re-run. Skip the intro and say in two lines what is in place: config values, registry names, and the state of the overrides, merge driver, CI files and hook. Ask which parts to revisit: config (3), subprojects (4), wiring (5), CI (6). Check (7) always runs. "reconfigure orch" goes straight to step 3. On a first setup, run every step.
+
+## 2. Intro
+
+Open with orch in a few lines. It lets several people and agents deliver one epic across many subprojects in parallel. Each story belongs to one subproject, contracts come first, and a deterministic gate checks every merge. The daily flow: plan with stock BMad, `orch-next` claims a story into its own worktree, `bmad-build` builds it, the PR passes `orch-gate`, and `orch-status` tracks progress and closes epics.
 
 ## 3. Configure
 
@@ -52,12 +54,19 @@ Ask for GitHub Actions, GitLab CI or both, and the CODEOWNERS owners (e.g. `@org
 
 ## 7. Check
 
-Run `setup.py check` and `uv run {orch} deps --working-tree --repo <project root>`. Report each problem with its fix. That covers git older than 2.25, an orch dir that is gitignored, and a stock anchor that is gone. A missing anchor means a BMad update changed a stock skill the overrides describe, so the override may no longer fire where it should. For missing detectors, give the install hint `deps` prints, and offer `deps --probe` once they are installed.
+Run `setup.py check` and `uv run {orch} deps --working-tree --repo <project root>`. Report each problem with its fix. A missing stock anchor means a BMad update changed a stock skill the overrides describe, so the override may no longer fire where it should. For missing detectors, give the install hint `deps` prints, and offer `deps --probe` once they are installed.
 
 ## 8. Next steps
 
-List what to commit: config, registry, overrides, CI files and the orch skills themselves. The first setup PR passes the gate with a notice, because orch is not yet on the base. After it merges, every PR fails `setup` until the epics land. The epics PR changes only planning files, so the gate accepts it as a setup repair. Plan with `bmad-prd` → `bmad-architecture` → `bmad-create-epics-and-stories` → `bmad-sprint-planning`, then pick work with `orch-next`. Every teammate runs `orch-setup -H` once in their clone for the merge driver (and the hook, if the team uses it). Finish with `module_greeting` from `assets/module.yaml`.
+List what to commit: config, registry, overrides, CI files and the orch skills themselves. The first setup PR passes the gate with a notice, because orch is not yet on the base. After it merges, every PR fails `setup` until the epics land. The epics PR changes only planning files, so the gate accepts it as a setup repair. Give every teammate the command to run once in their clone for the merge driver: `orch-setup -H`, or `orch-setup -H hook` if the team uses the hook. In a polyrepo code-repo clone, the hook command also takes `coord=<coordination repo checkout>`. Finish with `module_greeting` from `assets/module.yaml`.
 
 ## Headless
 
-With `-H`, skip the questions. In step 3, pass only the inline values (all defaults when orch is not installed), and skip write-config when there are none. Run overrides without `--update`, so drift is reported and never replaced. Then install the merge driver, overrides and checks (steps 5 and 7). Install the hook only for an inline `hook`. Install CI only for an inline `ci=<platforms>`. Never write the registry. Print each script's JSON as the only output.
+With `-H`, skip the questions, the intro and the registry, which is never written headless.
+
+- Step 3: pass only the inline values (all defaults when orch is not installed). Skip write-config when there are none.
+- Steps 5 and 7: install the merge driver and the overrides, then run the checks. Run overrides without `--update`, so drift is reported and never replaced.
+- Install the hook only for an inline `hook`, with `--coord` for an inline `coord=<path>`.
+- Install CI only for an inline `ci=<platforms>`.
+
+A missing uv or git, or any exit 2, stops the run there. Exit 1 is recorded, and the run continues. The only output is one JSON object: `{"ok": <true when every step exited 0>, "steps": {"config": …, "merge_driver": …, "overrides": …, "hook": …, "ci": …, "check": …, "deps": …}}`. Each step holds its script's JSON, or `"skipped"`.
