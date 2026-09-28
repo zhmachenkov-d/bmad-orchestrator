@@ -168,6 +168,48 @@ def test_invalid_answers_fail_and_write_nothing(project, capsys, answers, key):
     assert snapshot(project) == before
 
 
+def test_values_in_effect_fed_back_are_not_templated_twice(project, capsys):
+    """Headless passes the values in effect; a stored `{project-root}/...` path must not gain a second prefix."""
+    before = snapshot(project)
+    stored = {**DEFAULT_ANSWERS, "orch_registry_dir": "{project-root}/_bmad-output/orch/subprojects",
+              "orch_contracts_dir": "{project-root}/_bmad-output/orch/contracts"}
+    assert run(project, stored) == 0
+    assert output(capsys)["written"] == {} and snapshot(project) == before
+    assert run(project, {"orch_registry_dir": "{project-root}/orch/registry"}) == 0
+    assert orch_keys(project / "_bmad" / "custom" / "config.toml") == {"orch_registry_dir": "{project-root}/orch/registry"}
+
+
+def show(root, capsys):
+    assert wc.main(["--project-root", str(root), "--module-yaml", str(MODULE_YAML), "--show"]) == 0
+    return output(capsys)
+
+
+def test_show_reports_raw_values_in_effect_and_their_layer(project, capsys):
+    (project / "_bmad" / "custom" / "config.toml").write_text(
+        CUSTOM + '\n[modules.orch]\norch_registry_dir = "{project-root}/orch/registry"\norch_worktrees_dir = "/team/wt"\n')
+    (project / "_bmad" / "custom" / "config.user.toml").write_text('[modules.orch]\norch_stale_claim_hours = 1\n')
+    result = show(project, capsys)
+    v = result["variables"]
+    assert result["installer_config"] is True
+    assert v["orch_registry_dir"] == {**v["orch_registry_dir"], "value": "orch/registry", "source": "_bmad/custom/config.toml"}
+    assert v["orch_contracts_dir"]["value"] == "_bmad-output/orch/contracts" and v["orch_contracts_dir"]["source"] == "_bmad/config.toml"
+    # a user setting sees every layer; a team key ignores the personal ones
+    assert v["orch_worktrees_dir"]["value"] == "/team/wt" and v["orch_worktrees_dir"]["source"] == "_bmad/custom/config.toml"
+    assert v["orch_stale_claim_hours"]["value"] == 48 and v["orch_stale_claim_hours"]["source"] == "_bmad/config.toml"
+    # the shown values, fed back as answers, change nothing
+    capsys.readouterr()
+    before = snapshot(project)
+    assert run(project, {k: x["value"] for k, x in v.items()}) == 0
+    assert output(capsys)["written"] == {} and snapshot(project) == before
+
+
+def test_show_without_installer_config_gives_defaults(tmp_path, capsys):
+    (tmp_path / "_bmad").mkdir()
+    result = show(tmp_path, capsys)
+    assert result["installer_config"] is False
+    assert all(x["source"] == "default" and x["value"] == x["default"] for x in result["variables"].values())
+
+
 def test_unresolved_project_root_token_is_refused(capsys):
     code = wc.main(["--project-root", "{project-root}", "--module-yaml", str(MODULE_YAML), "--answers", "a.json"])
     assert code == 2 and "{project-root}" in output(capsys)["error"]
