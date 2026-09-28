@@ -277,13 +277,53 @@ def test_write_registry_validates_with_orch_gate_and_never_overwrites(capsys, pr
     assert edited.read_text(encoding="utf-8").endswith("# edited\n")
 
 
-def test_write_registry_rejects_bad_names(capsys, project):
+def test_write_registry_rejects_bad_and_duplicate_names(capsys, project):
     plan = project.parent / "plan.json"
     plan.write_text(json.dumps([{"name": "contracts", "repo": ".", "path": "x", "allowed_write": ["x/**"]},
-                                {"name": "Pay Svc", "repo": ".", "path": "y", "allowed_write": ["y/**"]}]))
+                                {"name": "Pay Svc", "repo": ".", "path": "y", "allowed_write": ["y/**"]},
+                                {"name": "pay", "repo": ".", "path": "p", "allowed_write": ["p/**"]},
+                                {"name": "pay", "repo": ".", "path": "q", "allowed_write": ["q/**"]}]))
     code, res = run(capsys, project, "write-registry", "--plan", str(plan))
-    assert code == 1 and len(res["errors"]) == 2, res
+    assert code == 1 and len(res["errors"]) == 3 and "earlier entry" in res["errors"][2], res
     assert not (project / "_bmad-output").exists()
+
+
+def test_registry_draft_is_resumable_and_a_corrected_draft_replaces_only_its_own_files(capsys, project):
+    _layout(project)
+    code, res = run(capsys, project, "scan", "--draft")
+    draft = Path(res["draft"]["path"])
+    assert code == 0 and res["draft"]["status"] == "created" and draft.is_relative_to(project / ".git"), res
+    assert run(capsys, project, "scan", "--draft")[1]["draft"]["status"] == "exists"
+    assert run(capsys, project, "status")[1]["registry_draft"] == str(draft)
+    code, res = run(capsys, project, "write-registry", "--plan", str(draft))
+    assert code == 0 and len(res["written"]) == 3, res
+    reg = project / "_bmad-output/orch/subprojects"
+    (reg / "ledger.yaml").write_text("# hand edited\n" + (reg / "ledger.yaml").read_text(encoding="utf-8"))
+    plan = json.loads(draft.read_text(encoding="utf-8"))
+    by = {e["name"]: e for e in plan["subprojects"]}
+    by["pay"]["allowed_read"].append("packages/web/**")  # a validation fix made in the draft
+    by["ledger"]["allowed_read"].append("services/pay/**")
+    plan["subprojects"] = [by["pay"], by["ledger"]]  # and web dropped
+    draft.write_text(json.dumps(plan), encoding="utf-8")
+    code, res = run(capsys, project, "write-registry", "--plan", str(draft))
+    assert res["replaced"] == ["_bmad-output/orch/subprojects/pay.yaml"], res
+    assert res["removed"] == ["_bmad-output/orch/subprojects/web.yaml"], res
+    assert code == 1 and res["kept_existing"] == ["_bmad-output/orch/subprojects/ledger.yaml"], res
+    assert "packages/web/**" in yaml.safe_load((reg / "pay.yaml").read_text(encoding="utf-8"))["allowed_read"]
+    assert (reg / "ledger.yaml").read_text(encoding="utf-8").startswith("# hand edited")
+    assert not (reg / "web.yaml").exists()
+
+
+def test_scan_expands_a_double_star_workspace_and_skips_one_outside_the_checkout(capsys, project):
+    for rel, text in {"pnpm-workspace.yaml": "packages:\n  - 'components/**'\n  - '../shared/*'\n",
+                      "components/ui/button/package.json": "{}", "components/ui/form/package.json": "{}",
+                      "components/ui/button/node_modules/x/package.json": "{}", "components/docs/README.md": ""}.items():
+        (project / rel).parent.mkdir(parents=True, exist_ok=True)
+        (project / rel).write_text(text, encoding="utf-8")
+    code, res = run(capsys, project, "scan")
+    assert code == 0, res
+    assert sorted(p["path"] for p in res["proposals"]) == ["components/ui/button", "components/ui/form"], res
+    assert any("../shared/*" in n for n in res["notes"]), res
 
 
 def test_scan_polyrepo_checkout_uses_its_origin_url(capsys, project, tmp_path):
@@ -350,6 +390,14 @@ def test_ci_refuses_a_polyrepo_registry(capsys, project):
     _register(project, "pay", repo="https://git.example.com/acme/pay.git")
     code, res = run(capsys, project, "ci", "--platform", "github")
     assert code == 1 and res["code"] == "polyrepo", res
+    assert not (project / ".github").exists()
+
+
+def test_ci_reports_an_invalid_registry_file_instead_of_calling_it_polyrepo(capsys, project):
+    _register(project, "pay")
+    (project / "_bmad-output/orch/subprojects/broken.yaml").write_text("name: [unclosed\n", encoding="utf-8")
+    code, res = run(capsys, project, "ci", "--platform", "github")
+    assert code == 1 and res["code"] == "registry-invalid" and "broken" in res["error"], res
     assert not (project / ".github").exists()
 
 
@@ -426,6 +474,15 @@ def test_status_reports_what_setup_put_in_place(capsys, project):
     assert res["ci"] == {"github": True, "gitlab": False}
     _older_orch_revision(project / "_bmad" / "custom" / "bmad-build.toml")
     assert run(capsys, project, "status")[1]["overrides"]["bmad-build"] == "drift"
+
+
+def test_status_preselects_ci_platforms_and_owners_from_the_repo(capsys, project):
+    assert run(capsys, project, "status")[1]["ci_defaults"] == {"platforms": [], "owners": None}
+    git(project, "remote", "add", "origin", "git@gitlab.example.com:acme/shop.git")
+    assert run(capsys, project, "status")[1]["ci_defaults"]["platforms"] == ["gitlab"]
+    (project / ".github").mkdir()
+    (project / ".github" / "CODEOWNERS").write_text("* @acme/all\n/docs/ @acme/docs\n* @acme/core @bob\n")
+    assert run(capsys, project, "status")[1]["ci_defaults"] == {"platforms": ["github"], "owners": "@acme/core @bob"}
 
 
 def test_status_merge_driver_name_matches_orch_gate():

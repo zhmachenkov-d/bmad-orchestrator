@@ -11,8 +11,10 @@ Orch paths come from `orch.py config --working-tree` of orch-gate, which install
 uncommitted config change is already in effect here.
 
 Commands:
-  scan            propose registry entries from the repo layout (and from --checkout code repos in a polyrepo)
-  write-registry  write confirmed entries (--plan JSON) as <registry_dir>/<name>.yaml; never overwrites
+  scan            propose registry entries from the repo layout (and from --checkout code repos in a polyrepo);
+                  --draft keeps them in a registry draft in the git dir, where the confirmation is worked out
+  write-registry  write confirmed entries (--plan JSON) as <registry_dir>/<name>.yaml; never overwrites a file
+                  except one the same draft wrote and nobody changed since, which a corrected draft replaces
   overrides       install or merge the orch overrides into _bmad/custom/{bmad-build,bmad-create-epics-and-stories,
                   bmad-sprint-planning}.toml; missing orch entries are added, everything else is kept; an orch
                   entry that differs from the template is reported as drift and replaced only with --update
@@ -30,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import hashlib
 import json
 import os
 import re
@@ -104,16 +107,17 @@ def orch_config(root: Path, orch_gate: Path) -> dict:
 
 
 def cli_location(root: Path, orch_gate: Path) -> dict:
-    """Where the committed files point: orch-gate relative to the project root, with its caveats."""
+    """Where the committed files point: orch-gate relative to the project root, with its caveats.
+
+    The path is the resolved one, so a symlinked skills folder still gives a real directory that CI's
+    `git archive` extracts.
+    """
     try:
         rel = orch_gate.resolve().relative_to(root.resolve()).as_posix()
     except ValueError:
         raise SetupError(f"orch-gate ({orch_gate}) is outside the project; committed team files must name a path "
                          "every clone has — install orch into the project", "orch-gate-outside")
     warnings = []
-    if any((root / p).is_symlink() for p in [rel, *[str(q) for q in PurePosixPath(rel).parents if str(q) != "."]]):
-        warnings.append(f"{rel} is (under) a symlink: CI extracts it with `git archive`, which keeps only the link; "
-                        "commit a real directory")
     if git(root, "ls-files", "--error-unmatch", f"{rel}/scripts/orch.py", check=False).returncode != 0:
         warnings.append(f"{rel} is not committed yet: overrides, hook commands and CI all run it from the repo, "
                         "so commit it with the setup PR")
@@ -130,15 +134,27 @@ def _read(path: Path, limit: int = 4096) -> str:
         return ""
 
 
-def _globs(root: Path, patterns: list) -> list[Path]:
+def _globs(root: Path, patterns: list, notes: list[str]) -> list[Path]:
+    """Member dirs named by workspace patterns. A `**` pattern means every dir below its base that holds a
+    manifest, never the base itself; a pattern reaching outside the checkout is skipped with a note."""
     found = []
     for pat in patterns:
-        if isinstance(pat, str) and not pat.startswith("!"):
-            found += [p for p in sorted(root.glob(pat.strip("/"))) if p.is_dir()]
+        if not isinstance(pat, str) or pat.startswith("!") or not pat.strip():
+            continue
+        parts = PurePosixPath(pat.strip()).parts
+        if PurePosixPath(pat.strip()).is_absolute() or ".." in parts:
+            notes.append(f"{root.name}: workspace pattern '{pat}' points outside the checkout; skipped")
+            continue
+        if "**" not in parts:
+            found += [p for p in sorted(root.glob("/".join(parts))) if p.is_dir()]
+            continue
+        prefix = "/".join(parts[:parts.index("**")])
+        for base in [root] if not prefix else [p for p in sorted(root.glob(prefix)) if p.is_dir()]:
+            found += [d for d, files in _walk(base) if d != base and any(m in files for m in MANIFESTS)]
     return found
 
 
-def _workspace_members(root: Path) -> list[Path]:
+def _workspace_members(root: Path, notes: list[str]) -> list[Path]:
     members = []
     pkg = root / "package.json"
     if pkg.is_file():
@@ -146,11 +162,11 @@ def _workspace_members(root: Path) -> list[Path]:
             ws = json.loads(pkg.read_text(encoding="utf-8")).get("workspaces")
         except (json.JSONDecodeError, AttributeError, OSError):
             ws = None
-        members += _globs(root, ws.get("packages", []) if isinstance(ws, dict) else ws or [])
+        members += _globs(root, ws.get("packages", []) if isinstance(ws, dict) else ws or [], notes)
     pnpm = root / "pnpm-workspace.yaml"
     if pnpm.is_file():
         try:
-            members += _globs(root, (yaml.safe_load(pnpm.read_text(encoding="utf-8")) or {}).get("packages", []))
+            members += _globs(root, (yaml.safe_load(pnpm.read_text(encoding="utf-8")) or {}).get("packages", []), notes)
         except (yaml.YAMLError, AttributeError, OSError):
             pass
     gowork = root / "go.work"
@@ -164,14 +180,14 @@ def _workspace_members(root: Path) -> list[Path]:
                 table = tomllib.loads(path.read_text(encoding="utf-8"))
                 for k in keys:
                     table = table.get(k, {})
-                members += _globs(root, table.get("members", []))
+                members += _globs(root, table.get("members", []), notes)
             except (tomllib.TOMLDecodeError, AttributeError, OSError):
                 pass
     return members
 
 
-def _candidates(root: Path, exclude: list[str]) -> list[Path]:
-    dirs = set(_workspace_members(root))
+def _candidates(root: Path, exclude: list[str], notes: list[str]) -> list[Path]:
+    dirs = set(_workspace_members(root, notes))
     for conv in CONVENTIONAL:
         if (root / conv).is_dir():
             dirs |= {d for d in (root / conv).iterdir() if d.is_dir() and not d.name.startswith(".")}
@@ -228,14 +244,25 @@ def _slug(text: str) -> str:
 
 
 def _existing(root: Path, registry_dir: str) -> dict:
+    """Registry entries by name; None for a file that is not a YAML mapping."""
     out = {}
     for path in sorted((root / registry_dir).glob("*.y*ml")):
         try:
-            data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            data = yaml.safe_load(path.read_text(encoding="utf-8"))
         except yaml.YAMLError:
-            data = {}
-        out[path.stem] = data if isinstance(data, dict) else {}
+            data = None
+        out[path.stem] = data if isinstance(data, dict) else None
     return out
+
+
+def _draft_path(root: Path) -> Path:
+    """The registry draft: per clone and never committed, so it lives in the git dir."""
+    path = Path(git(root, "rev-parse", "--git-path", "orch-setup/registry-draft.json").stdout.strip())
+    return path if path.is_absolute() else root / path
+
+
+def _sha(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def cmd_scan(args) -> int:
@@ -243,7 +270,7 @@ def cmd_scan(args) -> int:
     cfg = orch_config(root, Path(args.orch_gate))
     registry_dir, contracts_dir = cfg["registry_dir"], cfg["contracts_dir"]
     existing = _existing(root, registry_dir)
-    taken = {(str(d.get("repo", ".")).strip(), str(d.get("path", "")).strip().strip("/")) for d in existing.values()}
+    taken = {(str(d.get("repo", ".")).strip(), str(d.get("path", "")).strip().strip("/")) for d in existing.values() if d}
     names = set(existing)
     proposals, notes = [], []
     exclude = [registry_dir, contracts_dir, "_bmad", "_bmad-output", cfg["planning_artifacts"]]
@@ -255,7 +282,7 @@ def cmd_scan(args) -> int:
             repo = origin.stdout.strip() if origin.returncode == 0 else ""
             if not repo:
                 notes.append(f"{checkout}: no origin remote; its entries need 'repo' set to the clone URL by hand")
-        for sub in _candidates(checkout, exclude if checkout == root else []):
+        for sub in _candidates(checkout, exclude if checkout == root else [], notes):
             path = "." if sub == checkout else sub.relative_to(checkout).as_posix()
             if (repo, path) in taken:
                 continue
@@ -273,8 +300,18 @@ def cmd_scan(args) -> int:
                 "contracts": {"exports": _contracts(checkout, sub, name, contracts_dir), "imports": []},
                 "evidence": manifests or ["directory convention"],
             })
-    return emit({"ok": True, "registry_dir": registry_dir, "contracts_dir": contracts_dir,
-                 "existing": sorted(existing), "proposals": proposals, "notes": notes})
+    out = {"ok": True, "registry_dir": registry_dir, "contracts_dir": contracts_dir,
+           "existing": sorted(existing), "proposals": proposals, "notes": notes}
+    if args.draft:
+        path = _draft_path(root)
+        if path.exists():
+            out["draft"] = {"path": str(path), "status": "exists"}
+        elif proposals:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"draft": True, "subprojects": proposals, "written": {}}, indent=2,
+                                       ensure_ascii=False) + "\n", encoding="utf-8")
+            out["draft"] = {"path": str(path), "status": "created"}
+    return emit(out)
 
 
 def _entry_yaml(e: dict) -> str:
@@ -298,26 +335,49 @@ def cmd_write_registry(args) -> int:
     entries = plan.get("subprojects") if isinstance(plan, dict) else plan
     if not isinstance(entries, list):
         raise SetupError("--plan must be a list of entries or {\"subprojects\": [...]}", "bad-plan")
-    errors, written, kept = [], [], []
+    errors, seen = [], set()
     for i, e in enumerate(entries):
         name = e.get("name") if isinstance(e, dict) else None
         if not isinstance(name, str) or not NAME.match(name) or name == "contracts":
             errors.append(f"entry {i}: name {name!r} must be lowercase kebab-case and not 'contracts'")
             continue
+        if name in seen:
+            errors.append(f"entry {i}: name '{name}' is used by an earlier entry of the plan")
+        seen.add(name)
         if not all(isinstance(e.get(k), str) and e[k].strip() for k in ("repo", "path")) or not e.get("allowed_write"):
             errors.append(f"{name}: needs non-empty 'repo', 'path' and 'allowed_write'")
     if errors:
         return emit({"ok": False, "errors": errors}, 1)
+    # A draft remembers what it wrote, so a corrected draft replaces (or drops) those files while they are
+    # unchanged; any other existing file is kept.
+    draft = isinstance(plan, dict) and plan.get("draft") is True
+    owned = dict(plan.get("written") or {}) if draft else {}
+    result = {"written": [], "replaced": [], "removed": [], "kept_existing": []}
+    wanted = set()
     for e in entries:
         path = root / registry_dir / f"{e['name']}.yaml"
-        rel = path.relative_to(root).as_posix()
-        if path.exists() or path.with_suffix(".yml").exists():
-            kept.append(rel)
+        rel, text = path.relative_to(root).as_posix(), _entry_yaml(e)
+        wanted.add(rel)
+        if path.with_suffix(".yml").exists() or (path.exists() and owned.get(rel) != _sha(path.read_text(encoding="utf-8"))):
+            result["kept_existing"].append(rel)
             continue
+        if path.exists() and path.read_text(encoding="utf-8") == text:
+            continue
+        result["replaced" if path.exists() else "written"].append(rel)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(_entry_yaml(e), encoding="utf-8")
-        written.append(rel)
-    return emit({"ok": not kept, "written": written, "kept_existing": kept}, 1 if kept else 0)
+        path.write_text(text, encoding="utf-8")
+        owned[rel] = _sha(text)
+    for rel in sorted(set(owned) - wanted):
+        path = root / rel
+        if path.exists() and owned[rel] == _sha(path.read_text(encoding="utf-8")):
+            path.unlink()
+            result["removed"].append(rel)
+        del owned[rel]
+    if draft:
+        Path(args.plan).write_text(json.dumps({**plan, "written": owned}, indent=2, ensure_ascii=False) + "\n",
+                                   encoding="utf-8")
+    kept = result["kept_existing"]
+    return emit({"ok": not kept, **result}, 1 if kept else 0)
 
 
 # ---- overrides ----
@@ -542,7 +602,12 @@ def cmd_ci(args) -> int:
     cfg = orch_config(root, Path(args.orch_gate))
     cli = cli_location(root, Path(args.orch_gate))
     registry = _existing(root, cfg["registry_dir"])
-    foreign = sorted(n for n, d in registry.items() if str(d.get("repo", "")).strip() not in (".", "./"))
+    invalid = sorted(n for n, d in registry.items() if not (d and isinstance(d.get("repo"), str) and d["repo"].strip()))
+    if invalid:
+        return emit({"ok": False, "code": "registry-invalid",
+                     "error": "these registry files are not valid entries with a 'repo'; fix them (`orch.py registry "
+                              "--working-tree` names the issues) before installing CI: " + ", ".join(invalid)}, 1)
+    foreign = sorted(n for n, d in registry.items() if d["repo"].strip().rstrip("/") != ".")
     if foreign:
         return emit({"ok": False, "code": "polyrepo",
                      "error": "the CI templates cover a monorepo registry (repo: . only); these entries name other "
@@ -653,8 +718,29 @@ def cmd_status(args) -> int:
         "orch" if HOOK_TAG in hook.read_text(encoding="utf-8", errors="replace") else "foreign")
     driver = git(root, "config", "--get", f"merge.{MERGE_DRIVER}.driver", check=False).returncode == 0
     registry = sorted(_existing(root, cfg["registry_dir"]))
-    return emit({"ok": True, "registry": registry, "overrides": overrides, "merge_driver": driver,
-                 "ci": {p: (root / t).exists() for p, t in CI_TARGETS.items()}, "hook": hook_state})
+    draft = _draft_path(root)
+    return emit({"ok": True, "registry": registry, "registry_draft": str(draft) if draft.exists() else None,
+                 "overrides": overrides, "merge_driver": driver,
+                 "ci": {p: (root / t).exists() for p, t in CI_TARGETS.items()}, "ci_defaults": _ci_defaults(root),
+                 "hook": hook_state})
+
+
+def _ci_defaults(root: Path) -> dict:
+    """What the repo already answers for the CI question: the platforms it uses and its default CODEOWNERS owners."""
+    platforms = [p for p, used in (("github", (root / ".github").is_dir()), ("gitlab", (root / GITLAB_ROOT).exists()))
+                 if used]
+    if not platforms:
+        origin = git(root, "remote", "get-url", "origin", check=False).stdout.lower()
+        platforms = [p for p in CI_TARGETS if p in origin]
+    owners = None
+    for f in dict.fromkeys(f for files in CODEOWNERS_FILES.values() for f in files):
+        for line in _read(root / f, 1 << 20).splitlines():
+            parts = line.split()
+            if len(parts) > 1 and parts[0] == "*":  # the last matching rule wins in CODEOWNERS
+                owners = " ".join(parts[1:])
+        if owners:
+            break
+    return {"platforms": platforms, "owners": owners}
 
 
 # ---- check ----
@@ -723,8 +809,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True, parser_class=JsonParser)
     sc = sub.add_parser("scan", parents=[common, root], help="propose registry entries")
     sc.add_argument("--checkout", action="append", default=[], help="local clone of a polyrepo code repo (repeatable)")
+    sc.add_argument("--draft", action="store_true", help="also write the proposals to the registry draft, unless one exists")
     wr = sub.add_parser("write-registry", parents=[common, root], help="write confirmed registry entries")
-    wr.add_argument("--plan", required=True, help="JSON file: the confirmed entries")
+    wr.add_argument("--plan", required=True, help="JSON file: the confirmed entries, or the registry draft")
     ov = sub.add_parser("overrides", parents=[common, root], help="install or merge the stock-skill overrides")
     ov.add_argument("--dry-run", action="store_true")
     ov.add_argument("--update", action="store_true",
