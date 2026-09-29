@@ -10,19 +10,31 @@ from __future__ import annotations
 import difflib
 import os
 import shlex
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import OrchError, markers, registry, sprint_status, stories
+from . import OrchError, markers, plan, registry, sprint_status, stories
 from .config import Config
 from .detectors import run as run_detector
 from .detectors import version as detector_version
-from .gitio import Tree, changed_files, dirty_paths, merge_base, resolve_head, sha
+from .gitio import (
+    Tree,
+    changed_files,
+    dirty_paths,
+    merge_base,
+    merge_tree,
+    normalize_repo,
+    resolve_head,
+    sha,
+)
 from .globs import matches
 from .registry import CONTRACTS, Registry, pin_paths
 from .stories import KEY_RE, StorySet, id_to_key
 
 DETAIL_LINES = 60
+# Story-set issues that mean the epics could not be read at all: setup failures, not plan defects of a story.
+SETUP_STORY_ISSUES = ("no-epics", "epics-unreadable")
 
 
 @dataclass
@@ -153,6 +165,81 @@ def setup_problems(reg: Registry, story_set: StorySet, coord: Tree, cfg: Config,
     return fails, warns
 
 
+def _plan_findings(story_set: StorySet, reg: Registry) -> list[dict]:
+    # No registry_issues: registry validity is judged by setup_problems.
+    return [f for f in plan.check(story_set, reg)["findings"] if f["code"] not in SETUP_STORY_ISSUES]
+
+
+def _frozen(value):
+    return tuple(_frozen(v) for v in value) if isinstance(value, (list, tuple)) else value
+
+
+def _plan_identity(f: dict, s_map: dict | None = None, p_map: dict | None = None) -> tuple:
+    """A plan finding by its structured fields, never its message, so a line shift or a reworded message is the same
+    finding; `s_map` / `p_map` rename the finding's story ids and subproject names to main's."""
+    s_map, p_map = s_map or {}, p_map or {}
+    refs = f.get("refs") or {}
+    return (f["severity"], f["code"], s_map.get(f["story"], f["story"]),
+            tuple(s_map.get(x, x) for x in refs.get("stories", ())),
+            tuple(p_map.get(x, x) for x in refs.get("subprojects", ())),
+            _frozen(f.get("value")))
+
+
+def _unique(items) -> dict:
+    """key -> the one item with that key; keys shared by two or more items are left out."""
+    seen: dict = {}
+    for key, item in items:
+        seen.setdefault(key, []).append(item)
+    return {k: v[0] for k, v in seen.items() if len(v) == 1}
+
+
+def story_map(base: StorySet, merged: StorySet) -> dict[str, str]:
+    """Merged story id -> the id of the same story on main: by title when the title is unique on both sides, else
+    by id when main's story with that id is not claimed by a title match, else `new:<id>`."""
+    base_titles = _unique((s.title, s) for s in base.values())
+    merged_titles = _unique((s.title, s) for s in merged.values())
+    mapped = {s.id: base_titles[t].id for t, s in merged_titles.items() if t in base_titles}
+    claimed = set(mapped.values())
+    for s in merged.values():
+        if s.id not in mapped:
+            mapped[s.id] = s.id if base.by_id(s.id) is not None and s.id not in claimed else f"new:{s.id}"
+    return mapped
+
+
+def subproject_map(base: Registry, merged: Registry) -> dict[str, str]:
+    """Merged subproject name -> main's name for the subproject at the same (repo, path) when that pair is unique on
+    both sides, else the same name when main has it and nothing mapped onto it, else `new:<name>`."""
+    def where(sub):
+        return normalize_repo(sub.repo), sub.path
+    base_at = _unique((where(s), s) for s in base.values())
+    merged_at = _unique((where(s), s) for s in merged.values())
+    mapped = {s.name: base_at[k].name for k, s in merged_at.items() if k in base_at}
+    claimed = set(mapped.values())
+    for name in merged:
+        if name not in mapped:
+            mapped[name] = name if name in base and name not in claimed else f"new:{name}"
+    return mapped
+
+
+def introduced_plan_findings(base_stories: StorySet, base_reg: Registry, stories_: StorySet, reg: Registry) -> list[dict]:
+    """`plan-check` findings of the merged plan (`stories_`, `reg`) that main lacks, compared as multisets of
+    structured identities after mapping merged story ids and subproject names to main's.
+
+    For each identity only `merged_count - main_count` findings are reported, so a defect main already has is never
+    labelled introduced and a second defect of the same kind still is. Reported findings keep the merged fields.
+    """
+    s_map, p_map = story_map(base_stories, stories_), subproject_map(base_reg, reg)
+    known = Counter(_plan_identity(f) for f in _plan_findings(base_stories, base_reg))
+    seen: Counter = Counter()
+    out = []
+    for f in _plan_findings(stories_, reg):
+        key = _plan_identity(f, s_map, p_map)
+        seen[key] += 1
+        if seen[key] > known[key]:
+            out.append(f)
+    return out
+
+
 def run(ctx: Context) -> dict:
     head_sha, head_note = resolve_head(ctx.repo, ctx.base, ctx.head)
     if sha(ctx.repo, ctx.head) != sha(ctx.repo, "HEAD"):
@@ -194,19 +281,50 @@ def run(ctx: Context) -> dict:
     fails, warns = setup_problems(ctx.reg, ctx.stories, ctx.coord, ctx.cfg, ctx.repo_id)
     setup_dirs = [f"{ctx.cfg.registry_dir}/**", f"{ctx.cfg.planning_artifacts}/**"]
     if is_coord and any(matches(c["path"], setup_dirs) for c in changes):
-        # The setup this PR produces is what every later PR is judged by, so it is checked here too.
-        head_reg = registry.load(head, ctx.cfg)
-        head_fails, _ = setup_problems(head_reg, stories.load(head, ctx.cfg, head_reg), head, ctx.cfg, ctx.repo_id)
-        if fails and not head_fails and not live and all(matches(c["path"], setup_dirs) for c in changes):
-            # A PR that repairs the setup is judged by the state it produces, or a broken main could never be fixed.
-            checks["setup"].warn("setup-repair", "the coordination main has setup problems and this PR resolves them: "
-                                 + "; ".join(m for _, m, _ in fails))
-            fails = []
-        known = {(code, message.replace(f" at {ctx.coord.ref}", "")) for code, message, _ in fails}
-        for code, message, _ in head_fails:
-            if (code, message.replace(f" at {head.ref}", "")) not in known:
-                checks["setup"].fail(code, f"introduced by this PR: {message}",
-                                     hint="fix it in this PR; once merged it would fail every PR's setup check")
+        # The setup this PR produces is what every later PR is judged by, so it is checked here too, on a trial
+        # merge of the PR into its target as that target is now: a PR fine alone can break the setup or the plan
+        # combined with a concurrent change on main. That this is the merge that lands relies on a merge queue or an
+        # up-to-date-branch rule on the platform.
+        # The resolved sha, not the ref name: the merge is of the commit this result reports.
+        merged_oid, conflicts = merge_tree(ctx.repo, result["base_sha"], head_sha)
+        if result["base_sha"] != result["coord_sha"]:
+            result["notices"].append({"code": "trial-merge-base-differs",
+                                      "message": f"the plan was merged into {ctx.base} ({result['base_sha'][:10]}) but "
+                                                 f"compared with {ctx.coord.ref} ({result['coord_sha'][:10]})",
+                                      "hint": "gate with --base and --coord-ref naming the same branch for an exact comparison"})
+        setup_conflicts = [p for p in conflicts if matches(p, setup_dirs)]
+        if setup_conflicts:
+            # The merged setup is not defined until the conflict is resolved, so nothing is judged on it.
+            checks["setup"].fail("setup-merge-conflict", f"this PR conflicts with {ctx.base} in registry or planning "
+                                 f"files: {', '.join(setup_conflicts)}", hint=f"merge or rebase onto {ctx.base}, then re-run")
+        else:
+            merged = Tree(ctx.repo, merged_oid)
+            merged_note = f" after merging into {ctx.base}"
+            merged_reg = registry.load(merged, ctx.cfg)
+            merged_stories = stories.load(merged, ctx.cfg, merged_reg)
+            merged_fails, _ = setup_problems(merged_reg, merged_stories, merged, ctx.cfg, ctx.repo_id)
+            if fails and not merged_fails and not live and all(matches(c["path"], setup_dirs) for c in changes):
+                # A PR that repairs the setup is judged by the state it produces, or a broken main could never be fixed.
+                checks["setup"].warn("setup-repair", "the coordination main has setup problems and this PR resolves them: "
+                                     + "; ".join(m for _, m, _ in fails))
+                fails = []
+
+            def bare(message: str) -> str:
+                for suffix in (f" at {ctx.coord.ref}", f" at {merged.ref}", merged_note):
+                    message = message.replace(suffix, "")
+                return message
+            known = {(code, bare(message)) for code, message, _ in fails}
+            for code, message, _ in merged_fails:
+                if (code, bare(message)) not in known:
+                    checks["setup"].fail(code, "introduced by this PR: " + message.replace(f" at {merged.ref}", merged_note),
+                                         hint="fix it in this PR; once merged it would fail every PR's setup check")
+            # The plan this PR produces must not add plan-check defects: a new FAIL blocks, a new CONCERN warns.
+            # A defect main already has stays a warning, so a PR is never blocked for main's own defects.
+            plan_hint = ("fix it in this PR; " + shlex.join([*ctx.fix_prefix, "plan-check", "--working-tree"])
+                         + " on this branch lists the plan's findings")
+            for f in introduced_plan_findings(ctx.stories, ctx.reg, merged_stories, merged_reg):
+                report = checks["setup"].fail if f["severity"] == "fail" else checks["setup"].warn
+                report(f["code"], f"introduced by this PR: {f['message']}", story=f["story"], hint=plan_hint)
     for code, message, hint in fails:
         checks["setup"].fail(code, message, **({"hint": hint} if hint else {}))
     for code, message, hint in warns:
@@ -261,7 +379,7 @@ def run(ctx: Context) -> dict:
     # --- plan issues: the PR's own story must be well-formed; others' defects are surfaced, not blocking ---
     own = ctx.stories.get(result["story"]) if result["story"] else None
     for i in ctx.stories.issues:
-        if i["code"] in ("no-epics", "epics-unreadable"):
+        if i["code"] in SETUP_STORY_ISSUES:
             continue  # setup failures
         if own and i["story"] == own.id:
             if i["code"] not in ("missing-subproject", "unknown-subproject"):  # already no-subproject
@@ -496,7 +614,7 @@ def render_text(result: dict) -> str:
         for f in c["findings"]:
             if f["level"] == "info":
                 continue
-            lines.append(f"      - {f['message']} [{f['code']}]")
+            lines.append(f"      - [{f['level']}] {f['message']} [{f['code']}]")
             if fx := _fix_line(f):
                 lines.append(f"        fix: {fx}")
             if f.get("detail"):

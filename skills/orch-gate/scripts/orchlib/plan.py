@@ -14,7 +14,9 @@ from .stories import StorySet
 
 def check(stories: StorySet, reg: Registry, registry_issues: list[dict] = ()) -> dict:
     """`registry_issues` (registry.validate) weigh as the gate weighs them: missing paths concern, the rest fail."""
-    findings = [{"severity": "concern" if i["code"] in EXISTENCE_ISSUES else "fail", "story": None, **i}
+    findings = [{"severity": "concern" if i["code"] in EXISTENCE_ISSUES else "fail", "story": None, **i,
+                 "refs": _refs(subprojects=([i["subproject"]] if i.get("subproject") else [])
+                               + list((i.get("refs") or {}).get("subprojects", ())))}
                 for i in registry_issues]
     findings += [{"severity": "fail", **i} for i in stories.issues]
     order = list(stories)
@@ -24,7 +26,7 @@ def check(stories: StorySet, reg: Registry, registry_issues: list[dict] = ()) ->
             findings += _narrow(s, deps, reg)
             if not any(p.contract_change == "expand" for p in stories.values()
                        if p.subproject == CONTRACTS and order.index(p.key) < order.index(s.key)):
-                findings.append({"severity": "concern", "code": "narrow-without-expand", "story": s.id,
+                findings.append({"severity": "concern", "code": "narrow-without-expand", "story": s.id, "refs": _refs(),
                                  "message": f"story {s.id} narrows a contract but no earlier contract story expands one; "
                                             "breaking changes go expand -> migrate -> contract"})
         if not s.subproject or s.subproject == CONTRACTS or s.subproject not in reg:
@@ -34,11 +36,22 @@ def check(stories: StorySet, reg: Registry, registry_issues: list[dict] = ()) ->
                 continue
             if d.subproject not in reg[s.subproject].imports:
                 findings.append({"severity": "concern", "code": "dependency-not-imported", "story": s.id,
+                                 "refs": _refs([d.id], [s.subproject, d.subproject]),
                                  "message": f"story {s.id} ({s.subproject}) depends on {d.id} ({d.subproject}), "
                                             f"but {s.subproject} does not import {d.subproject} in the registry"})
     verdict = "FAIL" if any(f["severity"] == "fail" for f in findings) else (
         "CONCERNS" if findings else "PASS")
     return {"verdict": verdict, "findings": findings}
+
+
+def _refs(stories=(), subprojects=()) -> dict:
+    """Story ids and subproject names a message mentions besides its `story`, in message order, each once."""
+    return {"stories": list(dict.fromkeys(stories)), "subprojects": list(dict.fromkeys(subprojects))}
+
+
+def _named(pairs) -> list[str]:
+    """Subproject names of `name: consumer, ...` groups, in the order the message prints them."""
+    return [x for n, cons in pairs for x in (n, *cons)]
 
 
 def _narrow(s, deps, reg: Registry) -> list[dict]:
@@ -54,22 +67,29 @@ def _narrow(s, deps, reg: Registry) -> list[dict]:
     if related and len(covered) == len(related):
         return []
     if covered:
-        gaps = "; ".join(f"{n}: {', '.join(sorted(set(c) - dep_subs))}" for n, c in sorted(related.items()) if n not in covered)
+        gap_pairs = [(n, sorted(set(c) - dep_subs)) for n, c in sorted(related.items()) if n not in covered]
+        gaps = "; ".join(f"{n}: {', '.join(c)}" for n, c in gap_pairs)
         return [{"severity": "concern", "code": "ambiguous-narrow-target", "story": s.id,
+                 "refs": _refs(subprojects=[*covered, *_named(gap_pairs)]),
                  "message": f"story {s.id} covers every consumer of {', '.join(covered)} but not of other exporters its "
                             f"dependencies point at ({gaps}); if it narrows one of those, the gate will fail it"}]
     if not related:
         unconsumed = sorted(n for n, c in candidates.items() if not c)
         if len(unconsumed) == len(candidates):
             return []  # nobody imports these contracts: narrowing one migrates no one, and the gate accepts it
-        missing = "; ".join(f"{n}: {', '.join(c)}" for n, c in sorted(candidates.items()) if c)
+        missing_pairs = [(n, c) for n, c in sorted(candidates.items()) if c]
+        missing = "; ".join(f"{n}: {', '.join(c)}" for n, c in missing_pairs)
         if unconsumed:
             return [{"severity": "concern", "code": "ambiguous-narrow-target", "story": s.id,
+                     "refs": _refs(subprojects=[*unconsumed, *_named(missing_pairs)]),
                      "message": f"story {s.id} depends on no consumer's migration story: it passes the gate only if it "
                                 f"narrows a contract nobody imports ({', '.join(unconsumed)}), not one of {missing}"}]
         return [{"severity": "fail", "code": "narrow-without-migration", "story": s.id,
+                 "refs": _refs(subprojects=_named(missing_pairs)),
                  "message": f"story {s.id} narrows a contract but depends on no consumer's migration story "
                             f"(consumers per exporter: {missing})"}]
-    gaps = "; ".join(f"{n}: {', '.join(sorted(set(c) - dep_subs))}" for n, c in sorted(related.items()))
+    gap_pairs = [(n, sorted(set(c) - dep_subs)) for n, c in sorted(related.items())]
+    gaps = "; ".join(f"{n}: {', '.join(c)}" for n, c in gap_pairs)
     return [{"severity": "fail", "code": "narrow-missing-consumers", "story": s.id,
+             "refs": _refs(subprojects=_named(gap_pairs)),
              "message": f"story {s.id} narrows a contract without depending on a story of every consumer ({gaps})"}]

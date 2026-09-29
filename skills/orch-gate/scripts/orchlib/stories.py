@@ -100,7 +100,7 @@ def parse(text: str, source: str) -> tuple[list[Story], list[dict]]:
         label, value = lm.group(1).lower(), lm.group(2).strip()
         where = f"{source}:{lineno}"
         if label in seen_labels:
-            issues.append(_issue("duplicate-label", f"story {current.id}: '{label}' given twice ({where})", current.id))
+            issues.append(_issue("duplicate-label", f"story {current.id}: '{label}' given twice ({where})", current.id, value=label))
         seen_labels.add(label)
         if label == "subproject":
             current.subproject = value.strip("`") or None
@@ -108,19 +108,31 @@ def parse(text: str, source: str) -> tuple[list[Story], list[dict]]:
             deps = [] if value.lower() in NONE_WORDS else [d.strip().strip("`") for d in re.split(r"[,\s]+", value) if d.strip()]
             bad = [d for d in deps if not ID_RE.match(d)]
             if bad:
-                issues.append(_issue("bad-depends-on", f"story {current.id}: depends_on entries must look like N.M, got {bad} ({where})", current.id))
+                issues.append(_issue("bad-depends-on", f"story {current.id}: depends_on entries must look like N.M, got {bad} ({where})", current.id,
+                                      value=bad))
             current.depends_on = [d for d in deps if ID_RE.match(d)]
         else:
             v = value.lower().strip("`")
             if v not in CONTRACT_CHANGES:
-                issues.append(_issue("bad-contract-change", f"story {current.id}: contract change must be one of {CONTRACT_CHANGES}, got '{value}' ({where})", current.id))
+                issues.append(_issue("bad-contract-change", f"story {current.id}: contract change must be one of {CONTRACT_CHANGES}, got '{value}' ({where})", current.id,
+                                      value=value))
             else:
                 current.contract_change = v
     return stories, issues
 
 
-def _issue(code: str, message: str, story: str | None = None) -> dict:
-    return {"code": code, "story": story, "message": message}
+_NO_VALUE = object()
+
+
+def _issue(code: str, message: str, story: str | None = None, *, stories: list[str] = (), subprojects: list[str] = (),
+           value=_NO_VALUE) -> dict:
+    """`refs` names every story id and subproject its message mentions besides `story`, in message order, so a finding
+    can be compared structurally; `value` is the rejected value, for findings about one."""
+    issue = {"code": code, "story": story, "message": message,
+             "refs": {"stories": list(stories), "subprojects": list(subprojects)}}
+    if value is not _NO_VALUE:
+        issue["value"] = value
+    return issue
 
 
 def epic_files(tree: Tree, cfg: Config) -> list[str]:
@@ -174,13 +186,15 @@ def validate(stories: StorySet, reg: Registry | None) -> list[dict]:
         if not s.subproject:
             issues.append(_issue("missing-subproject", f"story {s.id} has no **Subproject:** line", s.id))
         elif reg is not None and s.subproject not in reg:
-            issues.append(_issue("unknown-subproject", f"story {s.id}: subproject '{s.subproject}' is not in the registry", s.id))
+            issues.append(_issue("unknown-subproject", f"story {s.id}: subproject '{s.subproject}' is not in the registry", s.id,
+                                 subprojects=[s.subproject]))
         if s.contract_change != "none" and s.subproject and s.subproject != CONTRACTS:
-            issues.append(_issue("contract-change-outside-contracts", f"story {s.id}: contract change '{s.contract_change}' only applies to '{CONTRACTS}' stories", s.id))
+            issues.append(_issue("contract-change-outside-contracts", f"story {s.id}: contract change '{s.contract_change}' only applies to '{CONTRACTS}' stories", s.id,
+                                 subprojects=[CONTRACTS], value=s.contract_change))
         for dep in s.depends_on:
             dk = id_to_key(dep)
             if dk not in stories:
-                issues.append(_issue("unknown-dependency", f"story {s.id} depends on unknown story {dep}", s.id))
+                issues.append(_issue("unknown-dependency", f"story {s.id} depends on unknown story {dep}", s.id, stories=[dep]))
             elif order[dk] >= order[s.key]:
-                issues.append(_issue("forward-dependency", f"story {s.id} depends on {dep}, which is not earlier in the plan", s.id))
+                issues.append(_issue("forward-dependency", f"story {s.id} depends on {dep}, which is not earlier in the plan", s.id, stories=[dep]))
     return issues
