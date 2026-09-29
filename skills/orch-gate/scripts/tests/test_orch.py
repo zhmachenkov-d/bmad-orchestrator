@@ -912,6 +912,10 @@ def test_a_coordination_pr_cannot_break_a_healthy_setup(mono):
 
 EPICS_PATH = "_bmad-output/planning-artifacts/epics.md"
 REFUNDS = "\n### Story 1.5: Refunds\n**Subproject:** payment-service\n**Depends on:** {}\n"
+# Branch-side stories go in their own epics file, so the trial merge with a concurrent main edit stays clean.
+EPICS2_PATH = "_bmad-output/planning-artifacts/epics2.md"   # sorts after epics.md
+EARLY_PATH = "_bmad-output/planning-artifacts/epics-0.md"   # sorts before epics.md
+RECEIPTS = "### Story 1.6: Receipts\n**Subproject:** payment-service\n**Depends on:** 1.2\n"
 
 
 def introduced(res, level=None):
@@ -989,8 +993,7 @@ def test_only_the_new_defect_of_a_kind_is_introduced(mono):
 
 def test_a_branch_behind_main_is_not_blamed_for_a_defect_main_fixed(mono):
     mono.write(EPICS_PATH, EPICS + REFUNDS.format("1.9")).commit("plan")
-    mono.branch("behind").write(EPICS_PATH, EPICS + REFUNDS.format("1.9") + (
-        "\n### Story 1.6: Receipts\n**Subproject:** payment-service\n**Depends on:** 1.2\n")).commit()
+    mono.branch("behind").write(EPICS2_PATH, RECEIPTS).commit()
     mono.checkout("main").write(EPICS_PATH, EPICS + REFUNDS.format("1.2")).commit("fix plan")
     mono.checkout("behind")
     code, res = gate(mono)
@@ -1013,6 +1016,7 @@ def test_a_non_planning_coordination_pr_skips_the_plan_comparison(mono, monkeypa
     def boom(*args):
         raise AssertionError("plan comparison ran")
     monkeypatch.setattr(gate_mod, "introduced_plan_findings", boom)
+    monkeypatch.setattr(gate_mod, "merge_tree", boom)
     mono.branch("docs").write("README.md", "more\n").commit()
     code, res = gate(mono)
     assert code == 0, res
@@ -1024,6 +1028,250 @@ def test_a_planning_pr_that_corrupts_the_epics_reports_it_once(mono):
     mono.commit()
     code, res = gate(mono)
     assert code == 1 and [f["code"] for f in check(res, "setup")["findings"]] == ["epics-unreadable"], res
+
+
+# ---- trial merge: setup and plan judged on the PR merged into main as it is now ----
+
+STORY_1_2 = "### Story 1.2: Implement payment API\n**Subproject:** payment-service\n**Depends on:** 1.1\n\nAs a user, I want to pay.\n\n"
+
+
+def test_a_plan_broken_only_by_a_concurrent_main_change_fails(mono):
+    mono.branch("plan").write(EPICS2_PATH, REFUNDS.format("1.2")).commit()
+    mono.checkout("main").write(EPICS_PATH, EPICS.replace(STORY_1_2, "")).commit("drop 1.2")
+    mono.checkout("plan")
+    code, res = gate(mono)
+    assert run_cli("plan-check", "--repo", str(mono.path), "--coord-ref", "plan")[0] == 0  # the head alone is clean
+    assert code == 1 and [(f["code"], f["story"]) for f in introduced(res, "fail")] == [("unknown-dependency", "1.5")], res
+
+
+def test_a_defect_main_gained_after_the_branch_point_is_not_introduced(mono):
+    mono.branch("plan").write(EPICS2_PATH, RECEIPTS).commit()
+    mono.checkout("main").write(EPICS_PATH, EPICS + REFUNDS.format("1.9")).commit("defect on main")
+    mono.checkout("plan")
+    code, res = gate(mono)
+    warns = [f for f in check(res, "setup")["findings"] if f["code"] == "unknown-dependency"]
+    assert code == 0 and not introduced(res) and [f["level"] for f in warns] == ["warn"], res
+
+
+def test_a_conflict_in_planning_files_fails_setup_and_skips_the_comparison(mono):
+    mono.branch("plan").write(EPICS_PATH, EPICS + REFUNDS.format("1.9")).commit()
+    mono.checkout("main").write(EPICS_PATH, EPICS + REFUNDS.format("1.8")).commit("main edit")
+    mono.checkout("plan")
+    head, status = mono.git("rev-parse", "HEAD"), mono.git("status", "--porcelain")
+    code, res = gate(mono)
+    findings = check(res, "setup")["findings"]
+    assert code == 1 and [f["code"] for f in findings if f["level"] == "fail"] == ["setup-merge-conflict"], res
+    assert EPICS_PATH in findings[0]["message"] and findings[0]["hint"] == "merge or rebase onto main, then re-run", res
+    assert not introduced(res), res
+    # The trial merge never touches the checkout.
+    assert mono.git("rev-parse", "HEAD") == head and mono.git("status", "--porcelain") == status
+
+
+def test_a_conflict_outside_setup_dirs_leaves_the_comparison_running(mono):
+    mono.branch("plan").write("README.md", "branch\n").write(EPICS2_PATH, REFUNDS.format("1.9")).commit()
+    mono.checkout("main").write("README.md", "main\n").commit("readme")
+    mono.checkout("plan")
+    code, res = gate(mono)
+    assert "setup-merge-conflict" not in {f["code"] for f in check(res, "setup")["findings"]}, res
+    assert code == 1 and [(f["code"], f["story"]) for f in introduced(res, "fail")] == [("unknown-dependency", "1.5")], res
+
+
+def test_a_swapped_bad_value_is_introduced(mono):
+    mono.write(EPICS_PATH, EPICS + REFUNDS.format("1.2") + "**Contract change:** maybe\n").commit("plan")
+    mono.branch("swap").write(EPICS_PATH, EPICS + REFUNDS.format("1.2") + "**Contract change:** perhaps\n").commit()
+    code, res = gate(mono)
+    fails = introduced(res, "fail")
+    assert code == 1 and [(f["code"], f["story"]) for f in fails] == [("bad-contract-change", "1.5")], res
+    assert "'perhaps'" in fails[0]["message"], res
+
+
+def test_a_renumbered_story_keeps_its_defects_as_they_were(mono):
+    mono.write(EPICS_PATH, EPICS + REFUNDS.format("1.9")).commit("plan")
+    mono.branch("renumber").write(EPICS_PATH, EPICS + REFUNDS.format("1.9").replace("Story 1.5", "Story 1.6")).commit()
+    code, res = gate(mono)
+    assert code == 0 and not introduced(res), res
+
+
+def test_a_renamed_subproject_keeps_its_concerns_as_they_were(mono):
+    mono.write(EPICS_PATH, EPICS + REFUNDS.format("1.3")).commit("plan")
+    mono.branch("rename").rm(f"{R}/user-service.yaml")
+    mono.write(f"{R}/user-svc.yaml", registry_yaml("user-svc", "services/user", imports=["payment-service"]))
+    mono.write(EPICS_PATH, (EPICS + REFUNDS.format("1.3")).replace("**Subproject:** user-service", "**Subproject:** user-svc"))
+    mono.commit()
+    code, res = gate(mono)
+    assert code == 0 and not introduced(res), res
+
+
+def test_ambiguous_titles_compare_stories_by_id(mono):
+    mono.write(EPICS_PATH, EPICS + REFUNDS.format("1.9")).commit("plan")
+    mono.branch("twin").write(EPICS_PATH, EPICS + REFUNDS.format("1.9") + REFUNDS.format("1.2").replace("1.5", "1.6")).commit()
+    code, res = gate(mono)
+    assert code == 0 and not introduced(res), res
+
+
+def test_a_new_story_that_reuses_a_moved_id_is_new(mono):
+    mono.write(EPICS_PATH, EPICS + REFUNDS.format("1.9")).commit("plan")
+    chargebacks = "\n### Story 1.5: Chargebacks\n**Subproject:** payment-service\n**Depends on:** 1.9\n"
+    mono.branch("reuse").write(EPICS_PATH, EPICS + chargebacks + REFUNDS.format("1.9").replace("Story 1.5", "Story 1.6")).commit()
+    code, res = gate(mono)
+    assert code == 1 and [(f["code"], f["story"]) for f in introduced(res, "fail")] == [("unknown-dependency", "1.5")], res
+
+
+def _fake_git(monkeypatch, **answers):
+    """Replace git's answer for the named subcommands (merge_tree -> merge-tree) with (rc, stdout)."""
+    import subprocess
+
+    from orchlib import gitio
+    real = gitio.git
+
+    def fake(repo, *args, **kw):
+        cmd = next((a for a in args if not a.startswith("-")), "")
+        if cmd.replace("-", "_") in answers:
+            rc, out = answers[cmd.replace("-", "_")]
+            return subprocess.CompletedProcess(["git", *args], rc, out, b"boom")
+        return real(repo, *args, **kw)
+    monkeypatch.setattr(gitio, "git", fake)
+
+
+@pytest.mark.parametrize("answers, expect", [
+    ({"version": (0, b"git version 2.37.1\n")}, "2.38"),
+    ({"merge_tree": (128, b"")}, "merge-tree"),
+    ({"merge_tree": (1, b"not an oid\0x\0")}, "merge-tree"),
+])
+def test_old_git_or_a_failing_merge_tree_is_an_environment_error(mono, monkeypatch, answers, expect):
+    mono.branch("plan").write(EPICS2_PATH, RECEIPTS).commit()
+    _fake_git(monkeypatch, **answers)
+    code, res = gate(mono)
+    assert code == 2 and expect in res["error"], res
+
+
+def test_a_trial_merge_into_another_ref_than_coordination_main_is_noted(mono):
+    mono.git("branch", "release")
+    mono.write("README.md", "newer\n").commit("main moves on")
+    mono.checkout("release").branch("plan").write(EPICS2_PATH, RECEIPTS).commit()
+    code, res = run_cli("gate", "--repo", str(mono.path), "--base", "release", "--coord-ref", "main")
+    assert code == 0 and "trial-merge-base-differs" in {n["code"] for n in res["notices"]}, res
+    code, res = gate(mono)
+    assert "trial-merge-base-differs" not in {n["code"] for n in res["notices"]}, res
+
+
+def test_text_output_prints_each_findings_level(mono):
+    mono.write(EPICS_PATH, EPICS + REFUNDS.format("1.9")).commit("plan")
+    mono.branch("swap").write(EPICS_PATH, EPICS + REFUNDS.format("1.8")).commit()
+    code, out = gate(mono, "--format", "text")
+    assert code == 1
+    assert "      - [fail] introduced by this PR: story 1.5 depends on unknown story 1.8 [unknown-dependency]" in out, out
+    assert "      - [warn] story 1.5 depends on unknown story 1.9 [unknown-dependency]" in out, out
+
+
+def test_a_setup_broken_only_by_a_concurrent_main_change_fails(mono):
+    mono.branch("reg").write(f"{R}/billing.yaml", registry_yaml("billing", "services/billing")).commit()
+    mono.checkout("main").write(f"{R}/invoices.yaml", registry_yaml("invoices", "services/billing")).commit("invoices")
+    mono.checkout("reg")
+    code, res = gate(mono)
+    fails = introduced(res, "fail")
+    # Each side alone is fine (main only warns about the missing path); merged, the two write the same dir.
+    assert code == 1 and [f["code"] for f in fails] == ["registry-invalid"] and "write-overlap" in fails[0]["message"], res
+
+
+def test_a_setup_problem_main_has_is_not_introduced_by_a_planning_pr(mono):
+    mono.rm(f"{R}/payment-service.yaml").rm(f"{R}/user-service.yaml").commit("empty registry")
+    mono.branch("plan").write(EPICS_PATH, EPICS.replace("I want to pay.", "I want to pay now.")).commit()
+    code, res = gate(mono)
+    fails = [f for f in check(res, "setup")["findings"] if f["level"] == "fail"]
+    assert code == 1 and not introduced(res) and [f["code"] for f in fails] == ["registry-empty"], res
+    assert fails[0]["message"].endswith(" at main"), res
+
+
+def test_an_introduced_setup_message_names_the_base_not_the_merged_tree(mono):
+    import re
+
+    mono.branch("plan")
+    (mono.path / EPICS_PATH).write_bytes(EPICS.encode() + b"\xff\n")
+    mono.commit()
+    code, res = gate(mono)
+    [f] = introduced(res, "fail")
+    assert " after merging into main" in f["message"] and not re.search(r"[0-9a-f]{40}", f["message"]), res
+
+
+def test_a_setup_conflict_on_a_broken_main_still_reports_mains_failure(mono):
+    good = (mono.path / f"{R}/user-service.yaml").read_text()
+    mono.write(f"{R}/user-service.yaml", good.replace("contracts:\n  exports: []\n  imports: [payment-service]\n",
+                                                      "contracts: [payment-service]\n")).commit("broken shape")
+    mono.branch("repair").write(f"{R}/user-service.yaml", good).write(EPICS_PATH, EPICS + REFUNDS.format("1.2")).commit()
+    mono.checkout("main").write(EPICS_PATH, EPICS + REFUNDS.format("1.1")).commit("main edit")
+    mono.checkout("repair")
+    code, res = gate(mono)
+    codes = [f["code"] for f in check(res, "setup")["findings"] if f["level"] == "fail"]
+    assert code == 1 and codes == ["setup-merge-conflict", "registry-invalid"] and not introduced(res), res
+    assert "setup-repair" not in {f["code"] for f in check(res, "setup")["findings"]}, res
+
+
+def test_a_subproject_moved_to_another_path_keeps_its_name(mono):
+    mono.write(EPICS_PATH, EPICS + REFUNDS.format("1.3")).commit("plan")
+    mono.branch("move").write(f"{R}/user-service.yaml", registry_yaml("user-service", "services/users", imports=["payment-service"]))
+    mono.write("services/users/app.py", "print('user')\n").commit()
+    code, res = gate(mono)
+    assert code == 0 and not introduced(res), res
+
+
+def _plan_findings(r):
+    _, res = run_cli("plan-check", "--repo", str(r.path))
+    assert "findings" in res, res
+    return res["findings"]
+
+
+def test_every_story_and_plan_finding_names_its_stories_and_subprojects_in_refs(mono):
+    import re
+
+    mono.write(f"{R}/billing.yaml", registry_yaml("billing", "services/billing", imports=["payment-service", "ledger", "ghost"]))
+    mono.write(f"{R}/ledger.yaml", registry_yaml("ledger", "services/ledger", imports=["billing"],
+                                                 exports=[("openapi", f"{C}/ledger/openapi.yaml", None)]))
+    mono.write(f"{R}/shadow.yaml", registry_yaml("shadow", "services/user"))  # overlaps user-service
+    mono.write(f"{R}/audit.yaml", registry_yaml("audit", "services/audit", exports=[("openapi", f"{C}/audit/openapi.yaml", None)]))
+    mono.write(EARLY_PATH, "### Story 2.1: Early narrow\n**Subproject:** contracts\n**Depends on:** none\n**Contract change:** narrow\n")
+    story = "\n### Story {}: {}\n**Subproject:** {}\n**Depends on:** {}\n"
+    mono.write(EPICS_PATH, EPICS
+               + story.format("1.5", "Refunds", "payment-service", "1.9, 1.3") + "**Subproject:** payment-service\n"
+               + story.format("1.6", "Bad deps", "payment-service", "x1") + "**Contract change:** maybe\n"
+               + "\n### Story 1.7: Orphan\n**Depends on:** none\n"
+               + story.format("1.8", "Ghost", "ghost", "1.9a") + story.format("1.9b", "Wrong kind", "payment-service", "none")
+               + "**Contract change:** expand\n" + story.format("1.10", "Early", "payment-service", "1.11")
+               + story.format("1.11", "Late", "payment-service", "none") + story.format("1.5", "Again", "payment-service", "none")
+               + story.format("1.12", "Billing", "billing", "none")
+               + story.format("1.13", "Narrow billing", "contracts", "1.12") + "**Contract change:** narrow\n"
+               + story.format("1.14", "Narrow users", "contracts", "1.3") + "**Contract change:** narrow\n"
+               + story.format("1.15", "Narrow nobody", "contracts", "none") + "**Contract change:** narrow\n").commit("defects")
+    findings = _plan_findings(mono)
+    names = set(run_cli("registry", "--repo", str(mono.path))[1]["subprojects"]) | {"ghost"}
+    mono.rm(f"{R}/audit.yaml").commit("drop audit")  # every exporter consumed
+    findings += _plan_findings(mono)
+    mono.rm(EARLY_PATH).rm(EPICS_PATH).commit("no epics")
+    findings += _plan_findings(mono)
+    (mono.path / EPICS_PATH).write_bytes(b"\xff\n")
+    mono.commit("unreadable")
+    findings += _plan_findings(mono)
+
+    story_codes = {"duplicate-label", "bad-depends-on", "bad-contract-change", "duplicate-story", "missing-subproject",
+                   "unknown-subproject", "contract-change-outside-contracts", "unknown-dependency", "forward-dependency",
+                   "no-epics", "epics-unreadable"}
+    registry_codes = {"unknown-import", "write-overlap", "import-cycle"}
+    plan_codes = {"narrow-without-expand", "dependency-not-imported", "ambiguous-narrow-target", "narrow-without-migration",
+                  "narrow-missing-consumers"}
+    ours = [f for f in findings if f["code"] in story_codes | plan_codes | registry_codes]
+    assert {f["code"] for f in ours} == story_codes | plan_codes | registry_codes, sorted({f["code"] for f in ours})
+    ambiguous = [f["message"] for f in ours if f["code"] == "ambiguous-narrow-target"]
+    assert any("covers every consumer" in m for m in ambiguous) and any("nobody imports" in m for m in ambiguous), ambiguous
+    location = re.compile(r" \((?:[^()]|\([^()]*\))*:\d+\)$")
+    for f in ours:
+        text = location.sub("", f["message"])
+        text = text.replace(f.get("value") if isinstance(f.get("value"), str) else "\0", "")
+        ids = [m for m in re.findall(r"(?<![\w./-])\d+\.\d+[a-z]?(?![\w./-])", text) if m != f["story"]]
+        subs = [n for n in names if re.search(rf"(?<![\w/.-]){re.escape(n)}(?![\w/.-])", text)]
+        assert set(ids) <= set(f["refs"]["stories"]) and set(subs) <= set(f["refs"]["subprojects"]), f
+        assert not any("/" in x for x in f["refs"]["stories"] + f["refs"]["subprojects"]), f
+        assert ("value" in f) == (f["code"] in ("bad-depends-on", "bad-contract-change", "duplicate-label",
+                                                  "contract-change-outside-contracts")), f
 
 
 def test_dot_slash_repo_is_the_coordination_repo(mono):

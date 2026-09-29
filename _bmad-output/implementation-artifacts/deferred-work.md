@@ -14,14 +14,6 @@
   summary: orch-setup must verify, at install and on every re-run, that the protection the CI templates rely on is actually on — the `orch-gate` check is required on the main branch (and in the merge queue on GitHub), required code-owner review is on, and the CODEOWNERS file the platform reads owns the CI files and orch paths — via the platform API (`gh api` rulesets/branch protection, GitLab protected branches and approval rules), and warn naming each missing setting; when the API is not reachable with the user's token, print the checklist instead.
   evidence: Walkthrough of PR #15: the base-CLI guarantee holds only when the job is required and the CI files are code-owned, but the templates only state this in their headers and the job cannot see repository settings, so a missed setting silently lets a PR run its own CLI.
 
-- source_spec: `_bmad-output/implementation-artifacts/spec-orch-gate-plan-regression.md`
-  summary: Judge a coordination PR's plan (and setup) on a trial merge of its head into the base tip, so a PR that is fine alone but breaks the plan combined with a concurrent main change is caught before merge.
-  evidence: Review of the plan-regression gate: head is compared with main and the merge-base, never with the merge result; the existing setup "introduced" check has the same limit, and a platform "branch must be up to date" rule is the current mitigation.
-
-- source_spec: `_bmad-output/implementation-artifacts/spec-orch-gate-plan-regression.md`
-  summary: Test the main baseline of the plan-regression check on its own — a defect main gained after the branch point and the branch also has must not be reported as introduced.
-  evidence: Verification-gap review: every plan-regression test either branches from main's tip (main and merge-base identical) or relies on the merge-base baseline, so removing `(ctx.stories, ctx.reg)` from `baselines` in gate.py passes all tests.
-
-- source_spec: `_bmad-output/implementation-artifacts/spec-orch-gate-plan-regression.md`
-  summary: Judge the setup "introduced by this PR" check against the merge-base too, as the plan-regression check does, so a branch behind main is not blamed for a registry problem main has since fixed.
-  evidence: Review of the plan-regression gate: `head_fails` in gate.run is compared only with main's setup failures (pre-existing behavior), unlike the new plan comparison.
+- source_spec: `_bmad-output/implementation-artifacts/spec-orch-gate-plan-trial-merge.md`
+  summary: orch-setup verifies that the coordination repo has a merge queue (GitHub) or an up-to-date / merged-results rule (GitLab), and warns naming the missing setting.
+  evidence: The gate judges a coordination PR's setup and plan on a trial merge with main as of the run; only a merge queue or an up-to-date-branch rule makes that the merge that lands.

@@ -76,6 +76,7 @@ context: []
 
 ## Spec Change Log
 
+- Superseded by `spec-orch-gate-plan-trial-merge.md`: setup and plan are judged on a trial merge against coordination main only, and plan findings are matched by structured `refs`/`value` instead of message text.
 - Review pass 1, intent_gap (two findings): count-by-key hid a swapped defect and relabelled old findings; the main-only baseline blocked branches behind main. Human decided: identity by normalized message, multiset difference; introduced only when absent on both main and merge-base. Amended the frozen Always rules, matrix (three rows), tasks, Code Map, Design Notes. Avoids: a new FAIL passing when it replaces one of the same code, and stale branches failing on fixed defects. KEEP: helper in gate.py reusing the head registry/stories already loaded for the head setup check; reporting under `setup` with the "introduced by this PR: " prefix, `story=` and a hint naming `orch.py plan-check`; the seven tests of v1 (the README one monkeypatches the helper to prove it does not run); the SKILL.md setup-row sentence.
 
 ## Review Triage Log

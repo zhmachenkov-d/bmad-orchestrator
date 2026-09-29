@@ -87,6 +87,40 @@ def merge_base(repo: Path, a: str, b: str) -> str:
     raise OrchError(f"{a} and {b} have no common history in {repo}")
 
 
+MERGE_TREE_MIN_GIT = (2, 38)   # `git merge-tree --write-tree`
+_OID_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
+
+
+def git_version(repo: Path) -> tuple[int, ...]:
+    raw = out(repo, "version")
+    m = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", raw)
+    if not m:
+        raise OrchError(f"cannot read the git version from {raw!r}")
+    return tuple(int(g) for g in m.groups() if g is not None)
+
+
+def merge_tree(repo: Path, base: str, head: str) -> tuple[str, list[str]]:
+    """(tree oid, conflicted paths) of merging `head` into `base`, built in the object store only.
+
+    The working tree, index and refs are never touched. On conflicts the tree still exists, with conflict markers in
+    the conflicted files; every other path holds the merge result.
+    """
+    version = git_version(repo)
+    if version[:2] < MERGE_TREE_MIN_GIT:
+        need = ".".join(map(str, MERGE_TREE_MIN_GIT))
+        raise OrchError(f"git {'.'.join(map(str, version))} is too old: the gate's trial merge needs git {need} or newer "
+                        f"(git merge-tree --write-tree); upgrade git on this runner", "git-too-old")
+    proc = git(repo, "merge-tree", "--write-tree", "-z", "--name-only", "--no-messages", base, head, check=False)
+    fields = decode(proc.stdout).split("\0")
+    oid = fields[0].strip()
+    if proc.returncode == 0 and _OID_RE.match(oid):
+        return oid, []
+    if proc.returncode == 1 and _OID_RE.match(oid):
+        return oid, list(dict.fromkeys(f for f in fields[1:] if f))
+    raise OrchError(f"git merge-tree {base} {head} failed in {repo} (exit {proc.returncode}): "
+                    f"{proc.stderr.decode(errors='replace').strip()}")
+
+
 def sha(repo: Path, ref: str) -> str:
     return out(repo, "rev-parse", "--verify", f"{ref}^{{commit}}")
 

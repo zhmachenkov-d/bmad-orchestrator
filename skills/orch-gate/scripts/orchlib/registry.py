@@ -70,8 +70,10 @@ class Registry(dict):
         return {name: sub.to_dict() for name, sub in sorted(self.items())}
 
 
-def _issue(code: str, message: str, subproject: str | None = None) -> dict:
-    return {"code": code, "subproject": subproject, "message": message}
+def _issue(code: str, message: str, subproject: str | None = None, refs: list[str] = ()) -> dict:
+    """`refs` names the other subprojects the message mentions, in message order."""
+    return {"code": code, "subproject": subproject, "message": message,
+            "refs": {"stories": [], "subprojects": list(dict.fromkeys(refs))}}
 
 
 def _strings(value, key: str, name: str, issues: list) -> list[str]:
@@ -184,7 +186,7 @@ def validate(reg: Registry, coord: Tree, cfg: Config) -> list[dict]:
             if imp == sub.name:
                 issues.append(_issue("self-import", "imports itself", sub.name))
             elif imp not in real:
-                issues.append(_issue("unknown-import", f"imports unknown subproject '{imp}'", sub.name))
+                issues.append(_issue("unknown-import", f"imports unknown subproject '{imp}'", sub.name, [imp]))
         for exp in sub.exports:
             if exp.type not in CONTRACT_TYPES:
                 issues.append(_issue("unknown-contract-type", f"export type '{exp.type}' not one of {', '.join(CONTRACT_TYPES)}", sub.name))
@@ -206,8 +208,8 @@ def validate(reg: Registry, coord: Tree, cfg: Config) -> list[dict]:
             for pa in sa.allowed_write:
                 for pb in sb.allowed_write:
                     if may_overlap(pa, pb):
-                        issues.append(_issue("write-overlap", f"allowed_write '{pa}' overlaps '{pb}' of '{b}'", a))
-    issues += [_issue("import-cycle", "import cycle: " + " -> ".join(c)) for c in _cycles(real)]
+                        issues.append(_issue("write-overlap", f"allowed_write '{pa}' overlaps '{pb}' of '{b}'", a, [b]))
+    issues += [_issue("import-cycle", "import cycle: " + " -> ".join(c), refs=c) for c in _cycles(real)]
     return issues
 
 
