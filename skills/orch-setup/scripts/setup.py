@@ -23,8 +23,8 @@ Commands:
                   entry that differs from the template is reported as drift and replaced only with --update
   ci              install the orch-gate CI job (--platform github|gitlab) for a monorepo registry, read through
                   `orch.py registry --working-tree`; CODEOWNERS lines are only suggested
-  protection      read the GitHub branch settings the gate relies on (required orch-gate check, code-owner
-                  review, merge onto the gated main) with the user's gh login; ok, missing or unknown each
+  protection      read the GitHub or GitLab settings the gate relies on (required orch-gate check, code-owner
+                  review, merge onto the gated main) with the user's gh / glab login; ok, missing or unknown each
   hook            install a pre-push hook that runs the gate on pushed story/* branches
   check           git/uv/host CLIs, stock anchors the overrides rely on, ignored orch dirs
 
@@ -669,10 +669,15 @@ def cmd_ci(args) -> int:
 
 
 # ---- protection ----
-# The gate cannot see repository settings, so this reads the ones its guarantees rest on through `gh api`, with the
-# user's own login. It only reads: no setting, file or ref changes, no fetch, and no token leaves `gh`.
+# The gate cannot see repository settings, so this reads the ones its guarantees rest on through `gh api` or
+# `glab api`, with the user's own login. It only reads: no setting, file or ref changes, no fetch, and no token
+# leaves the CLI.
 
 GH = "gh"
+GLAB = "glab"
+CLI_NAMES = {"github": "GitHub CLI", "gitlab": "GitLab CLI"}
+SSH_API_HOSTS = {"github": {"ssh.github.com": "github.com"},  # SSH over 443; the API lives on the main host
+                 "gitlab": {"altssh.gitlab.com": "gitlab.com"}}
 HOST_TIMEOUT = 30
 GATE_CHECK = "orch-gate"  # the job/check name in assets/ci/github-actions.yml
 RULES_PAGE = 100
@@ -680,10 +685,12 @@ STATUS_LINE = re.compile(r"^HTTP/\S+ (\d{3})")
 SEGMENT = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
-def parse_origin(url: str) -> tuple[str, str, bool] | None:
+def parse_origin(url: str, nested: bool = False) -> tuple[str, str, bool] | None:
     """(host, owner/repo, is_ssh) of an https, `git@host:path` or `ssh://` origin; None when it is not one.
 
-    Userinfo (a user, or a token in an https URL) and the port are dropped, so no credential reaches the output."""
+    With `nested` (GitLab) the path may have nested groups (`group/sub/project`, 2 or more segments); otherwise
+    it is exactly `owner/repo`. Userinfo (a user, or a token in an https URL) and the port are dropped, so no
+    credential reaches the output."""
     url = url.strip()
     m = re.match(r"^(https?|ssh)://", url, re.I)
     if m:
@@ -702,7 +709,8 @@ def parse_origin(url: str) -> tuple[str, str, bool] | None:
         return None
     path = path.strip("/").removesuffix(".git")
     segments = path.split("/")
-    if len(segments) != 2 or not all(SEGMENT.match(s) and s not in (".", "..") for s in segments):
+    count_ok = len(segments) >= 2 if nested else len(segments) == 2
+    if not count_ok or not all(SEGMENT.match(s) and s not in (".", "..") for s in segments):
         return None
     return host.lower(), path, ssh
 
@@ -722,23 +730,30 @@ def ssh_host(alias: str) -> str:
     return alias
 
 
-def gh_api(host: str, endpoint: str) -> tuple[int | None, object, str]:
-    """(HTTP status, JSON body, error text) of one `gh api --include` read. The status comes from the response's
-    first line, not gh's exit code; None when there is none (no gh, no login, no network)."""
+def _cli(platform: str) -> tuple[str, str]:
+    """(executable, short name) of the platform's CLI; read at call time so tests can swap the executable."""
+    return (GH, "gh") if platform == "github" else (GLAB, "glab")
+
+
+def cli_api(platform: str, host: str, endpoint: str) -> tuple[int | None, object, str]:
+    """(HTTP status, JSON body, error text) of one `gh api --include` / `glab api --include` read. The status
+    comes from the response's first line, not the CLI's exit code; None when there is none (no CLI, no login,
+    no network)."""
+    exe, name = _cli(platform)
     try:
-        res = subprocess.run([GH, "api", "--include", "--hostname", host, endpoint],
+        res = subprocess.run([exe, "api", "--include", "--hostname", host, endpoint],
                              capture_output=True, text=True, timeout=HOST_TIMEOUT)
     except FileNotFoundError:
-        return None, None, "gh (GitHub CLI) is not installed"
+        return None, None, f"{name} ({CLI_NAMES[platform]}) is not installed"
     except OSError as exc:
-        return None, None, f"gh cannot run: {exc}"
+        return None, None, f"{name} cannot run: {exc}"
     except subprocess.TimeoutExpired:
-        return None, None, f"gh api timed out after {HOST_TIMEOUT}s"
+        return None, None, f"{name} api timed out after {HOST_TIMEOUT}s"
     out = res.stdout.replace("\r\n", "\n")
     m = STATUS_LINE.match(out)
     if not m:
         text = (res.stderr or res.stdout).strip()
-        return None, None, text.splitlines()[-1] if text else f"gh api exited {res.returncode} without a response"
+        return None, None, text.splitlines()[-1] if text else f"{name} api exited {res.returncode} without a response"
     _, _, body = out.partition("\n\n")
     try:
         data = json.loads(body) if body.strip() else None
@@ -748,12 +763,17 @@ def gh_api(host: str, endpoint: str) -> tuple[int | None, object, str]:
     return int(m.group(1)), data, str(message)
 
 
+def gh_api(host: str, endpoint: str) -> tuple[int | None, object, str]:
+    return cli_api("github", host, endpoint)
+
+
 def _source(label: str, status: int | None, data, error: str) -> dict:
     """A settings source: readable with its data (None = nothing configured), or unreadable with why."""
     if status is None:
         return {"label": label, "readable": False, "data": None, "why": error}
     if 200 <= status < 300:
         return {"label": label, "readable": True, "data": data, "why": ""}
+    error = error.removeprefix(f"{status} ")  # GitLab messages repeat the status: "404 Project Not Found"
     return {"label": label, "readable": False, "data": None, "why": f"HTTP {status}" + (f" {error}" if error else "")}
 
 
@@ -866,38 +886,150 @@ def github_settings(sources: list[dict], branch: str) -> list[dict]:
     return out
 
 
+GL_GATE_FIELDS = ("only_allow_merge_if_pipeline_succeeds", "allow_merge_on_skipped_pipeline")
+GL_OWNERS_FIELD = "code_owner_approval_required"
+
+
+def read_gitlab_sources(host: str, project: str, branch: str) -> list[dict]:
+    """The project (merge settings) and its protected branches, `inherited` group rules included."""
+    p = urllib.parse.quote(project, safe="")
+    status, data, error = cli_api("gitlab", host, f"projects/{p}")
+    proj = _source("project", status, data, error)
+    if proj["readable"] and not isinstance(proj["data"], dict):
+        proj.update(readable=False, data=None, why="unexpected response")
+    elif status in (401, 404):  # glab without a login reads anonymously: a private project looks missing
+        proj["why"] += f"; if the project is private, sign in with `glab auth login --hostname {host}`"
+    status, data, error = cli_api("gitlab", host, f"projects/{p}/protected_branches?per_page={RULES_PAGE}")
+    rules = _source("protected branches", status, data, error)
+    if rules["readable"] and not isinstance(rules["data"], list):
+        rules.update(readable=False, data=None, why="unexpected response")
+    elif rules["readable"] and len(rules["data"]) >= RULES_PAGE:
+        rules.update(readable=False, data=None, why=f"{RULES_PAGE} or more protected branches; not all were read")
+    return [proj, rules]
+
+
+def protected_name_matches(pattern: str, branch: str) -> bool:
+    """GitLab's protected-branch match: the whole name, case-sensitive, `*` matching anything (`/` too)."""
+    return re.fullmatch("".join(".*" if c == "*" else re.escape(c) for c in pattern), branch) is not None
+
+
+def _matching_rules(source: dict, branch: str) -> list[dict]:
+    return [r for r in source["data"] or [] if isinstance(r, dict) and isinstance(r.get("name"), str)
+            and protected_name_matches(r["name"], branch)]
+
+
+def gitlab_settings(sources: list[dict], branch: str, host: str | None) -> list[dict]:
+    proj, rules = sources
+    login = f"; sign in with `glab auth login --hostname {host}`" if host else ""
+    checklist = {
+        "required-check": "Settings → Merge requests: turn on \"Pipelines must succeed\" and turn off \"Skipped "
+                          f"pipelines are considered successful\", so no MR merges without the `{GATE_CHECK}` "
+                          "job's verdict.",
+        "code-owner-review": f"Protect `{branch}` with \"Code owner approval\" (needs GitLab Premium or higher), so "
+                             "an MR cannot change the CI files, the registry or orch itself without its owners.",
+        "merge-onto-gated-main": "Settings → Merge requests: merge method \"Fast-forward merge\" or \"Merge commit "
+                                 f"with semi-linear history\" — the gate judges a coordination MR on a trial merge "
+                                 f"with `{branch}` as of the run.",
+    }
+
+    def absent(fields: list[str]) -> str:
+        return f"{proj['label']}: {', '.join(fields)} not returned{login}"
+
+    out = []
+    # required-check: a known breaking value is missing; else an absent field or unreadable source is unknown
+    data = proj["data"] if proj["readable"] else {}
+    succeeds, skipped = (data.get(f) for f in GL_GATE_FIELDS)
+    if proj["readable"] and GL_GATE_FIELDS[0] in data and succeeds is not True:
+        status, why = "missing", "\"Pipelines must succeed\" is off"
+    elif proj["readable"] and skipped is True:
+        status, why = "missing", "skipped pipelines are considered successful"
+    elif not proj["readable"]:
+        status, why = "unknown", _unread([proj])
+    elif missing_fields := [f for f in GL_GATE_FIELDS if f not in data]:
+        status, why = "unknown", absent(missing_fields)
+    else:
+        status, why = "ok", ""
+    out.append({"id": "required-check", "status": status, "message": {
+        "ok": "MRs merge only when their pipeline succeeds (and not when it is skipped)",
+        "missing": f"MRs can merge without a successful pipeline: {why}",
+        "unknown": f"cannot tell whether MRs need a successful pipeline ({why})"}[status]})
+    gate_why = why
+
+    status, _ = _status([rules], lambda s: any(r.get(GL_OWNERS_FIELD) is True for r in _matching_rules(s, branch)))
+    matching = _matching_rules(rules, branch) if rules["readable"] else []
+    why = _unread([rules])
+    if status == "missing" and matching and all(GL_OWNERS_FIELD not in r for r in matching):
+        status, why = "unknown", (f"{rules['label']}: {GL_OWNERS_FIELD} not returned (GitLab Community Edition "
+                                  f"has no code-owner approval){login}")
+    hit = next((r for r in matching if r.get(GL_OWNERS_FIELD) is True), {})
+    out.append({"id": "code-owner-review", "status": status, "message": {
+        "ok": f"code-owner approval is required on `{branch}` (protected branch rule `{hit.get('name')}`"
+              + (", inherited from the group)" if hit.get("inherited") is True else ")"),
+        "missing": (f"`{branch}` is protected without code-owner approval" if matching
+                    else f"`{branch}` is not a protected branch, so code-owner approval is not required"),
+        "unknown": f"cannot tell whether code-owner approval is required ({why})"}[status]})
+
+    gate = out[0]["status"]
+    if gate != "ok":
+        merge = {"status": gate, "message": f"depends on the required `{GATE_CHECK}` pipeline, which is {gate}"
+                 + (f" ({gate_why})" if gate == "unknown" else "")}
+    else:
+        method = data.get("merge_method")
+        status = {"ff": "ok", "rebase_merge": "ok", "merge": "missing"}.get(method if isinstance(method, str)
+                                                                             else "", "unknown")
+        why = absent(["merge_method"]) if "merge_method" not in data else f"merge_method is {json.dumps(method)}"
+        merge = {"status": status, "message": {
+            "ok": f"MRs merge onto the gated `{branch}` (merge method {method})",
+            "missing": f"the merge method is \"Merge commit\", so an MR can merge onto a `{branch}` the gate did "
+                       "not see",
+            "unknown": f"cannot tell whether MRs merge onto the gated `{branch}` ({why})"}[status]}
+    out.append({"id": "merge-onto-gated-main", **merge})
+    for s in out:
+        s["checklist"] = checklist[s["id"]]
+    return out
+
+
+PROTECTION = {  # platform → (source labels, reader, evaluator)
+    "github": (("rulesets", "classic branch protection"), read_github_sources,
+               lambda sources, branch, host: github_settings(sources, branch)),
+    "gitlab": (("project", "protected branches"), read_gitlab_sources, gitlab_settings),
+}
+
+
 def cmd_protection(args) -> int:
     root = Path(args.project_root).resolve()
     cfg = orch_config(root, Path(args.orch_gate))
     _, refusal = monorepo_registry(root, Path(args.orch_gate))
     if refusal:
         return emit(refusal, 1)
+    platform = args.platform
+    labels, read_sources, evaluate = PROTECTION[platform]
     branch = cfg["main_branch"]
     origin = git(root, "remote", "get-url", "origin", check=False)
-    parsed = parse_origin(origin.stdout) if origin.returncode == 0 and origin.stdout.strip() else None
+    parsed = (parse_origin(origin.stdout, nested=platform == "gitlab")
+              if origin.returncode == 0 and origin.stdout.strip() else None)
     host = project = None
     if parsed is None:
-        why = ("the origin remote is not a GitHub owner/repo URL (https, git@host:path or ssh://)"
+        why = (f"the origin remote is not a {'GitHub owner/repo' if platform == 'github' else 'GitLab project'} "
+               "URL (https, git@host:path or ssh://)"
                if origin.returncode == 0 and origin.stdout.strip() else "there is no origin remote")
-        sources = [{"label": label, "readable": False, "data": None, "why": why}
-                   for label in ("rulesets", "classic branch protection")]
+        sources = [{"label": label, "readable": False, "data": None, "why": why} for label in labels]
     else:
         host, project, ssh = parsed
         if ssh:
             host = ssh_host(host)
-            if host == "ssh.github.com":  # GitHub's SSH-over-443 host; the API lives on github.com
-                host = "github.com"
-        sources = read_github_sources(host, project, branch)
+            host = SSH_API_HOSTS[platform].get(host, host)
+        sources = read_sources(host, project, branch)
         for s in sources:
             if not s["readable"]:
-                s["why"] = f"{s['why']} (gh api on {host})"
-    settings = github_settings(sources, branch)
+                s["why"] = f"{s['why']} ({_cli(platform)[1]} api on {host})"
+    settings = evaluate(sources, branch, host)
     problems = [{"code": "protection-missing", "message": f"{s['id']}: {s['message']}"}
                 for s in settings if s["status"] == "missing"]
     warnings = [{"code": "protection-unverified", "message": f"{s['id']}: {s['message']}"}
                 for s in settings if s["status"] == "unknown"]
     return emit({"ok": not problems,
-                 "platforms": {"github": {"host": host, "project": project, "branch": branch, "settings": settings}},
+                 "platforms": {platform: {"host": host, "project": project, "branch": branch, "settings": settings}},
                  "problems": problems, "warnings": warnings}, 1 if problems else 0)
 
 
@@ -1094,8 +1226,8 @@ def build_parser() -> argparse.ArgumentParser:
     ci.add_argument("--platform", action="append", choices=sorted(CI_TARGETS), required=True)
     ci.add_argument("--owners", help="CODEOWNERS owners for the suggested lines, e.g. @org/orch-owners")
     ci.add_argument("--dry-run", action="store_true")
-    pr = sub.add_parser("protection", parents=[common, root], help="verify the branch protection the gate relies on")
-    pr.add_argument("--platform", choices=["github"], required=True)
+    pr = sub.add_parser("protection", parents=[common, root], help="verify the platform settings the gate relies on")
+    pr.add_argument("--platform", choices=sorted(PROTECTION), required=True)
     hk = sub.add_parser("hook", parents=[common], help="install the pre-push hook in this clone")
     hk.add_argument("--repo", default=".", help="repo whose clone gets the hook (default: cwd)")
     hk.add_argument("--coord", help="coordination repo checkout, for a polyrepo code repo")
