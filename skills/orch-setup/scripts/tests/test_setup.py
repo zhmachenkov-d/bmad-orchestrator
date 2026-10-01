@@ -537,3 +537,266 @@ def test_stock_anchors_hold_in_this_repos_installed_skills(capsys):
             pytest.skip(f"stock {skill} is not installed")
         for d in dirs:
             assert all(a in (d / f).read_text(encoding="utf-8") for f, a in needed), d
+
+
+# ---- protection ----
+
+FAKE_GH = r"""import json, os, sys
+args = sys.argv[1:]
+with open(os.environ["FAKE_GH_LOG"], "a") as log:
+    log.write(json.dumps(args) + "\n")
+if os.environ.get("FAKE_GH_MODE") == "no-login":
+    sys.stderr.write("To get started with GitHub CLI, please run:  gh auth login\n")
+    sys.exit(4)
+assert args[:2] == ["api", "--include"] and args[2] == "--hostname", args
+responses = json.load(open(os.environ["FAKE_GH_RESPONSES"]))
+status, body = responses.get(args[-1], [404, {"message": "Not Found"}])
+reason = {200: "OK", 403: "Forbidden", 404: "Not Found"}.get(status, "")
+sys.stdout.write(f"HTTP/2.0 {status} {reason}\r\nContent-Type: application/json\r\n\r\n{json.dumps(body)}")
+sys.exit(0 if status < 400 else 1)
+"""
+
+FAKE_SSH = r"""import os, sys
+assert sys.argv[1] == "-G", sys.argv
+alias = sys.argv[2]
+print("user git")
+print("hostname " + os.environ.get("FAKE_SSH_ALIASES_" + alias.replace("-", "_"), alias))
+print("port 22")
+"""
+
+RULES = "repos/acme/shop/rules/branches/main?per_page=100"
+CLASSIC = "repos/acme/shop/branches/main/protection"
+NOT_PROTECTED = [404, {"message": "Branch not protected"}]
+GATE_RULE = {"type": "required_status_checks", "ruleset_id": 2,
+             "parameters": {"strict_required_status_checks_policy": False,
+                            "required_status_checks": [{"context": "orch-gate", "integration_id": 15368}]}}
+OWNERS_RULE = {"type": "pull_request", "ruleset_id": 1,
+               "parameters": {"require_code_owner_review": True, "required_approving_review_count": 1}}
+QUEUE_RULE = {"type": "merge_queue", "ruleset_id": 1, "parameters": {"merge_method": "MERGE"}}
+
+
+@pytest.fixture
+def gh(tmp_path, monkeypatch):
+    """Fake gh and ssh first on PATH: gh answers per endpoint from `responses`, so no test reaches the network."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name, script in (("gh", FAKE_GH), ("ssh", FAKE_SSH)):
+        (bin_dir / name).write_text("#!/usr/bin/env python3\n" + script, encoding="utf-8")
+        (bin_dir / name).chmod(0o755)
+    responses, log = tmp_path / "gh-responses.json", tmp_path / "gh.log"
+    log.write_text("")
+    monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("FAKE_GH_RESPONSES", str(responses))
+    monkeypatch.setenv("FAKE_GH_LOG", str(log))
+
+    class Gh:
+        def answer(self, mapping: dict):
+            responses.write_text(json.dumps(mapping), encoding="utf-8")
+
+        def calls(self) -> list[list[str]]:
+            return [json.loads(line) for line in log.read_text().splitlines()]
+
+    fake = Gh()
+    fake.answer({})
+    return fake
+
+
+def protection(capsys, project: Path) -> tuple[int, dict, dict]:
+    code, res = run(capsys, project, "protection", "--platform", "github")
+    github = res.get("platforms", {}).get("github", {})
+    return code, res, {s["id"]: s["status"] for s in github.get("settings", [])}
+
+
+def _origin(project: Path, url: str = "https://github.com/acme/shop.git"):
+    git(project, "remote", "add", "origin", url)
+
+
+def test_protection_all_on_through_rulesets(capsys, project, gh):
+    _origin(project)
+    gh.answer({RULES: [200, [OWNERS_RULE, GATE_RULE, QUEUE_RULE]], CLASSIC: NOT_PROTECTED})
+    code, res, st = protection(capsys, project)
+    assert code == 0 and res["ok"] and res["problems"] == [] and res["warnings"] == [], res
+    assert st == {"required-check": "ok", "code-owner-review": "ok", "merge-onto-gated-main": "ok"}, res
+    github = res["platforms"]["github"]
+    assert (github["host"], github["project"], github["branch"]) == ("github.com", "acme/shop", "main")
+    assert [list(s) for s in github["settings"]] == [["id", "status", "message", "checklist"]] * 3
+    assert all(c[:5] == ["api", "--include", "--hostname", "github.com", c[-1]] for c in gh.calls())
+    assert [c[-1] for c in gh.calls()] == [RULES, CLASSIC]
+
+
+def test_protection_ok_from_classic_protection_alone(capsys, project, gh):
+    _origin(project)
+    gh.answer({RULES: [200, []], CLASSIC: [200, {
+        "required_status_checks": {"strict": True, "contexts": ["lint", "orch-gate"], "checks": []},
+        "required_pull_request_reviews": {"require_code_owner_reviews": True}}]})
+    code, res, st = protection(capsys, project)
+    assert code == 0 and set(st.values()) == {"ok"}, res
+
+
+def test_protection_classic_checks_list_counts_too(capsys, project, gh):
+    _origin(project)
+    gh.answer({RULES: [200, [OWNERS_RULE]], CLASSIC: [200, {
+        "required_status_checks": {"strict": True, "contexts": [], "checks": [{"context": "orch-gate", "app_id": 1}]}}]})
+    code, res, st = protection(capsys, project)
+    assert code == 0 and set(st.values()) == {"ok"}, res
+
+
+def test_protection_queue_and_check_in_different_rulesets(capsys, project, gh):
+    _origin(project)
+    gh.answer({RULES: [200, [dict(QUEUE_RULE, ruleset_id=7), dict(GATE_RULE, ruleset_id=8), OWNERS_RULE]],
+               CLASSIC: NOT_PROTECTED})
+    code, res, st = protection(capsys, project)
+    assert code == 0 and st["merge-onto-gated-main"] == "ok", res
+
+
+def test_protection_queue_without_the_check_is_missing(capsys, project, gh):
+    _origin(project)
+    gh.answer({RULES: [200, [QUEUE_RULE, OWNERS_RULE]], CLASSIC: NOT_PROTECTED})
+    code, res, st = protection(capsys, project)
+    assert code == 1 and not res["ok"], res
+    assert st == {"required-check": "missing", "code-owner-review": "ok", "merge-onto-gated-main": "missing"}, res
+    assert [p["code"] for p in res["problems"]] == ["protection-missing"] * 2, res
+
+
+def test_protection_classic_without_strict_cannot_see_its_merge_queue(capsys, project, gh):
+    _origin(project)
+    gh.answer({RULES: [200, [OWNERS_RULE]], CLASSIC: [200, {
+        "required_status_checks": {"strict": False, "contexts": ["orch-gate"], "checks": []}}]})
+    code, res, st = protection(capsys, project)
+    assert code == 0 and st["required-check"] == "ok" and st["merge-onto-gated-main"] == "unknown", res
+    assert res["warnings"] == [{"code": "protection-unverified", "message": res["warnings"][0]["message"]}], res
+    assert res["warnings"][0]["message"].startswith("merge-onto-gated-main:")
+
+
+def test_protection_strict_ruleset_counts_as_merge_onto_gated_main(capsys, project, gh):
+    _origin(project)
+    strict = {"type": "required_status_checks", "parameters": {"strict_required_status_checks_policy": True,
+                                                               "required_status_checks": [{"context": "lint"}]}}
+    gh.answer({RULES: [200, [GATE_RULE, strict, OWNERS_RULE]], CLASSIC: NOT_PROTECTED})
+    code, res, st = protection(capsys, project)
+    assert code == 0 and set(st.values()) == {"ok"}, res
+
+
+def test_protection_unprotected_branch_is_all_missing(capsys, project, gh):
+    _origin(project)
+    gh.answer({RULES: [200, []], CLASSIC: NOT_PROTECTED})
+    code, res, st = protection(capsys, project)
+    assert code == 1 and set(st.values()) == {"missing"} and len(res["problems"]) == 3, res
+
+
+@pytest.mark.parametrize("classic", [[404, {"message": "Not Found"}], [403, {"message": "Must have admin rights"}]])
+def test_protection_unreadable_classic_is_unknown_not_missing(capsys, project, gh, classic):
+    _origin(project)
+    gh.answer({RULES: [200, []], CLASSIC: classic})
+    code, res, st = protection(capsys, project)
+    assert code == 0 and res["problems"] == [] and set(st.values()) == {"unknown"}, res
+    (req,) = [s for s in res["platforms"]["github"]["settings"] if s["id"] == "required-check"]
+    assert classic[1]["message"] in req["message"] and "github.com" in req["message"], req
+    assert "orch-gate" in req["checklist"]
+    assert [w["code"] for w in res["warnings"]] == ["protection-unverified"] * 3
+
+
+def test_protection_a_full_rules_page_is_unreadable(capsys, project, gh):
+    _origin(project)
+    gh.answer({RULES: [200, [{"type": "deletion"}] * 100], CLASSIC: NOT_PROTECTED})
+    code, res, st = protection(capsys, project)
+    assert code == 0 and set(st.values()) == {"unknown"}, res
+
+
+def test_protection_without_a_gh_login_is_unknown(capsys, project, gh, monkeypatch):
+    _origin(project)
+    monkeypatch.setenv("FAKE_GH_MODE", "no-login")
+    code, res, st = protection(capsys, project)
+    assert code == 0 and set(st.values()) == {"unknown"}, res
+    assert all("gh auth login" in w["message"] for w in res["warnings"]), res
+
+
+def test_protection_without_gh_is_unknown(capsys, project, gh, monkeypatch, tmp_path):
+    _origin(project)
+    monkeypatch.setattr(setup, "GH", str(tmp_path / "no-such-gh"))
+    code, res, st = protection(capsys, project)
+    assert code == 0 and set(st.values()) == {"unknown"}, res
+    assert all("not installed" in s["message"] for s in res["platforms"]["github"]["settings"]), res
+
+
+def test_protection_without_origin_makes_no_call(capsys, project, gh):
+    code, res, st = protection(capsys, project)
+    assert code == 0 and set(st.values()) == {"unknown"} and gh.calls() == [], res
+    assert res["platforms"]["github"]["host"] is None and "no origin remote" in res["warnings"][0]["message"]
+
+
+def test_protection_resolves_an_ssh_alias(capsys, project, gh, monkeypatch):
+    _origin(project, "git@gh-work:acme/shop.git")
+    monkeypatch.setenv("FAKE_SSH_ALIASES_gh_work", "github.com")
+    gh.answer({RULES: [200, [OWNERS_RULE, GATE_RULE, QUEUE_RULE]], CLASSIC: NOT_PROTECTED})
+    code, res, st = protection(capsys, project)
+    assert code == 0 and set(st.values()) == {"ok"}, res
+    assert {c[3] for c in gh.calls()} == {"github.com"} and res["platforms"]["github"]["host"] == "github.com"
+
+
+def test_protection_maps_ssh_over_443_to_the_github_api_host(capsys, project, gh, monkeypatch):
+    _origin(project, "git@gh-443:acme/shop.git")
+    monkeypatch.setenv("FAKE_SSH_ALIASES_gh_443", "ssh.github.com")
+    gh.answer({RULES: [200, [OWNERS_RULE, GATE_RULE, QUEUE_RULE]], CLASSIC: NOT_PROTECTED})
+    code, res, st = protection(capsys, project)
+    assert code == 0 and set(st.values()) == {"ok"}, res
+    assert {c[3] for c in gh.calls()} == {"github.com"} and res["platforms"]["github"]["host"] == "github.com"
+
+
+def test_protection_check_without_queue_or_strict_is_missing(capsys, project, gh):
+    _origin(project)
+    gh.answer({RULES: [200, [GATE_RULE, OWNERS_RULE]], CLASSIC: NOT_PROTECTED})
+    code, res, st = protection(capsys, project)
+    assert code == 1 and st["merge-onto-gated-main"] == "missing" and st["required-check"] == "ok", res
+    (problem,) = res["problems"]
+    assert problem["code"] == "protection-missing" and problem["message"].startswith("merge-onto-gated-main:"), res
+
+
+def test_protection_never_prints_a_token_from_the_origin(capsys, project, gh):
+    _origin(project, "https://x:SECRET@github.com/acme/shop")
+    gh.answer({RULES: [200, []], CLASSIC: [404, {"message": "Not Found"}]})
+    code = setup.main(["protection", "--orch-gate", str(project / CLI_DIR), "--project-root", str(project),
+                       "--platform", "github"])
+    out = capsys.readouterr()
+    assert code == 0 and "SECRET" not in out.out + out.err
+    assert json.loads(out.out)["platforms"]["github"]["project"] == "acme/shop"
+    assert not any("SECRET" in arg for c in gh.calls() for arg in c)
+
+
+def test_protection_refuses_a_polyrepo_registry(capsys, project, gh):
+    _origin(project)
+    _register(project, "pay", repo="https://git.example.com/acme/pay.git")
+    code, res = run(capsys, project, "protection", "--platform", "github")
+    assert code == 1 and res["code"] == "polyrepo" and gh.calls() == [], res
+
+
+def test_protection_changes_no_file_and_no_ref(capsys, project, gh):
+    _origin(project)
+    _register(project, "pay")
+    gh.answer({RULES: [200, []], CLASSIC: NOT_PROTECTED})
+    before = (git(project, "status", "--porcelain"), git(project, "for-each-ref"), git(project, "config", "--list"))
+    code, res, _ = protection(capsys, project)
+    assert code == 1, res
+    assert (git(project, "status", "--porcelain"), git(project, "for-each-ref"),
+            git(project, "config", "--list")) == before
+
+
+@pytest.mark.parametrize("url, expected", [
+    ("https://github.com/acme/shop.git", ("github.com", "acme/shop", False)),
+    ("https://github.com/acme/shop/", ("github.com", "acme/shop", False)),
+    ("https://x:SECRET@GHE.example.com:8443/acme/shop", ("ghe.example.com", "acme/shop", False)),
+    ("http://ghe.local/acme/my.repo.git", ("ghe.local", "acme/my.repo", False)),
+    ("git@github.com:acme/shop.git", ("github.com", "acme/shop", True)),
+    ("gh-work:acme/shop", ("gh-work", "acme/shop", True)),
+    ("ssh://git@github.com/acme/shop.git", ("github.com", "acme/shop", True)),
+    ("ssh://git@ssh.github.com:443/acme/shop", ("ssh.github.com", "acme/shop", True)),
+    ("ssh://github.com/acme/shop", ("github.com", "acme/shop", True)),
+    ("/srv/git/shop.git", None),
+    ("../shop", None),
+    ("file:///srv/git/acme/shop.git", None),
+    ("https://gitlab.com/group/sub/shop.git", None),
+    ("git@-oProxyCommand=x:acme/shop", None),
+    ("", None),
+])
+def test_parse_origin_forms(url, expected):
+    assert setup.parse_origin(url) == expected

@@ -23,6 +23,8 @@ Commands:
                   entry that differs from the template is reported as drift and replaced only with --update
   ci              install the orch-gate CI job (--platform github|gitlab) for a monorepo registry, read through
                   `orch.py registry --working-tree`; CODEOWNERS lines are only suggested
+  protection      read the GitHub branch settings the gate relies on (required orch-gate check, code-owner
+                  review, merge onto the gated main) with the user's gh login; ok, missing or unknown each
   hook            install a pre-push hook that runs the gate on pushed story/* branches
   check           git/uv/host CLIs, stock anchors the overrides rely on, ignored orch dirs
 
@@ -43,6 +45,7 @@ import stat
 import subprocess
 import sys
 import tomllib
+import urllib.parse
 from pathlib import Path, PurePosixPath
 
 import tomlkit
@@ -97,8 +100,9 @@ def orch_cli(root: Path, orch_gate: Path, cmd: str) -> tuple[int, dict]:
     cli = orch_gate / "scripts" / "orch.py"
     if not cli.is_file():
         raise SetupError(f"orch-gate not found at {orch_gate}; orch skills install side by side", "no-orch-gate")
+    # no bytecode: a read of the project must leave its working tree as it was
     res = subprocess.run(["uv", "run", str(cli), cmd, "--working-tree", "--offline", "--repo", str(root)],
-                         capture_output=True, text=True)
+                         capture_output=True, text=True, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
     try:
         out = json.loads(res.stdout)
     except json.JSONDecodeError:
@@ -616,23 +620,32 @@ def _gitlab_include(root: Path, dry_run: bool) -> dict:
     return {"file": GITLAB_ROOT, "status": "updated"}
 
 
+def monorepo_registry(root: Path, orch_gate: Path) -> tuple[dict, dict | None]:
+    """The registry as the gate reads it, and the refusal to emit (exit 1) when it is invalid or names other repos.
+
+    orch-gate drops an entry it cannot load and normalizes `repo`, so this reads it through orch-gate's CLI."""
+    _, out = orch_cli(root, orch_gate, "registry")
+    registry = {n: s for n, s in out["subprojects"].items() if n != "contracts"}
+    invalid = [i for i in out["issues"] if i.get("subproject") not in registry]
+    if invalid:
+        return registry, {"ok": False, "code": "registry-invalid", "issues": invalid,
+                          "error": "orch-gate cannot load these registry entries; fix them first: "
+                                   + "; ".join(i["message"] for i in invalid)}
+    foreign = sorted(n for n, s in registry.items() if s["repo"] != ".")
+    if foreign:
+        return registry, {"ok": False, "code": "polyrepo",
+                          "error": "the CI templates cover a monorepo registry (repo: . only); these entries name "
+                                   "other repos, which need the polyrepo CI follow-up: " + ", ".join(foreign)}
+    return registry, None
+
+
 def cmd_ci(args) -> int:
     root = Path(args.project_root).resolve()
     cfg = orch_config(root, Path(args.orch_gate))
     cli = cli_location(root, Path(args.orch_gate))
-    # Read the registry as the gate will: orch-gate drops an entry it cannot load, and normalizes `repo`.
-    _, out = orch_cli(root, Path(args.orch_gate), "registry")
-    registry = {n: s for n, s in out["subprojects"].items() if n != "contracts"}
-    invalid = [i for i in out["issues"] if i.get("subproject") not in registry]
-    if invalid:
-        return emit({"ok": False, "code": "registry-invalid", "issues": invalid,
-                     "error": "orch-gate cannot load these registry entries; fix them before installing CI: "
-                              + "; ".join(i["message"] for i in invalid)}, 1)
-    foreign = sorted(n for n, s in registry.items() if s["repo"] != ".")
-    if foreign:
-        return emit({"ok": False, "code": "polyrepo",
-                     "error": "the CI templates cover a monorepo registry (repo: . only); these entries name other "
-                              "repos, which need the polyrepo CI follow-up: " + ", ".join(foreign)}, 1)
+    registry, refusal = monorepo_registry(root, Path(args.orch_gate))
+    if refusal:
+        return emit(refusal, 1)
     values = {"@ORCH_CLI_DIR@": cli["dir"], "@ORCH_CLI_PATH@": cli["path"],
               "@ORCH_REGISTRY_DIR@": cfg["registry_dir"], "@ORCH_CONTRACTS_DIR@": cfg["contracts_dir"],
               "@PLANNING_ARTIFACTS@": cfg["planning_artifacts"], "@ORCH_OWNERS@": args.owners or "@ORCH_OWNERS@"}
@@ -653,6 +666,239 @@ def cmd_ci(args) -> int:
     return emit({"ok": not left, "dry_run": args.dry_run, "files": files, "codeowners_lines": owners,
                  "codeowners_file": codeowners, "owners_set": bool(args.owners), "warnings": warnings},
                 1 if left else 0)
+
+
+# ---- protection ----
+# The gate cannot see repository settings, so this reads the ones its guarantees rest on through `gh api`, with the
+# user's own login. It only reads: no setting, file or ref changes, no fetch, and no token leaves `gh`.
+
+GH = "gh"
+HOST_TIMEOUT = 30
+GATE_CHECK = "orch-gate"  # the job/check name in assets/ci/github-actions.yml
+RULES_PAGE = 100
+STATUS_LINE = re.compile(r"^HTTP/\S+ (\d{3})")
+SEGMENT = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def parse_origin(url: str) -> tuple[str, str, bool] | None:
+    """(host, owner/repo, is_ssh) of an https, `git@host:path` or `ssh://` origin; None when it is not one.
+
+    Userinfo (a user, or a token in an https URL) and the port are dropped, so no credential reaches the output."""
+    url = url.strip()
+    m = re.match(r"^(https?|ssh)://", url, re.I)
+    if m:
+        try:
+            parts = urllib.parse.urlsplit(url)
+            host = parts.hostname
+        except ValueError:
+            return None
+        path, ssh = parts.path, m.group(1).lower() == "ssh"
+    else:
+        m = re.match(r"^(?:[^@/:]+@)?([^@/:]+):(?!/)(.+)$", url)  # scp-like: [user@]host:path
+        if not m:
+            return None
+        host, path, ssh = m.group(1), m.group(2), True
+    if not host or host.startswith("-"):
+        return None
+    path = path.strip("/").removesuffix(".git")
+    segments = path.split("/")
+    if len(segments) != 2 or not all(SEGMENT.match(s) and s not in (".", "..") for s in segments):
+        return None
+    return host.lower(), path, ssh
+
+
+def ssh_host(alias: str) -> str:
+    """The real host behind an SSH alias (`ssh -G`: no connection; evaluates the user's ssh_config); the alias
+    on failure."""
+    try:
+        res = subprocess.run(["ssh", "-G", alias], capture_output=True, text=True, timeout=HOST_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired):
+        return alias
+    if res.returncode == 0:
+        for line in res.stdout.splitlines():
+            key, _, value = line.strip().partition(" ")
+            if key.lower() == "hostname" and value.strip():
+                return value.strip().lower()
+    return alias
+
+
+def gh_api(host: str, endpoint: str) -> tuple[int | None, object, str]:
+    """(HTTP status, JSON body, error text) of one `gh api --include` read. The status comes from the response's
+    first line, not gh's exit code; None when there is none (no gh, no login, no network)."""
+    try:
+        res = subprocess.run([GH, "api", "--include", "--hostname", host, endpoint],
+                             capture_output=True, text=True, timeout=HOST_TIMEOUT)
+    except FileNotFoundError:
+        return None, None, "gh (GitHub CLI) is not installed"
+    except OSError as exc:
+        return None, None, f"gh cannot run: {exc}"
+    except subprocess.TimeoutExpired:
+        return None, None, f"gh api timed out after {HOST_TIMEOUT}s"
+    out = res.stdout.replace("\r\n", "\n")
+    m = STATUS_LINE.match(out)
+    if not m:
+        text = (res.stderr or res.stdout).strip()
+        return None, None, text.splitlines()[-1] if text else f"gh api exited {res.returncode} without a response"
+    _, _, body = out.partition("\n\n")
+    try:
+        data = json.loads(body) if body.strip() else None
+    except json.JSONDecodeError:
+        data = None
+    message = data.get("message", "") if isinstance(data, dict) else ""
+    return int(m.group(1)), data, str(message)
+
+
+def _source(label: str, status: int | None, data, error: str) -> dict:
+    """A settings source: readable with its data (None = nothing configured), or unreadable with why."""
+    if status is None:
+        return {"label": label, "readable": False, "data": None, "why": error}
+    if 200 <= status < 300:
+        return {"label": label, "readable": True, "data": data, "why": ""}
+    return {"label": label, "readable": False, "data": None, "why": f"HTTP {status}" + (f" {error}" if error else "")}
+
+
+def read_github_sources(host: str, project: str, branch: str) -> list[dict]:
+    """The active rulesets (repo and org) for the branch and its classic branch protection."""
+    b = urllib.parse.quote(branch, safe="")
+    status, data, error = gh_api(host, f"repos/{project}/rules/branches/{b}?per_page={RULES_PAGE}")
+    rules = _source("rulesets", status, data, error)
+    if rules["readable"] and not isinstance(rules["data"], list):
+        rules.update(readable=False, data=None, why="unexpected response")
+    elif rules["readable"] and len(rules["data"]) >= RULES_PAGE:
+        rules.update(readable=False, data=None, why=f"{RULES_PAGE} or more rules; not all of them were read")
+    status, data, error = gh_api(host, f"repos/{project}/branches/{b}/protection")
+    if status == 404 and error == "Branch not protected":
+        classic = {"label": "classic branch protection", "readable": True, "data": None, "why": ""}
+    else:
+        # a plain `Not Found` is what a non-admin gets, so it says nothing about the settings
+        classic = _source("classic branch protection", status, data, error)
+        if classic["readable"] and not isinstance(classic["data"], dict):
+            classic.update(readable=False, data=None, why="unexpected response")
+    return [rules, classic]
+
+
+def _rules(source: dict, kind: str) -> list[dict]:
+    if source["label"] != "rulesets" or not source["readable"]:
+        return []
+    return [r.get("parameters") or {} for r in source["data"] if isinstance(r, dict) and r.get("type") == kind]
+
+
+def _classic(source: dict) -> dict:
+    return source["data"] if source["label"] != "rulesets" and source["readable"] and source["data"] else {}
+
+
+def _requires_check(source: dict) -> bool:
+    for params in _rules(source, "required_status_checks"):
+        if any(isinstance(c, dict) and c.get("context") == GATE_CHECK
+               for c in params.get("required_status_checks") or []):
+            return True
+    checks = _classic(source).get("required_status_checks") or {}
+    return GATE_CHECK in (checks.get("contexts") or []) or any(
+        isinstance(c, dict) and c.get("context") == GATE_CHECK for c in checks.get("checks") or [])
+
+
+def _requires_code_owners(source: dict) -> bool:
+    if any(p.get("require_code_owner_review") is True for p in _rules(source, "pull_request")):
+        return True
+    return (_classic(source).get("required_pull_request_reviews") or {}).get("require_code_owner_reviews") is True
+
+
+def _merges_onto_gated_main(source: dict) -> bool:
+    if _rules(source, "merge_queue"):
+        return True
+    if any(p.get("strict_required_status_checks_policy") is True for p in _rules(source, "required_status_checks")):
+        return True
+    return (_classic(source).get("required_status_checks") or {}).get("strict") is True
+
+
+def _status(sources: list[dict], test) -> tuple[str, dict | None]:
+    """ok when a readable source satisfies the test, missing when every source was read and none does."""
+    hit = next((s for s in sources if s["readable"] and test(s)), None)
+    if hit:
+        return "ok", hit
+    return ("missing" if all(s["readable"] for s in sources) else "unknown"), None
+
+
+def _unread(sources: list[dict]) -> str:
+    return "; ".join(f"{s['label']}: {s['why']}" for s in sources if not s["readable"])
+
+
+def github_settings(sources: list[dict], branch: str) -> list[dict]:
+    checklist = {
+        "required-check": f"Require the `{GATE_CHECK}` status check on `{branch}` (a ruleset or branch protection "
+                          "rule), so no PR merges without the gate's verdict.",
+        "code-owner-review": f"Require review from Code Owners on `{branch}`, so a PR cannot change the CI files, "
+                             "the registry or orch itself without its owners.",
+        "merge-onto-gated-main": f"Make every PR merge onto the `{branch}` the gate saw: a merge queue, or "
+                                 "\"Require branches to be up to date before merging\" — the gate judges a "
+                                 f"coordination PR on a trial merge with `{branch}` as of the run.",
+    }
+    out = []
+    status, hit = _status(sources, _requires_check)
+    out.append({"id": "required-check", "status": status, "message": {
+        "ok": f"`{GATE_CHECK}` is a required status check ({hit and hit['label']})",
+        "missing": f"no ruleset or branch protection on `{branch}` requires the `{GATE_CHECK}` check",
+        "unknown": f"cannot tell whether `{GATE_CHECK}` is required ({_unread(sources)})"}[status]})
+    status, hit = _status(sources, _requires_code_owners)
+    out.append({"id": "code-owner-review", "status": status, "message": {
+        "ok": f"code-owner review is required ({hit and hit['label']})",
+        "missing": f"no ruleset or branch protection on `{branch}` requires code-owner review",
+        "unknown": f"cannot tell whether code-owner review is required ({_unread(sources)})"}[status]})
+    gate = out[0]["status"]
+    if gate != "ok":
+        merge = {"status": gate, "message": f"depends on the required `{GATE_CHECK}` check, which is {gate}"
+                 + (f" ({_unread(sources)})" if gate == "unknown" else "")}
+    else:
+        status, hit = _status(sources, _merges_onto_gated_main)
+        classic = next(s for s in sources if s["label"] != "rulesets")
+        if status == "missing" and classic["data"]:
+            status = "unknown"  # classic "Require merge queue" is not in the REST response
+            why = "classic branch protection is on, but whether it requires a merge queue is not readable"
+        else:
+            why = _unread(sources)
+        merge = {"status": status, "message": {
+            "ok": f"PRs merge onto the gated `{branch}` (merge queue or up-to-date branches, {hit and hit['label']})",
+            "missing": f"no merge queue and no \"up to date before merging\" rule on `{branch}`",
+            "unknown": f"cannot tell whether PRs merge onto the gated `{branch}` ({why})"}[status]}
+    out.append({"id": "merge-onto-gated-main", **merge})
+    for s in out:
+        s["checklist"] = checklist[s["id"]]
+    return out
+
+
+def cmd_protection(args) -> int:
+    root = Path(args.project_root).resolve()
+    cfg = orch_config(root, Path(args.orch_gate))
+    _, refusal = monorepo_registry(root, Path(args.orch_gate))
+    if refusal:
+        return emit(refusal, 1)
+    branch = cfg["main_branch"]
+    origin = git(root, "remote", "get-url", "origin", check=False)
+    parsed = parse_origin(origin.stdout) if origin.returncode == 0 and origin.stdout.strip() else None
+    host = project = None
+    if parsed is None:
+        why = ("the origin remote is not a GitHub owner/repo URL (https, git@host:path or ssh://)"
+               if origin.returncode == 0 and origin.stdout.strip() else "there is no origin remote")
+        sources = [{"label": label, "readable": False, "data": None, "why": why}
+                   for label in ("rulesets", "classic branch protection")]
+    else:
+        host, project, ssh = parsed
+        if ssh:
+            host = ssh_host(host)
+            if host == "ssh.github.com":  # GitHub's SSH-over-443 host; the API lives on github.com
+                host = "github.com"
+        sources = read_github_sources(host, project, branch)
+        for s in sources:
+            if not s["readable"]:
+                s["why"] = f"{s['why']} (gh api on {host})"
+    settings = github_settings(sources, branch)
+    problems = [{"code": "protection-missing", "message": f"{s['id']}: {s['message']}"}
+                for s in settings if s["status"] == "missing"]
+    warnings = [{"code": "protection-unverified", "message": f"{s['id']}: {s['message']}"}
+                for s in settings if s["status"] == "unknown"]
+    return emit({"ok": not problems,
+                 "platforms": {"github": {"host": host, "project": project, "branch": branch, "settings": settings}},
+                 "problems": problems, "warnings": warnings}, 1 if problems else 0)
 
 
 # ---- hook ----
@@ -848,6 +1094,8 @@ def build_parser() -> argparse.ArgumentParser:
     ci.add_argument("--platform", action="append", choices=sorted(CI_TARGETS), required=True)
     ci.add_argument("--owners", help="CODEOWNERS owners for the suggested lines, e.g. @org/orch-owners")
     ci.add_argument("--dry-run", action="store_true")
+    pr = sub.add_parser("protection", parents=[common, root], help="verify the branch protection the gate relies on")
+    pr.add_argument("--platform", choices=["github"], required=True)
     hk = sub.add_parser("hook", parents=[common], help="install the pre-push hook in this clone")
     hk.add_argument("--repo", default=".", help="repo whose clone gets the hook (default: cwd)")
     hk.add_argument("--coord", help="coordination repo checkout, for a polyrepo code repo")
@@ -858,7 +1106,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 COMMANDS = {"scan": cmd_scan, "write-registry": cmd_write_registry, "overrides": cmd_overrides, "ci": cmd_ci,
-            "hook": cmd_hook, "check": cmd_check, "state": cmd_state}
+            "protection": cmd_protection, "hook": cmd_hook, "check": cmd_check, "state": cmd_state}
 
 
 def main(argv=None) -> int:
