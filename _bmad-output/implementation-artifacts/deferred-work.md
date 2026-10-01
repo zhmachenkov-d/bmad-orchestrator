@@ -14,6 +14,10 @@
   summary: `setup.py protection` warns (`bypass-possible`) when the rules can be bypassed — GitHub ruleset bypass actors or classic `enforce_admins: false`, GitLab push access to the main branch other than "No one" — naming who can bypass; bypass lists readable only by admins are `unknown`.
   evidence: Party review of the protection spec: a direct push to main skips the gate while all three checked settings read `ok`; deferred by user.
 
-- source_spec: `_bmad-output/implementation-artifacts/spec-orch-setup-protection-check.md`
-  summary: GitLab half of `setup.py protection` (`--platform gitlab`, `glab api --include --hostname`), on the same origin parsing, response parsing and ok/missing/unknown rules — sources `GET projects/{enc path}` and `GET projects/{enc path}/protected_branches?per_page=100` (exactly 100 → unreadable), protected-branch rules being those whose `name` matches the branch by `fnmatch` (none = not protected); `required-check` = `only_allow_merge_if_pipeline_succeeds` true and `allow_merge_on_skipped_pipeline` false (a `[skip ci]` pipeline would merge past the gate, decision by user); `code-owner-review` = `code_owner_approval_required` true on any matching rule, absent on all → `unknown`; `merge-onto-gated-main` = `merge_method` `ff` or `rebase_merge`; warning `merge-trains` when `merge_trains_enabled` and `merge_pipelines_enabled`; a 404 on the project is unreadable; SKILL step 7 runs it when the GitLab CI file is installed.
-  evidence: Split at the spec token gate after review (about 2100 tokens); needed by the user, so the next item after the GitHub half. glab's `--include` output on 4xx is not yet verified against a live GitLab.
+- source_spec: `_bmad-output/implementation-artifacts/spec-orch-setup-protection-check-gitlab.md`
+  summary: `setup.py protection` on GitLab warns (`merge-trains`, not a problem) when the project has `merge_trains_enabled` and `merge_pipelines_enabled` true, because the gate judges each MR against its target branch, not against the train ahead of it.
+  evidence: Split at the spec token gate (about 2000 tokens) by user; an independent warning on top of the three GitLab settings.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-orch-setup-protection-check-gitlab.md`
+  summary: `setup.py protection` takes a repeatable `--platform` (`github`, `gitlab`), evaluating each platform against the one origin into `platforms.<platform>` of one JSON result, with problem/warning messages prefixed by the platform, so a repo with both CI files gets one check and headless one `protection` result.
+  evidence: Split at the spec token gate (about 2000 tokens) by user; until then SKILL.md runs `protection` once per installed CI platform.

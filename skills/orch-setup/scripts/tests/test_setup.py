@@ -800,3 +800,335 @@ def test_protection_changes_no_file_and_no_ref(capsys, project, gh):
 ])
 def test_parse_origin_forms(url, expected):
     assert setup.parse_origin(url) == expected
+
+
+# ---- protection: GitLab ----
+
+FAKE_GLAB = FAKE_GH.replace("FAKE_GH_", "FAKE_GLAB_")
+
+GL_PROJECT = "projects/acme%2Fshop"
+GL_BRANCHES = "projects/acme%2Fshop/protected_branches?per_page=100"
+GL_ON = {"id": 7, "path_with_namespace": "acme/shop", "only_allow_merge_if_pipeline_succeeds": True,
+         "allow_merge_on_skipped_pipeline": False, "merge_method": "ff"}
+GL_MAIN = {"id": 1, "name": "main", "code_owner_approval_required": True, "inherited": False}
+
+
+@pytest.fixture
+def glab(tmp_path, monkeypatch, gh):
+    """Fake glab beside the fake gh and ssh, with its own responses and log."""
+    path = tmp_path / "bin" / "glab"
+    path.write_text("#!/usr/bin/env python3\n" + FAKE_GLAB, encoding="utf-8")
+    path.chmod(0o755)
+    responses, log = tmp_path / "glab-responses.json", tmp_path / "glab.log"
+    log.write_text("")
+    monkeypatch.setenv("FAKE_GLAB_RESPONSES", str(responses))
+    monkeypatch.setenv("FAKE_GLAB_LOG", str(log))
+
+    class Glab:
+        def answer(self, mapping: dict):
+            responses.write_text(json.dumps(mapping), encoding="utf-8")
+
+        def calls(self) -> list[list[str]]:
+            return [json.loads(line) for line in log.read_text().splitlines()]
+
+    fake = Glab()
+    fake.answer({})
+    return fake
+
+
+def gl_protection(capsys, project: Path) -> tuple[int, dict, dict]:
+    code, res = run(capsys, project, "protection", "--platform", "gitlab")
+    gitlab = res.get("platforms", {}).get("gitlab", {})
+    return code, res, {s["id"]: s["status"] for s in gitlab.get("settings", [])}
+
+
+def _gl_origin(project: Path, url: str = "https://gitlab.com/acme/shop.git"):
+    git(project, "remote", "add", "origin", url)
+
+
+def _gl(glab, project=GL_ON, branches=(GL_MAIN,), prefix="projects/acme%2Fshop", branches_response=None):
+    """Answer the project with 200 `project` and its protected branches with 200 `branches`, or with
+    `branches_response` ([status, body]) when given."""
+    glab.answer({prefix: [200, project],
+                 f"{prefix}/protected_branches?per_page=100": branches_response or [200, list(branches)]})
+
+
+def _message(res: dict, sid: str) -> str:
+    return next(s["message"] for s in res["platforms"]["gitlab"]["settings"] if s["id"] == sid)
+
+
+def test_gl_protection_all_on(capsys, project, glab, gh):
+    _gl_origin(project)
+    _gl(glab)
+    code, res, st = gl_protection(capsys, project)
+    assert code == 0 and res["ok"] and res["problems"] == [] and res["warnings"] == [], res
+    assert st == {"required-check": "ok", "code-owner-review": "ok", "merge-onto-gated-main": "ok"}, res
+    assert list(res["platforms"]) == ["gitlab"]
+    gitlab = res["platforms"]["gitlab"]
+    assert (gitlab["host"], gitlab["project"], gitlab["branch"]) == ("gitlab.com", "acme/shop", "main")
+    assert [list(s) for s in gitlab["settings"]] == [["id", "status", "message", "checklist"]] * 3
+    assert all(c[:5] == ["api", "--include", "--hostname", "gitlab.com", c[-1]] for c in glab.calls())
+    assert [c[-1] for c in glab.calls()] == [GL_PROJECT, GL_BRANCHES] and gh.calls() == []
+    assert "Premium" in gitlab["settings"][1]["checklist"]
+
+
+@pytest.mark.parametrize("method", ["ff", "rebase_merge"])
+def test_gl_protection_ff_and_semi_linear_are_ok(capsys, project, glab, method):
+    _gl_origin(project)
+    _gl(glab, dict(GL_ON, merge_method=method))
+    code, res, st = gl_protection(capsys, project)
+    assert code == 0 and st["merge-onto-gated-main"] == "ok", res
+
+
+def test_gl_protection_wildcard_rule(capsys, project, glab):
+    _gl_origin(project)
+    _gl(glab, branches=[{"name": "ma*", "code_owner_approval_required": True}])
+    code, res, st = gl_protection(capsys, project)
+    assert code == 0 and st["code-owner-review"] == "ok", res
+
+
+@pytest.mark.parametrize("name", ["Main", "mai", "main*x", "[m]ain", "*/main"])
+def test_gl_protection_non_matching_rules_leave_main_unprotected(capsys, project, glab, name):
+    _gl_origin(project)
+    _gl(glab, branches=[{"name": "xmain", "code_owner_approval_required": True},
+                        {"name": name, "code_owner_approval_required": True}])
+    code, res, st = gl_protection(capsys, project)
+    assert code == 1 and st["code-owner-review"] == "missing", res
+    assert "not a protected branch" in _message(res, "code-owner-review")
+
+
+@pytest.mark.parametrize("pattern, branch, expected", [
+    ("main", "main", True),
+    ("ma*", "main", True),
+    ("ma*", "xmain", False),
+    ("Main", "main", False),
+    ("*", "release/1.0", True),
+    ("release/*", "release/1/hotfix", True),
+    ("re*se", "release/1/hotfix", False),
+    ("[m]ain", "main", False),
+    ("[m]ain", "[m]ain", True),
+    ("ma?n", "main", False),
+    ("ma.n", "main", False),
+])
+def test_gl_protected_name_matching(pattern, branch, expected):
+    assert setup.protected_name_matches(pattern, branch) is expected
+
+
+def test_gl_protection_skipped_never_set_counts_as_off(capsys, project, glab):
+    _gl_origin(project)
+    _gl(glab, dict(GL_ON, allow_merge_on_skipped_pipeline=None))
+    code, res, st = gl_protection(capsys, project)
+    assert code == 0 and st["required-check"] == "ok", res
+
+
+def test_gl_protection_skipped_pipelines_allowed_is_missing(capsys, project, glab):
+    _gl_origin(project)
+    _gl(glab, dict(GL_ON, allow_merge_on_skipped_pipeline=True))
+    code, res, st = gl_protection(capsys, project)
+    assert code == 1 and not res["ok"], res
+    assert st == {"required-check": "missing", "code-owner-review": "ok", "merge-onto-gated-main": "missing"}, res
+    assert [p["code"] for p in res["problems"]] == ["protection-missing"] * 2, res
+
+
+def test_gl_protection_partly_known_is_missing(capsys, project, glab):
+    _gl_origin(project)
+    proj = dict(GL_ON, only_allow_merge_if_pipeline_succeeds=False)
+    del proj["allow_merge_on_skipped_pipeline"]
+    _gl(glab, proj)
+    code, res, st = gl_protection(capsys, project)
+    assert code == 1 and st["required-check"] == "missing", res
+
+
+def test_gl_protection_merge_commits_are_missing(capsys, project, glab):
+    _gl_origin(project)
+    _gl(glab, dict(GL_ON, merge_method="merge"))
+    code, res, st = gl_protection(capsys, project)
+    assert code == 1 and st == {"required-check": "ok", "code-owner-review": "ok",
+                                "merge-onto-gated-main": "missing"}, res
+    (problem,) = res["problems"]
+    assert problem["message"].startswith("merge-onto-gated-main:"), res
+
+
+def test_gl_protection_other_merge_method_is_unknown(capsys, project, glab):
+    _gl_origin(project)
+    _gl(glab, dict(GL_ON, merge_method="squash_only"))
+    code, res, st = gl_protection(capsys, project)
+    assert code == 0 and st["merge-onto-gated-main"] == "unknown", res
+
+
+def test_gl_protection_unprotected_main_is_missing(capsys, project, glab):
+    _gl_origin(project)
+    _gl(glab, branches=[{"name": "release/*", "code_owner_approval_required": True}])
+    code, res, st = gl_protection(capsys, project)
+    assert code == 1 and st == {"required-check": "ok", "code-owner-review": "missing",
+                                "merge-onto-gated-main": "ok"}, res
+
+
+def test_gl_protection_main_without_code_owners_is_missing(capsys, project, glab):
+    _gl_origin(project)
+    _gl(glab, branches=[dict(GL_MAIN, code_owner_approval_required=False),
+                        {"name": "m*", "code_owner_approval_required": False}])
+    code, res, st = gl_protection(capsys, project)
+    assert code == 1 and st["code-owner-review"] == "missing", res
+
+
+def test_gl_protection_inherited_group_rule_counts(capsys, project, glab):
+    _gl_origin(project)
+    _gl(glab, branches=[{"id": 9, "name": "main", "code_owner_approval_required": True, "inherited": True}])
+    code, res, st = gl_protection(capsys, project)
+    assert code == 0 and st["code-owner-review"] == "ok", res
+    assert "inherited" in _message(res, "code-owner-review")
+
+
+def test_gl_protection_community_edition_is_unknown(capsys, project, glab):
+    _gl_origin(project)
+    _gl(glab, branches=[{"id": 1, "name": "main"}])
+    code, res, st = gl_protection(capsys, project)
+    assert code == 0 and st["code-owner-review"] == "unknown" and res["problems"] == [], res
+    assert "code_owner_approval_required" in _message(res, "code-owner-review")
+
+
+def test_gl_protection_anonymous_read_is_unknown(capsys, project, glab):
+    _gl_origin(project)
+    _gl(glab, {"id": 7, "path_with_namespace": "acme/shop", "visibility": "public"})
+    code, res, st = gl_protection(capsys, project)
+    assert code == 0 and res["problems"] == [], res
+    assert st == {"required-check": "unknown", "code-owner-review": "ok", "merge-onto-gated-main": "unknown"}, res
+    for sid in ("required-check", "merge-onto-gated-main"):
+        msg = _message(res, sid)
+        assert "glab auth login --hostname gitlab.com" in msg and "only_allow_merge_if_pipeline_succeeds" in msg, msg
+    assert [w["code"] for w in res["warnings"]] == ["protection-unverified"] * 2
+
+
+def test_gl_protection_unreadable_rules_are_unknown(capsys, project, glab):
+    _gl_origin(project)
+    _gl(glab, branches_response=[403, {"message": "403 Forbidden"}])
+    code, res, st = gl_protection(capsys, project)
+    assert code == 0 and st == {"required-check": "ok", "code-owner-review": "unknown",
+                                "merge-onto-gated-main": "ok"}, res
+    msg = _message(res, "code-owner-review")
+    assert "HTTP 403 Forbidden" in msg and "403 403" not in msg and "glab api on gitlab.com" in msg, msg
+
+
+@pytest.mark.parametrize("project_body, branches_body, unknown", [
+    ([GL_ON], [GL_MAIN], {"required-check", "merge-onto-gated-main"}),  # code owners come from protected branches
+    (GL_ON, {"name": "main"}, {"code-owner-review"}),
+])
+def test_gl_protection_unexpected_response_is_unknown(capsys, project, glab, project_body, branches_body, unknown):
+    _gl_origin(project)
+    glab.answer({GL_PROJECT: [200, project_body], GL_BRANCHES: [200, branches_body]})
+    code, res, st = gl_protection(capsys, project)
+    assert code == 0 and {k for k, v in st.items() if v == "unknown"} == unknown, res
+    assert {k for k, v in st.items() if v == "ok"} == set(st) - unknown, res
+    assert all("unexpected response" in _message(res, sid) for sid in unknown), res
+
+
+def test_gl_protection_a_full_rules_page_is_unreadable(capsys, project, glab):
+    _gl_origin(project)
+    _gl(glab, branches=[dict(GL_MAIN, id=i, name=f"b{i}") for i in range(99)] + [GL_MAIN])
+    code, res, st = gl_protection(capsys, project)
+    assert code == 0 and st["code-owner-review"] == "unknown", res
+
+
+def test_gl_protection_project_not_found_is_all_unknown(capsys, project, glab):
+    _gl_origin(project)
+    glab.answer({})  # every endpoint 404
+    code, res, st = gl_protection(capsys, project)
+    assert code == 0 and res["problems"] == [] and set(st.values()) == {"unknown"}, res
+    assert all("gitlab.com" in s["message"] and "404" in s["message"]
+               for s in res["platforms"]["gitlab"]["settings"]), res
+    assert all("glab" not in s["checklist"] for s in res["platforms"]["gitlab"]["settings"])
+    hint = "if the project is private, sign in with `glab auth login --hostname gitlab.com`"
+    assert all(hint in _message(res, sid) for sid in ("required-check", "merge-onto-gated-main")), res
+
+
+def test_gl_protection_without_glab_is_unknown(capsys, project, glab, monkeypatch, tmp_path):
+    _gl_origin(project)
+    monkeypatch.setattr(setup, "GLAB", str(tmp_path / "no-such-glab"))
+    code, res, st = gl_protection(capsys, project)
+    assert code == 0 and set(st.values()) == {"unknown"}, res
+    assert all("glab (GitLab CLI) is not installed" in s["message"]
+               for s in res["platforms"]["gitlab"]["settings"]), res
+
+
+def test_gl_protection_nested_groups(capsys, project, glab):
+    _gl_origin(project, "git@gitlab.com:g/sub/shop.git")
+    _gl(glab, prefix="projects/g%2Fsub%2Fshop")
+    code, res, st = gl_protection(capsys, project)
+    assert code == 0 and set(st.values()) == {"ok"}, res
+    assert res["platforms"]["gitlab"]["project"] == "g/sub/shop"
+    assert [c[-1] for c in glab.calls()] == ["projects/g%2Fsub%2Fshop",
+                                             "projects/g%2Fsub%2Fshop/protected_branches?per_page=100"]
+
+
+def test_gl_protection_maps_ssh_over_443_to_the_gitlab_api_host(capsys, project, glab, monkeypatch):
+    _gl_origin(project, "git@gl-443:acme/shop.git")
+    monkeypatch.setenv("FAKE_SSH_ALIASES_gl_443", "altssh.gitlab.com")
+    _gl(glab)
+    code, res, st = gl_protection(capsys, project)
+    assert code == 0 and set(st.values()) == {"ok"}, res
+    assert {c[3] for c in glab.calls()} == {"gitlab.com"} and res["platforms"]["gitlab"]["host"] == "gitlab.com"
+
+
+def test_gl_protection_resolves_an_ssh_alias_to_a_self_managed_host(capsys, project, glab, monkeypatch):
+    _gl_origin(project, "ssh://git@gl-work:2222/acme/shop.git")
+    monkeypatch.setenv("FAKE_SSH_ALIASES_gl_work", "gitlab.example.com")
+    _gl(glab)
+    code, res, st = gl_protection(capsys, project)
+    assert code == 0 and {c[3] for c in glab.calls()} == {"gitlab.example.com"}, res
+
+
+def test_gl_protection_without_origin_makes_no_call(capsys, project, glab):
+    code, res, st = gl_protection(capsys, project)
+    assert code == 0 and set(st.values()) == {"unknown"} and glab.calls() == [], res
+    assert res["platforms"]["gitlab"]["host"] is None and "no origin remote" in res["warnings"][0]["message"]
+    assert "GitHub" not in json.dumps(res)
+
+
+def test_gl_protection_never_prints_a_token_from_the_origin(capsys, project, glab):
+    _gl_origin(project, "https://oauth2:SECRET@gitlab.com/acme/shop.git")
+    _gl(glab)
+    code = setup.main(["protection", "--orch-gate", str(project / CLI_DIR), "--project-root", str(project),
+                       "--platform", "gitlab"])
+    out = capsys.readouterr()
+    assert code == 0 and "SECRET" not in out.out + out.err
+    assert not any("SECRET" in arg for c in glab.calls() for arg in c)
+
+
+def test_gl_protection_refuses_a_polyrepo_registry(capsys, project, glab):
+    _gl_origin(project)
+    _register(project, "pay", repo="https://git.example.com/acme/pay.git")
+    code, res = run(capsys, project, "protection", "--platform", "gitlab")
+    assert code == 1 and res["code"] == "polyrepo" and glab.calls() == [], res
+
+
+def test_gl_protection_changes_no_file_and_no_ref(capsys, project, glab):
+    _gl_origin(project)
+    _register(project, "pay")
+    _gl(glab, dict(GL_ON, merge_method="merge"))
+    before = (git(project, "status", "--porcelain"), git(project, "for-each-ref"), git(project, "config", "--list"))
+    code, res, _ = gl_protection(capsys, project)
+    assert code == 1, res
+    assert (git(project, "status", "--porcelain"), git(project, "for-each-ref"),
+            git(project, "config", "--list")) == before
+
+
+def test_protection_rejects_an_unknown_platform(capsys, project):
+    with pytest.raises(SystemExit) as exc:
+        setup.main(["protection", "--project-root", str(project), "--platform", "bitbucket"])
+    assert exc.value.code == 2 and json.loads(capsys.readouterr().out)["code"] == "bad-args"
+
+
+@pytest.mark.parametrize("url, expected", [
+    ("https://gitlab.com/group/sub/shop.git", ("gitlab.com", "group/sub/shop", False)),
+    ("https://gitlab.com/acme/shop", ("gitlab.com", "acme/shop", False)),
+    ("git@gitlab.com:g/sub/deeper/shop.git", ("gitlab.com", "g/sub/deeper/shop", True)),
+    ("ssh://git@altssh.gitlab.com:443/g/sub/shop.git", ("altssh.gitlab.com", "g/sub/shop", True)),
+    ("https://oauth2:SECRET@GitLab.Example.com/g/shop.git", ("gitlab.example.com", "g/shop", False)),
+    ("https://gitlab.com/shop.git", None),
+    ("https://gitlab.com/g/../shop.git", None),
+    ("git@gitlab.com:g//shop.git", None),
+    ("/srv/git/g/sub/shop.git", None),
+])
+def test_parse_origin_gitlab_forms(url, expected):
+    assert setup.parse_origin(url, nested=True) == expected
