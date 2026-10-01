@@ -1434,6 +1434,29 @@ def test_plan_check_working_tree_works_in_a_repo_with_no_commits(tmp_path):
     assert _index_and_head(r) == before
 
 
+@pytest.mark.parametrize("via", ["--coord", "ORCH_COORD"])
+def test_plan_check_working_tree_snapshots_the_coordination_repo_not_the_acting_repo(tmp_path, mono, via):
+    """Run from a code repo: the snapshot is of the coordination repo's working tree, never the acting repo's."""
+    mono.write(f"{R}/billing.yaml", registry_yaml("billing", "services/billing"))
+    mono.write("services/billing/app.py", "print('bill')\n")
+    mono.write("_bmad-output/planning-artifacts/epics.md",
+               EPICS + "\n### Story 1.5: Billing\n**Subproject:** billing\n**Depends on:** 1.2\n**Contract change:** none\n")
+    # the acting repo carries planning files of its own, committed and not, that the check must not read
+    other = Repo(tmp_path / "other")
+    other.write("_bmad-output/planning-artifacts/epics.md", "## Epic 9: X\n### Story 9.1: Y\n**Subproject:** nowhere\n")
+    other.commit()
+    other.write(f"{R}/ghost.yaml", registry_yaml("ghost", "src"))
+    before = _index_and_head(mono), _index_and_head(other)
+    flags, env = (("--coord", str(mono.path)), None) if via == "--coord" else ((), {"ORCH_COORD": str(mono.path)})
+    code, res = run_cli("plan-check", "--working-tree", "--repo", str(other.path), *flags, env=env)
+    assert res["read_from"] == "working-tree", res
+    assert mono.git("cat-file", "-t", res["coord_ref"]) == "tree", res
+    assert other.git("cat-file", "-t", res["coord_ref"], check=False) == "", res
+    assert res["verdict"] == "CONCERNS", res
+    assert [(f["code"], f["story"]) for f in res["findings"]] == [("dependency-not-imported", "1.5")], res
+    assert (_index_and_head(mono), _index_and_head(other)) == before
+
+
 def test_plan_check_working_tree_respects_gitignore(mono):
     mono.write(".gitignore", "_bmad-output/planning-artifacts/\n")
     mono.rm("_bmad-output/planning-artifacts/epics.md")
